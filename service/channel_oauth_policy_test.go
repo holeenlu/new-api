@@ -11,13 +11,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestApplyChannelErrorPolicySkipsClaudeCodeRetries(t *testing.T) {
-	err := types.NewOpenAIError(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+func TestApplyChannelErrorPolicySkipsSubscriptionOAuthRetries(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeClaudeCode, constant.ChannelTypeCodex} {
+		err := types.NewOpenAIError(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 
-	got := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, err)
+		got := ApplyChannelErrorPolicy(channelType, err)
 
-	require.Same(t, err, got)
-	require.True(t, types.IsSkipRetryError(got))
+		require.Same(t, err, got)
+		require.True(t, types.IsSkipRetryError(got))
+	}
 }
 
 func TestApplyChannelErrorPolicyLeavesOtherChannelsUnchanged(t *testing.T) {

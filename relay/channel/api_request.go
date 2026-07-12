@@ -154,6 +154,26 @@ func isClaudeCodeOAuthProtectedHeader(name string) bool {
 	}
 }
 
+func isCodexOAuthProtectedHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "authorization", "x-api-key", "chatgpt-account-id", "openai-beta", "originator", "user-agent", "content-type", "host":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSubscriptionOAuthProtectedHeader(channelType int, name string) bool {
+	switch channelType {
+	case rootconstant.ChannelTypeClaudeCode:
+		return isClaudeCodeOAuthProtectedHeader(name)
+	case rootconstant.ChannelTypeCodex:
+		return isCodexOAuthProtectedHeader(name)
+	default:
+		return false
+	}
+}
+
 func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string) (string, bool, error) {
 	trimmed := strings.TrimSpace(template)
 	if strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
@@ -247,7 +267,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			if shouldSkipPassthroughHeader(name) {
 				continue
 			}
-			if info.ChannelType == rootconstant.ChannelTypeClaudeCode && isClaudeCodeOAuthProtectedHeader(name) {
+			if isSubscriptionOAuthProtectedHeader(info.ChannelType, name) {
 				continue
 			}
 			if !passAll {
@@ -278,9 +298,18 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		if key == "" {
 			continue
 		}
-		if info.ChannelType == rootconstant.ChannelTypeClaudeCode && isClaudeCodeOAuthProtectedHeader(key) {
+		if isSubscriptionOAuthProtectedHeader(info.ChannelType, key) {
+			if info.UseRuntimeHeadersOverride {
+				continue
+			}
+			channelName := "subscription OAuth"
+			if info.ChannelType == rootconstant.ChannelTypeClaudeCode {
+				channelName = "Claude Code OAuth"
+			} else if info.ChannelType == rootconstant.ChannelTypeCodex {
+				channelName = "Codex OAuth"
+			}
 			return nil, types.NewError(
-				fmt.Errorf("header %q cannot be overridden for Claude Code OAuth channels", key),
+				fmt.Errorf("header %q cannot be overridden for %s channels", key, channelName),
 				types.ErrorCodeChannelHeaderOverrideInvalid,
 				types.ErrOptionWithSkipRetry(),
 			)

@@ -69,7 +69,7 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 // amplifying an upstream rejection through gateway retries or auto-disable.
 // The client may retry later according to the upstream status/Retry-After.
 func ApplyChannelErrorPolicy(channelType int, err *types.NewAPIError) *types.NewAPIError {
-	if err == nil || channelType != constant.ChannelTypeClaudeCode {
+	if err == nil || (channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex) {
 		return err
 	}
 	types.ErrOptionWithSkipRetry()(err)

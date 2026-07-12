@@ -1,11 +1,14 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -24,20 +27,104 @@ type Adaptor struct {
 var codexClientHeaders = []string{
 	"session-id",
 	"thread-id",
-	"user-agent",
 	"x-client-request-id",
 	"x-codex-beta-features",
+	"x-codex-parent-thread-id",
+	"x-codex-turn-state",
 	"x-codex-turn-metadata",
 	"x-codex-window-id",
+	"x-openai-memgen-request",
+	"x-openai-subagent",
 	"x-openai-internal-codex-responses-lite",
+	"x-responsesapi-include-timing-metrics",
 }
 
 const (
+	CodexOAuthUserAgent            = codexModelsUserAgent
+	CodexOAuthOriginator           = "codex_cli_rs"
 	codexChannelTestSessionID      = "019f4cb7-4452-79b2-92c0-f105ef46cc15"
 	codexChannelTestTurnID         = "019f4cb7-44a0-79d0-9824-ceb1437e84b8"
 	codexChannelTestInstallationID = "f6c6d912-945f-4584-bcf8-2cac04e84a1c"
 	codexChannelTestTurnMetadata   = `{"installation_id":"f6c6d912-945f-4584-bcf8-2cac04e84a1c","session_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","thread_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","turn_id":"019f4cb7-44a0-79d0-9824-ceb1437e84b8","window_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15:0","request_kind":"turn","thread_source":"user","sandbox":"seatbelt","turn_started_at_unix_ms":1783698506913}`
 )
+
+var (
+	CodexOAuthMaxConcurrency     = common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 5)
+	CodexOAuthMinRequestInterval = time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
+	codexOAuthSlots              sync.Map
+	codexOAuthPacing             sync.Map
+)
+
+func init() {
+	if CodexOAuthMaxConcurrency < 1 {
+		CodexOAuthMaxConcurrency = 1
+	} else if CodexOAuthMaxConcurrency > 8 {
+		CodexOAuthMaxConcurrency = 8
+	}
+	if CodexOAuthMinRequestInterval < 0 {
+		CodexOAuthMinRequestInterval = 0
+	} else if CodexOAuthMinRequestInterval > 5*time.Second {
+		CodexOAuthMinRequestInterval = 5 * time.Second
+	}
+}
+
+type codexOAuthPacingState struct {
+	mu        sync.Mutex
+	nextStart time.Time
+}
+
+type codexOAuthResponseBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *codexOAuthResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+func acquireCodexOAuthSlot(channelID int) (func(), bool) {
+	value, _ := codexOAuthSlots.LoadOrStore(channelID, make(chan struct{}, CodexOAuthMaxConcurrency))
+	slots := value.(chan struct{})
+	select {
+	case slots <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-slots })
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func waitForCodexOAuthTurn(ctx context.Context, channelID int) error {
+	value, _ := codexOAuthPacing.LoadOrStore(channelID, &codexOAuthPacingState{})
+	state := value.(*codexOAuthPacingState)
+
+	state.mu.Lock()
+	now := time.Now()
+	startAt := now
+	if state.nextStart.After(startAt) {
+		startAt = state.nextStart
+	}
+	state.nextStart = startAt.Add(CodexOAuthMinRequestInterval)
+	state.mu.Unlock()
+
+	delay := time.Until(startAt)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 func isCodexLiteModel(info *relaycommon.RelayInfo) bool {
 	if info == nil {
@@ -157,7 +244,32 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
-	return channel.DoApiRequest(a, c, info, requestBody)
+	release, acquired := acquireCodexOAuthSlot(info.ChannelId)
+	if !acquired {
+		c.Header("Retry-After", "1")
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("codex OAuth channel concurrency limit reached; retry later"),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusTooManyRequests,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
+		release()
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	resp, err := channel.DoApiRequest(a, c, info, requestBody)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if resp == nil || resp.Body == nil {
+		release()
+		return resp, nil
+	}
+	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, release: release}
+	return resp, nil
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
@@ -238,8 +350,9 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 		req.Set("OpenAI-Beta", "responses=experimental")
 	}
 	if req.Get("originator") == "" {
-		req.Set("originator", "codex_cli_rs")
+		req.Set("originator", CodexOAuthOriginator)
 	}
+	req.Set("User-Agent", CodexOAuthUserAgent)
 
 	// chatgpt.com/backend-api/codex/responses is strict about Content-Type.
 	// Clients may omit it or include parameters like `application/json; charset=utf-8`,

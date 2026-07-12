@@ -186,6 +186,53 @@ func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testin
 	require.NotContains(t, headers, "anthropic-beta")
 }
 
+func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeCodex,
+			HeadersOverride: map[string]any{
+				"User-Agent": "untrusted-client",
+			},
+		},
+	}
+
+	_, err := processHeaderOverride(info, ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot be overridden")
+}
+
+func TestProcessHeaderOverride_CodexRuntimeHeadersSkipProtectedIdentity(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	info := &relaycommon.RelayInfo{
+		UseRuntimeHeadersOverride: true,
+		RuntimeHeadersOverride: map[string]any{
+			"originator": "Codex Desktop",
+			"user-agent": "untrusted-client",
+			"session-id": "session-123",
+		},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeCodex,
+		},
+	}
+
+	headers, err := processHeaderOverride(info, ctx)
+	require.NoError(t, err)
+	require.NotContains(t, headers, "originator")
+	require.NotContains(t, headers, "user-agent")
+	require.Equal(t, "session-123", headers["session-id"])
+}
+
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {
 	t.Parallel()
 
