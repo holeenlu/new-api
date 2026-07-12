@@ -33,7 +33,7 @@ const (
 )
 
 var (
-	ClaudeCodeOAuthMaxConcurrency     = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 2)
+	ClaudeCodeOAuthMaxConcurrency     = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 5)
 	ClaudeCodeOAuthMinRequestInterval = time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
 	claudeCodeOAuthSlots              sync.Map
 	claudeCodeOAuthPacing             sync.Map
