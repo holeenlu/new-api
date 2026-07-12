@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: new-api:oauth-local
-    ports:
-      - "127.0.0.1:3001:3000"
+    ports: !override
+      - "192.168.11.12:3001:3000"
     environment:
       SQL_DSN: "${SQL_DSN}"
       REDIS_CONN_STRING: "${REDIS_CONN_STRING}"
@@ -32,24 +32,3 @@ services:
       POSTGRES_USER: "${POSTGRES_USER}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
       POSTGRES_DB: "${POSTGRES_DB}"
-
-  caddy:
-    image: caddy:2-alpine
-    container_name: new-api-caddy
-    restart: unless-stopped
-    depends_on:
-      - new-api
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./Caddyfile.104.128.92.169:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - new-api-network
-
-volumes:
-  caddy_data:
-  caddy_config:
