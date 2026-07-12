@@ -36,6 +36,7 @@ import {
   Eraser,
   Plus,
   Eye,
+  Link2,
   RefreshCw,
   Code,
   Route,
@@ -128,6 +129,7 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import {
   fetchModels,
+  fetchUpstreamModels,
   getAllModels,
   getChannel,
   getChannelKey,
@@ -159,8 +161,6 @@ import {
   getKeyPromptForType,
   parseModelsString,
   formatModelsArray,
-  extractRedirectModels,
-  extractMappingSourceModels,
   hasModelConfigChanged,
   findMissingModelsInMapping,
   validateModelMappingJson,
@@ -173,7 +173,7 @@ import {
 import type { Channel } from '../../types'
 import { useChannels } from '../channels-provider'
 import { AdvancedCustomEditorDialog } from '../dialogs/advanced-custom-editor-dialog'
-import { FetchModelsDialog } from '../dialogs/fetch-models-dialog'
+import { CodexOAuthDialog } from '../dialogs/codex-oauth-dialog'
 import {
   MissingModelsConfirmationDialog,
   type MissingModelsAction,
@@ -612,9 +612,11 @@ export function ChannelMutateDrawer({
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
   const canRevealChannelKey = currentUser?.role === ROLE.SUPER_ADMIN
-  const [fetchModelsDialogOpen, setFetchModelsDialogOpen] = useState(false)
+  const [isFetchingAndFillingModels, setIsFetchingAndFillingModels] =
+    useState(false)
   const [channelKey, setChannelKey] = useState<string | null>(null)
   const [isChannelKeyLoading, setIsChannelKeyLoading] = useState(false)
+  const [codexOAuthDialogOpen, setCodexOAuthDialogOpen] = useState(false)
   const [isCodexCredentialRefreshing, setIsCodexCredentialRefreshing] =
     useState(false)
   const initialModelsRef = useRef<string[]>([])
@@ -875,18 +877,6 @@ export function ChannelMutateDrawer({
     [allModelsData]
   )
 
-  // Get basic models for the current channel type
-  const basicModels = useMemo(() => {
-    if (!allModelsList.length) return []
-    // Filter models based on common patterns for specific types
-    if (currentType === 1) {
-      return allModelsList.filter(
-        (model) => model.startsWith('gpt-') || model.startsWith('text-')
-      )
-    }
-    return allModelsList
-  }, [allModelsList, currentType])
-
   // Get prefill groups
   const prefillGroups = useMemo(
     () => prefillGroupsData?.data || [],
@@ -1021,7 +1011,7 @@ export function ChannelMutateDrawer({
       currentAllowIncludeObfuscation ||
       currentAllowInferenceGeo
     )
-  } else if (currentType === 14) {
+  } else if (currentType === 14 || currentType === 59) {
     fieldPassthroughConfigured = Boolean(
       currentAllowServiceTier ||
       currentAllowInferenceGeo ||
@@ -1064,7 +1054,7 @@ export function ChannelMutateDrawer({
       configured: extraSettingsConfigured,
     },
   ]
-  if (currentType === 1 || currentType === 14 || currentType === 57) {
+  if (currentType === 1 || currentType === 14 || currentType === 57 || currentType === 59) {
     advancedNavChildren.push({
       id: ADVANCED_SETTINGS_SECTION_IDS.fieldPassthrough,
       title: t('Field passthrough controls'),
@@ -1114,18 +1104,6 @@ export function ChannelMutateDrawer({
       children: advancedNavChildren,
     },
   ]
-
-  // Extract redirect models from model_mapping (target values)
-  const redirectModelList = useMemo(
-    () => extractRedirectModels(currentModelMapping || ''),
-    [currentModelMapping]
-  )
-
-  // Extract source keys from model_mapping (models being remapped FROM)
-  const redirectModelKeyList = useMemo(
-    () => extractMappingSourceModels(currentModelMapping || ''),
-    [currentModelMapping]
-  )
 
   // Transform models to multi-select options
   const modelOptions = useMemo(() => {
@@ -1179,6 +1157,7 @@ export function ChannelMutateDrawer({
             .filter(
               (entry) =>
                 Boolean(entry.target) &&
+                entry.source !== entry.target &&
                 currentModelsArray.includes(entry.target)
             )
             .map((entry) => entry.target)
@@ -1407,10 +1386,9 @@ export function ChannelMutateDrawer({
     [currentModelsArray, form]
   )
 
-  // Handle fetching models from upstream
-  const handleFetchModels = useCallback(async () => {
+  // Fetch the provider's models and keep the request-to-upstream mapping explicit.
+  const handleFetchAndFillModels = useCallback(async () => {
     const type = form.getValues('type')
-
     if (!MODEL_FETCHABLE_TYPES.has(type)) {
       toast.error(t('This channel type does not support fetching models'))
       return
@@ -1421,44 +1399,56 @@ export function ChannelMutateDrawer({
       return
     }
 
-    // For creation mode, validate key before opening dialog
-    if (!isEditing) {
-      const key = form.getValues('key')
-      if (!key?.trim()) {
-        toast.error(t('Please enter API key first'))
-        return
-      }
-    }
-
-    setFetchModelsDialogOpen(true)
-  }, [isEditing, canEditSensitive, form, t])
-
-  const createModeFetcher = useCallback(async (): Promise<string[]> => {
-    if (!canEditSensitive) {
-      throw new Error(t("You don't have necessary permission"))
-    }
-    const response = await fetchModels({
-      type: form.getValues('type'),
-      key: form.getValues('key'),
-      base_url: form.getValues('base_url') || '',
-    })
-    if (response.success && response.data) {
-      return response.data
-    }
-    throw new Error(response.message || 'No models fetched from upstream')
-  }, [canEditSensitive, form, t])
-
-  // Handle model operations
-  const handleFillRelatedModels = useCallback(() => {
-    if (!basicModels.length) {
-      toast.info(t('No related models available for this channel type'))
+    if (!isEditing && !form.getValues('key')?.trim()) {
+      toast.error(t('Please enter API key first'))
       return
     }
-    updateModels(basicModels)
-    toast.success(
-      t('Filled {{count}} related model(s)', { count: basicModels.length })
-    )
-  }, [basicModels, updateModels, t])
+
+    setIsFetchingAndFillingModels(true)
+    try {
+      const response = isEditing
+        ? await fetchUpstreamModels(channelId!)
+        : await fetchModels({
+            type,
+            key: form.getValues('key'),
+            base_url: form.getValues('base_url') || '',
+          })
+
+      if (!response.success) {
+        throw new Error(response.message || t('Failed to fetch models'))
+      }
+
+      const models = formatModelsArray(
+        Array.isArray(response.data) ? response.data : []
+      )
+      const modelList = parseModelsString(models)
+      if (modelList.length === 0) {
+        toast.info(t('No models fetched yet.'))
+        return
+      }
+
+      form.setValue('models', models, {
+        shouldDirty: true,
+        shouldValidate: true,
+      })
+      form.setValue(
+        'model_mapping',
+        JSON.stringify(
+          Object.fromEntries(modelList.map((model) => [model, model])),
+          null,
+          2
+        ),
+        { shouldDirty: true, shouldValidate: true }
+      )
+      toast.success(t('Fetched {{count}} models', { count: modelList.length }))
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t('Failed to fetch models')
+      )
+    } finally {
+      setIsFetchingAndFillingModels(false)
+    }
+  }, [canEditSensitive, channelId, form, isEditing, t])
 
   const handleFillAllModels = useCallback(() => {
     if (!allModelsList.length) {
@@ -3052,12 +3042,27 @@ export function ChannelMutateDrawer({
                               {currentType === 57 && (
                                 <div className='border-border/60 flex flex-col gap-3 border-y py-4'>
                                   <div className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
-                                    <div className='text-muted-foreground text-xs'>
-                                      {t(
-                                        'Codex channels use an OAuth JSON credential as the key.'
-                                      )}
+                                    <div className='flex flex-col gap-0.5'>
+                                      <div className='text-sm font-semibold'>
+                                        {t('Codex Authorization')}
+                                      </div>
+                                      <div className='text-muted-foreground text-xs'>
+                                        {t(
+                                          'Codex channels use an OAuth JSON credential as the key.'
+                                        )}
+                                      </div>
                                     </div>
                                     <div className='flex flex-wrap items-center gap-2'>
+                                      <Button
+                                        type='button'
+                                        variant='outline'
+                                        size='sm'
+                                        onClick={() => setCodexOAuthDialogOpen(true)}
+                                        disabled={sensitiveLocked}
+                                      >
+                                        <Link2 className='mr-2 h-4 w-4' />
+                                        {t('Authorize')}
+                                      </Button>
                                       {isEditing && channelId && (
                                         <Button
                                           type='button'
@@ -3090,6 +3095,14 @@ export function ChannelMutateDrawer({
                                   </Alert>
                                 </div>
                               )}
+
+                              <CodexOAuthDialog
+                                open={codexOAuthDialogOpen}
+                                onOpenChange={setCodexOAuthDialogOpen}
+                                onKeyGenerated={(key) => {
+                                  form.setValue('key', key, { shouldDirty: true })
+                                }}
+                              />
 
                               {isEditing && isMultiKeyChannel && (
                                 <FormField
@@ -3312,14 +3325,25 @@ export function ChannelMutateDrawer({
                                   type='button'
                                   variant='outline'
                                   size='sm'
-                                  onClick={handleFillRelatedModels}
-                                  disabled={!basicModels.length}
+                                  onClick={handleFetchAndFillModels}
+                                  disabled={
+                                    isFetchingAndFillingModels ||
+                                    !MODEL_FETCHABLE_TYPES.has(currentType) ||
+                                    (!isEditing && !canEditSensitive)
+                                  }
                                 >
-                                  <FileText
-                                    className='mr-2 h-4 w-4'
-                                    aria-hidden='true'
-                                  />
-                                  {t('Fill Related Models')}
+                                  {isFetchingAndFillingModels ? (
+                                    <Loader2
+                                      className='mr-2 h-4 w-4 animate-spin'
+                                      aria-hidden='true'
+                                    />
+                                  ) : (
+                                    <Sparkles
+                                      className='mr-2 h-4 w-4'
+                                      aria-hidden='true'
+                                    />
+                                  )}
+                                  {t('Fetch from Upstream')}
                                 </Button>
                                 <Button
                                   type='button'
@@ -3334,29 +3358,10 @@ export function ChannelMutateDrawer({
                                   />
                                   {t('Fill All Models')}
                                 </Button>
-                                {MODEL_FETCHABLE_TYPES.has(currentType) && (
-                                  <>
-                                    <Button
-                                      type='button'
-                                      variant='outline'
-                                      size='sm'
-                                      onClick={handleFetchModels}
-                                      disabled={!isEditing && !canEditSensitive}
-                                    >
-                                      <Sparkles
-                                        className='mr-2 h-4 w-4'
-                                        aria-hidden='true'
-                                      />
-                                      {t('Fetch from Upstream')}
-                                    </Button>
-                                    {!isEditing && !canEditSensitive && (
-                                      <span className='text-muted-foreground basis-full text-xs'>
-                                        {t(
-                                          'No permission to perform this action'
-                                        )}
-                                      </span>
-                                    )}
-                                  </>
+                                {!isEditing && !canEditSensitive && (
+                                  <span className='text-muted-foreground basis-full text-xs'>
+                                    {t('No permission to perform this action')}
+                                  </span>
                                 )}
                                 <Button
                                   type='button'
@@ -4236,7 +4241,8 @@ export function ChannelMutateDrawer({
 
                         {(currentType === 1 ||
                           currentType === 14 ||
-                          currentType === 57) && (
+                          currentType === 57 ||
+                          currentType === 59) && (
                           <div
                             id={ADVANCED_SETTINGS_SECTION_IDS.fieldPassthrough}
                             className={sideDrawerSectionClassName(
@@ -4391,7 +4397,7 @@ export function ChannelMutateDrawer({
                                   </>
                                 )}
 
-                                {currentType === 14 && (
+                                {(currentType === 14 || currentType === 59) && (
                                   <>
                                     <FormField
                                       control={form.control}
@@ -4672,24 +4678,6 @@ export function ChannelMutateDrawer({
           }}
         />
       )}
-
-      {/* Fetch Models Dialog */}
-      <FetchModelsDialog
-        open={fetchModelsDialogOpen}
-        onOpenChange={setFetchModelsDialogOpen}
-        onModelsSelected={(models) => {
-          form.setValue('models', formatModelsArray(models))
-        }}
-        redirectModels={redirectModelList}
-        redirectSourceModels={redirectModelKeyList}
-        customFetcher={!isEditing ? createModeFetcher : undefined}
-        channelName={!isEditing ? currentName?.trim() : undefined}
-        existingModelsOverride={
-          !isEditing
-            ? parseModelsString(form.getValues('models') || '')
-            : undefined
-        }
-      />
 
       <SecureVerificationDialog
         open={verificationOpen}

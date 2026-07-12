@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -133,6 +134,14 @@ func GetClaudeAuthHeader(token string) http.Header {
 	h := http.Header{}
 	h.Add("x-api-key", token)
 	h.Add("anthropic-version", "2023-06-01")
+	return h
+}
+
+// GetClaudeCodeOAuthHeader builds the headers required by Claude Code OAuth tokens.
+func GetClaudeCodeOAuthHeader(token string) http.Header {
+	h := http.Header{}
+	h.Add("anthropic-version", "2023-06-01")
+	_ = claude.SetupClaudeCodeOAuthHeader(&h, token)
 	return h
 }
 

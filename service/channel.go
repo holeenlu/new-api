@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -62,6 +63,17 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	lowerMessage := strings.ToLower(err.Error())
 	search, _ := AcSearch(lowerMessage, operation_setting.AutomaticDisableKeywords, true)
 	return search
+}
+
+// ApplyChannelErrorPolicy prevents subscription-backed channels from
+// amplifying an upstream rejection through gateway retries or auto-disable.
+// The client may retry later according to the upstream status/Retry-After.
+func ApplyChannelErrorPolicy(channelType int, err *types.NewAPIError) *types.NewAPIError {
+	if err == nil || channelType != constant.ChannelTypeClaudeCode {
+		return err
+	}
+	types.ErrOptionWithSkipRetry()(err)
+	return err
 }
 
 func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {

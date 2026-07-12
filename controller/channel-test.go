@@ -76,6 +76,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// ChatGPT Subscription (Codex) only accepts streamed Responses requests,
+	// including manual channel tests where the query parameter may be omitted.
+	if channel != nil && channel.Type == constant.ChannelTypeCodex {
+		isStream = true
+	}
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
@@ -441,6 +446,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+			err = service.ApplyChannelErrorPolicy(channel.Type, err)
 			common.SysError(fmt.Sprintf(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
 				channel.Id,
@@ -736,6 +742,9 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 		case constant.EndpointTypeAnthropic, constant.EndpointTypeGemini, constant.EndpointTypeOpenAI:
 			// 返回 GeneralOpenAIRequest
 			maxTokens := uint(16)
+			if channel != nil && channel.Type == constant.ChannelTypeClaudeCode {
+				maxTokens = 1
+			}
 			if constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
 				maxTokens = 3000
 			}
@@ -805,6 +814,10 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				Content: "hi",
 			},
 		},
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeClaudeCode {
+		testRequest.MaxTokens = lo.ToPtr(uint(1))
+		return testRequest
 	}
 	if isStream {
 		testRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
@@ -1018,6 +1031,11 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
 	for _, channel := range channels {
+		// Subscription OAuth channels are intentionally excluded from scheduled
+		// inference probes. A manual single-channel test remains available.
+		if channel.Type == constant.ChannelTypeClaudeCode {
+			continue
+		}
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
 		}

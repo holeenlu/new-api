@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -136,6 +137,53 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 
 	_, hasAcceptEncoding := headers["accept-encoding"]
 	require.False(t, hasAcceptEncoding)
+}
+
+func TestProcessHeaderOverride_ClaudeCodeRejectsProtectedHeaders(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeClaudeCode,
+			HeadersOverride: map[string]any{
+				"Authorization": "Bearer replacement",
+			},
+		},
+	}
+
+	_, err := processHeaderOverride(info, ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot be overridden")
+}
+
+func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ctx.Request.Header.Set("User-Agent", "untrusted-client")
+	ctx.Request.Header.Set("Anthropic-Beta", "untrusted-beta")
+	ctx.Request.Header.Set("X-Trace-Id", "trace-123")
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeClaudeCode,
+			HeadersOverride: map[string]any{
+				"*": "",
+			},
+		},
+	}
+
+	headers, err := processHeaderOverride(info, ctx)
+	require.NoError(t, err)
+	require.Equal(t, "trace-123", headers["x-trace-id"])
+	require.NotContains(t, headers, "user-agent")
+	require.NotContains(t, headers, "anthropic-beta")
 }
 
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {

@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,16 +16,25 @@ import (
 )
 
 const (
-	codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-	codexOAuthTokenURL = "https://auth.openai.com/oauth/token"
-	codexJWTClaimPath  = "https://api.openai.com/auth"
-	defaultHTTPTimeout = 20 * time.Second
+	codexOAuthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexOAuthAuthorizeURL = "https://auth.openai.com/oauth/authorize"
+	codexOAuthTokenURL     = "https://auth.openai.com/oauth/token"
+	codexOAuthRedirectURI  = "http://localhost:1455/auth/callback"
+	codexOAuthScope        = "openid profile email offline_access"
+	codexJWTClaimPath      = "https://api.openai.com/auth"
+	defaultHTTPTimeout     = 20 * time.Second
 )
 
 type CodexOAuthTokenResult struct {
 	AccessToken  string
 	RefreshToken string
 	ExpiresAt    time.Time
+}
+
+type CodexOAuthAuthorizationFlow struct {
+	State        string
+	Verifier     string
+	AuthorizeURL string
 }
 
 func RefreshCodexOAuthToken(ctx context.Context, refreshToken string) (*CodexOAuthTokenResult, error) {
@@ -36,6 +47,80 @@ func RefreshCodexOAuthTokenWithProxy(ctx context.Context, refreshToken string, p
 		return nil, err
 	}
 	return refreshCodexOAuthToken(ctx, client, codexOAuthTokenURL, codexOAuthClientID, refreshToken)
+}
+
+func CreateCodexOAuthAuthorizationFlow() (*CodexOAuthAuthorizationFlow, error) {
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return nil, err
+	}
+	verifierBytes := make([]byte, 32)
+	if _, err := rand.Read(verifierBytes); err != nil {
+		return nil, err
+	}
+	verifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
+	challengeSum := sha256.Sum256([]byte(verifier))
+
+	u, err := url.Parse(codexOAuthAuthorizeURL)
+	if err != nil {
+		return nil, err
+	}
+	state := fmt.Sprintf("%x", stateBytes)
+	q := u.Query()
+	q.Set("response_type", "code")
+	q.Set("client_id", codexOAuthClientID)
+	q.Set("redirect_uri", codexOAuthRedirectURI)
+	q.Set("scope", codexOAuthScope)
+	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(challengeSum[:]))
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", state)
+	q.Set("id_token_add_organizations", "true")
+	q.Set("codex_cli_simplified_flow", "true")
+	q.Set("originator", "codex_cli_rs")
+	u.RawQuery = q.Encode()
+
+	return &CodexOAuthAuthorizationFlow{State: state, Verifier: verifier, AuthorizeURL: u.String()}, nil
+}
+
+func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier string) (*CodexOAuthTokenResult, error) {
+	code = strings.TrimSpace(code)
+	verifier = strings.TrimSpace(verifier)
+	if code == "" || verifier == "" {
+		return nil, errors.New("authorization code and code_verifier are required")
+	}
+	client, err := getCodexOAuthHTTPClient("")
+	if err != nil {
+		return nil, err
+	}
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", codexOAuthClientID)
+	form.Set("code", code)
+	form.Set("code_verifier", verifier)
+	form.Set("redirect_uri", codexOAuthRedirectURI)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := common.DecodeJson(resp.Body, &payload); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("codex oauth code exchange failed: status=%d", resp.StatusCode)
+	}
+	return &CodexOAuthTokenResult{AccessToken: strings.TrimSpace(payload.AccessToken), RefreshToken: strings.TrimSpace(payload.RefreshToken), ExpiresAt: time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)}, nil
 }
 
 func refreshCodexOAuthToken(

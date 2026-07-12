@@ -21,6 +21,35 @@ import (
 type Adaptor struct {
 }
 
+var codexClientHeaders = []string{
+	"session-id",
+	"thread-id",
+	"user-agent",
+	"x-client-request-id",
+	"x-codex-beta-features",
+	"x-codex-turn-metadata",
+	"x-codex-window-id",
+	"x-openai-internal-codex-responses-lite",
+}
+
+const (
+	codexChannelTestSessionID      = "019f4cb7-4452-79b2-92c0-f105ef46cc15"
+	codexChannelTestTurnID         = "019f4cb7-44a0-79d0-9824-ceb1437e84b8"
+	codexChannelTestInstallationID = "f6c6d912-945f-4584-bcf8-2cac04e84a1c"
+	codexChannelTestTurnMetadata   = `{"installation_id":"f6c6d912-945f-4584-bcf8-2cac04e84a1c","session_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","thread_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","turn_id":"019f4cb7-44a0-79d0-9824-ceb1437e84b8","window_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15:0","request_kind":"turn","thread_source":"user","sandbox":"seatbelt","turn_started_at_unix_ms":1783698506913}`
+)
+
+func isCodexLiteModel(info *relaycommon.RelayInfo) bool {
+	if info == nil {
+		return false
+	}
+	model := info.UpstreamModelName
+	if model == "" {
+		model = info.OriginModelName
+	}
+	return strings.HasPrefix(strings.ToLower(model), "gpt-5.6-")
+}
+
 func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
 	return nil, errors.New("codex channel: endpoint not supported")
 }
@@ -95,6 +124,26 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	if len(request.Instructions) == 0 {
 		request.Instructions = json.RawMessage(`""`)
 	}
+	if info != nil && info.IsChannelTest && isCodexLiteModel(info) {
+		clientMetadata := map[string]any{
+			"session_id":              codexChannelTestSessionID,
+			"thread_id":               codexChannelTestSessionID,
+			"turn_id":                 codexChannelTestTurnID,
+			"x-codex-installation-id": codexChannelTestInstallationID,
+			"x-codex-turn-metadata":   codexChannelTestTurnMetadata,
+			"x-codex-window-id":       codexChannelTestSessionID + ":0",
+		}
+		clientMetadataJSON, err := common.Marshal(clientMetadata)
+		if err != nil {
+			return nil, err
+		}
+		request.ClientMetadata = clientMetadataJSON
+		request.Include = json.RawMessage(`["reasoning.encrypted_content"]`)
+		request.ParallelToolCalls = json.RawMessage(`false`)
+		request.ToolChoice = json.RawMessage(`"auto"`)
+		request.Text = json.RawMessage(`{"verbosity":"low"}`)
+		request.Reasoning = &dto.Reasoning{Effort: "medium", Context: json.RawMessage(`"all_turns"`)}
+	}
 
 	if isCompact {
 		return request, nil
@@ -147,6 +196,20 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, req)
+	for _, name := range codexClientHeaders {
+		if value := c.GetHeader(name); value != "" {
+			req.Set(name, value)
+		}
+	}
+	if info.IsChannelTest && isCodexLiteModel(info) {
+		req.Set("originator", "Codex Desktop")
+		req.Set("x-openai-internal-codex-responses-lite", "true")
+		req.Set("x-codex-beta-features", "remote_compaction_v2")
+		req.Set("session-id", codexChannelTestSessionID)
+		req.Set("thread-id", codexChannelTestSessionID)
+		req.Set("x-codex-turn-metadata", codexChannelTestTurnMetadata)
+		req.Set("x-codex-window-id", codexChannelTestSessionID+":0")
+	}
 
 	key := strings.TrimSpace(info.ApiKey)
 	if !strings.HasPrefix(key, "{") {

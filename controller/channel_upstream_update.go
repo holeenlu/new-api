@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
@@ -256,6 +257,18 @@ func getUpstreamModelUpdateMinCheckIntervalSeconds() int64 {
 }
 
 func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+	if channel.Type == constant.ChannelTypeCodex {
+		client, err := service.NewProxyHttpClient(channel.GetSetting().Proxy)
+		if err != nil {
+			return nil, err
+		}
+		models, err := codex.FetchUpstreamModels(context.Background(), client, channel.GetBaseURL(), channel.Key)
+		if err != nil {
+			return nil, err
+		}
+		return normalizeModelNames(models), nil
+	}
+
 	baseURL := constant.ChannelBaseURLs[channel.Type]
 	if channel.GetBaseURL() != "" {
 		baseURL = channel.GetBaseURL()

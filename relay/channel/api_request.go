@@ -12,6 +12,7 @@ import (
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	rootconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -144,6 +145,15 @@ func shouldSkipPassthroughHeader(name string) bool {
 	return false
 }
 
+func isClaudeCodeOAuthProtectedHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "authorization", "x-api-key", "anthropic-version", "anthropic-beta", "user-agent", "x-app", "host":
+		return true
+	default:
+		return false
+	}
+}
+
 func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string) (string, bool, error) {
 	trimmed := strings.TrimSpace(template)
 	if strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
@@ -237,6 +247,9 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			if shouldSkipPassthroughHeader(name) {
 				continue
 			}
+			if info.ChannelType == rootconstant.ChannelTypeClaudeCode && isClaudeCodeOAuthProtectedHeader(name) {
+				continue
+			}
 			if !passAll {
 				matched := false
 				for _, re := range passthroughRegex {
@@ -264,6 +277,13 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		key := strings.TrimSpace(strings.ToLower(k))
 		if key == "" {
 			continue
+		}
+		if info.ChannelType == rootconstant.ChannelTypeClaudeCode && isClaudeCodeOAuthProtectedHeader(key) {
+			return nil, types.NewError(
+				fmt.Errorf("header %q cannot be overridden for Claude Code OAuth channels", key),
+				types.ErrorCodeChannelHeaderOverrideInvalid,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
 
 		str, ok := v.(string)

@@ -838,9 +838,10 @@ type WebSearchOptions struct {
 
 // https://platform.openai.com/docs/api-reference/responses/create
 type OpenAIResponsesRequest struct {
-	Model   string          `json:"model"`
-	Input   json.RawMessage `json:"input,omitempty"`
-	Include json.RawMessage `json:"include,omitempty"`
+	Model          string          `json:"model"`
+	Input          json.RawMessage `json:"input,omitempty"`
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	Include        json.RawMessage `json:"include,omitempty"`
 	// 在后台运行推理，暂时还不支持依赖的接口
 	// Background         json.RawMessage `json:"background,omitempty"`
 	Conversation       json.RawMessage `json:"conversation,omitempty"`
@@ -876,9 +877,6 @@ type OpenAIResponsesRequest struct {
 	User             json.RawMessage `json:"user,omitempty"`
 	MaxToolCalls     *uint           `json:"max_tool_calls,omitempty"`
 	Prompt           json.RawMessage `json:"prompt,omitempty"`
-	// Codex Responses metadata/client_metadata:
-	// https://github.com/openai/codex/commit/14df0e8833aad0d6d78287954b61ffac67af936c
-	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 	// qwen
 	EnableThinking json.RawMessage `json:"enable_thinking,omitempty"`
 	// perplexity

@@ -438,7 +438,9 @@ function RateLimitWindow(props: RateLimitWindowProps) {
     !!props.window &&
     typeof props.window === 'object' &&
     Object.keys(props.window).length > 0
-  const { percent, variant } = windowLabel(props.window)
+  const usedPercent = clampPercent(props.window?.used_percent)
+  const remainingPercent = Math.max(0, 100 - usedPercent)
+  const { variant } = windowLabel(props.window)
 
   return (
     <Card size='sm' className='gap-0 py-0'>
@@ -462,10 +464,10 @@ function RateLimitWindow(props: RateLimitWindowProps) {
                 percentTextClassName[variant ?? 'neutral']
               )}
             >
-              {hasData ? `${percent}%` : '-'}
+              {hasData ? `${remainingPercent}%` : '-'}
             </div>
             <div className='text-muted-foreground mt-1 text-[11px]'>
-              {t('Used')}
+              {t('Remaining')}
             </div>
           </div>
         </div>
@@ -473,8 +475,8 @@ function RateLimitWindow(props: RateLimitWindowProps) {
       <CardContent className='p-3 pt-0'>
         {hasData ? (
           <Progress
-            value={percent}
-            aria-label={`${props.title} usage: ${percent}%`}
+            value={remainingPercent}
+            aria-label={`${props.title} remaining: ${remainingPercent}%`}
             className='mt-1'
           />
         ) : (

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -102,6 +103,7 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 		{Id: 1, Status: common.ChannelStatusEnabled},
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
+		{Id: 4, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled},
 	}
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
@@ -109,6 +111,35 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 2, selected[1].Id)
+}
+
+func TestBuildTestRequestLimitsClaudeCodeProbeOutput(t *testing.T) {
+	request := buildTestRequest("claude-sonnet-5", "", &model.Channel{Type: constant.ChannelTypeClaudeCode}, false)
+	general, ok := request.(*dto.GeneralOpenAIRequest)
+	require.True(t, ok)
+	require.NotNil(t, general.MaxTokens)
+	require.Equal(t, uint(1), *general.MaxTokens)
+}
+
+func TestValidateClaudeCodeChannelRejectsUnsafeRequestMutation(t *testing.T) {
+	key := "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-token"
+	passThroughSetting := `{"pass_through_body_enabled":true}`
+	paramOverride := `{"operations":[{"path":"system","mode":"set","value":"replacement"}]}`
+
+	require.Error(t, validateChannel(&model.Channel{
+		Type:    constant.ChannelTypeClaudeCode,
+		Key:     key,
+		Setting: &passThroughSetting,
+	}, true))
+	require.Error(t, validateChannel(&model.Channel{
+		Type:          constant.ChannelTypeClaudeCode,
+		Key:           key,
+		ParamOverride: &paramOverride,
+	}, true))
+	require.NoError(t, validateChannel(&model.Channel{
+		Type: constant.ChannelTypeClaudeCode,
+		Key:  key,
+	}, true))
 }
 
 func TestTestAllChannelsRejectsExistingActiveTask(t *testing.T) {

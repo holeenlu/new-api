@@ -9,6 +9,7 @@ DEV_API_SERVICE = new-api
 DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
+APP_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || sed -n '1p' VERSION)
 
 .PHONY: all build-web build-web-classic build-all-web start-api dev dev-api dev-api-rebuild dev-web dev-web-classic reset-setup
 
@@ -17,12 +18,12 @@ all: build-all-web start-api
 build-web:
 	@echo "Building default web..."
 	@cd ./web && bun install --frozen-lockfile
-	@cd $(WEB_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+	@cd $(WEB_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(APP_VERSION) bun run build
 
 build-web-classic:
 	@echo "Building classic web..."
 	@cd ./web && bun install --frozen-lockfile
-	@cd $(WEB_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+	@cd $(WEB_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$(APP_VERSION) bun run build
 
 build-all-web: build-web build-web-classic
 

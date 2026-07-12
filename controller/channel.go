@@ -15,6 +15,8 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
@@ -198,6 +200,8 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 	switch channel.Type {
 	case constant.ChannelTypeAnthropic:
 		headers = GetClaudeAuthHeader(key)
+	case constant.ChannelTypeClaudeCode:
+		headers = GetClaudeCodeOAuthHeader(key)
 	default:
 		headers = GetAuthHeader(key)
 	}
@@ -516,6 +520,24 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 			}
 			if v, ok := keyMap["account_id"]; !ok || v == nil || strings.TrimSpace(fmt.Sprintf("%v", v)) == "" {
 				return fmt.Errorf("Codex key JSON must include account_id")
+			}
+		}
+	}
+
+	if channel.Type == constant.ChannelTypeClaudeCode {
+		trimmedKey := strings.TrimSpace(channel.Key)
+		if isAdd || trimmedKey != "" {
+			if _, err := claude.ParseClaudeCodeOAuthToken(trimmedKey); err != nil {
+				return err
+			}
+		}
+		if channel.GetSetting().PassThroughBodyEnabled {
+			return fmt.Errorf("claude code channel: pass-through body is not allowed")
+		}
+		if channel.ParamOverride != nil {
+			paramOverride := strings.TrimSpace(*channel.ParamOverride)
+			if paramOverride != "" && paramOverride != "{}" && paramOverride != "[]" {
+				return fmt.Errorf("claude code channel: parameter overrides are not allowed")
 			}
 		}
 	}
@@ -1176,9 +1198,11 @@ func FetchModels(c *gin.Context) {
 		baseURL = constant.ChannelBaseURLs[req.Type]
 	}
 
-	// remove line breaks and extra spaces.
+	// Preserve formatted Codex OAuth JSON; other providers use the first key line.
 	key := strings.TrimSpace(req.Key)
-	key = strings.Split(key, "\n")[0]
+	if req.Type != constant.ChannelTypeCodex {
+		key = strings.Split(key, "\n")[0]
+	}
 
 	if req.Type == constant.ChannelTypeOllama {
 		models, err := ollama.FetchOllamaModels(baseURL, key)
@@ -1219,6 +1243,22 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
+	if req.Type == constant.ChannelTypeCodex {
+		models, err := codex.FetchUpstreamModels(c.Request.Context(), &http.Client{}, baseURL, key)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": fmt.Sprintf("获取 Codex 上游模型失败: %s", err.Error()),
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data":    models,
+		})
+		return
+	}
+
 	client := &http.Client{}
 	url := fmt.Sprintf("%s/v1/models", baseURL)
 
@@ -1231,7 +1271,14 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
-	request.Header.Set("Authorization", "Bearer "+key)
+	switch req.Type {
+	case constant.ChannelTypeAnthropic:
+		request.Header = GetClaudeAuthHeader(key)
+	case constant.ChannelTypeClaudeCode:
+		request.Header = GetClaudeCodeOAuthHeader(key)
+	default:
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
 
 	response, err := client.Do(request)
 	if err != nil {
