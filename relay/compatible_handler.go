@@ -70,7 +70,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 	adaptor.Init(info)
 
-	passThroughEnabled := info.ChannelType != constant.ChannelTypeClaudeCode &&
+	passThroughEnabled := !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
 		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
 	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
 		!passThroughEnabled &&
@@ -160,21 +160,25 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 
 		// remove disabled fields for OpenAI API
-		jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
+			jsonData, err = relaycommon.RemoveDisabledFieldsForSubscriptionOAuth(jsonData, info.ChannelOtherSettings)
+		} else {
+			jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+		}
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
 
 		// apply param override
 		if len(info.ParamOverride) > 0 {
-			jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
+			jsonData, err = relaycommon.ApplyParamOverrideForChannel(jsonData, info)
 			if err != nil {
 				return newAPIErrorFromParamOverride(err)
 			}
 		}
 
-		if info.ChannelType == constant.ChannelTypeClaudeCode {
-			logger.LogDebug(c, "Claude Code OAuth request body omitted from logs (%d bytes)", len(jsonData))
+		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
+			logger.LogDebug(c, "subscription OAuth request body omitted from logs (%d bytes)", len(jsonData))
 		} else {
 			logger.LogDebug(c, "text request body: %s", jsonData)
 		}

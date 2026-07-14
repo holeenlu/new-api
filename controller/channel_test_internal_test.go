@@ -104,6 +104,7 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
 		{Id: 4, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled},
+		{Id: 5, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled},
 	}
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
@@ -121,25 +122,44 @@ func TestBuildTestRequestLimitsClaudeCodeProbeOutput(t *testing.T) {
 	require.Equal(t, uint(1), *general.MaxTokens)
 }
 
-func TestValidateClaudeCodeChannelRejectsUnsafeRequestMutation(t *testing.T) {
-	key := "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-token"
+func TestValidateSubscriptionOAuthChannelRejectsUnsafeRequestMutation(t *testing.T) {
 	passThroughSetting := `{"pass_through_body_enabled":true}`
 	paramOverride := `{"operations":[{"path":"system","mode":"set","value":"replacement"}]}`
+	claudeHeaderOverride := `{"Anthropic-Beta":"replacement"}`
+	codexHeaderOverride := `{"Originator":"replacement"}`
+	tests := []struct {
+		name           string
+		channelType    int
+		key            string
+		headerOverride string
+	}{
+		{name: "claude code", channelType: constant.ChannelTypeClaudeCode, key: "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-token", headerOverride: claudeHeaderOverride},
+		{name: "codex", channelType: constant.ChannelTypeCodex, key: `{"access_token":"token","account_id":"account"}`, headerOverride: codexHeaderOverride},
+	}
 
-	require.Error(t, validateChannel(&model.Channel{
-		Type:    constant.ChannelTypeClaudeCode,
-		Key:     key,
-		Setting: &passThroughSetting,
-	}, true))
-	require.Error(t, validateChannel(&model.Channel{
-		Type:          constant.ChannelTypeClaudeCode,
-		Key:           key,
-		ParamOverride: &paramOverride,
-	}, true))
-	require.NoError(t, validateChannel(&model.Channel{
-		Type: constant.ChannelTypeClaudeCode,
-		Key:  key,
-	}, true))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Error(t, validateChannel(&model.Channel{
+				Type:    test.channelType,
+				Key:     test.key,
+				Setting: &passThroughSetting,
+			}, true))
+			require.Error(t, validateChannel(&model.Channel{
+				Type:          test.channelType,
+				Key:           test.key,
+				ParamOverride: &paramOverride,
+			}, true))
+			require.Error(t, validateChannel(&model.Channel{
+				Type:           test.channelType,
+				Key:            test.key,
+				HeaderOverride: &test.headerOverride,
+			}, true))
+			require.NoError(t, validateChannel(&model.Channel{
+				Type: test.channelType,
+				Key:  test.key,
+			}, true))
+		})
+	}
 }
 
 func TestTestAllChannelsRejectsExistingActiveTask(t *testing.T) {

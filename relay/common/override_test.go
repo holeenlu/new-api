@@ -1902,6 +1902,41 @@ func TestApplyParamOverrideWithRelayInfoMixedLegacyAndOperations(t *testing.T) {
 	}
 }
 
+func TestApplySubscriptionOAuthHeaderPassthroughRejectsBodyMutation(t *testing.T) {
+	info := &RelayInfo{ChannelMeta: &ChannelMeta{ParamOverride: map[string]interface{}{
+		"operations": []interface{}{map[string]interface{}{
+			"mode":  "set",
+			"path":  "model",
+			"value": "replacement",
+		}},
+	}}}
+
+	_, err := ApplySubscriptionOAuthHeaderPassthrough([]byte(`{"model":"original"}`), info)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "do not allow parameter override mode")
+}
+
+func TestApplySubscriptionOAuthHeaderPassthroughPreservesBody(t *testing.T) {
+	input := []byte(`{"model":"gpt-5","input":"hello"}`)
+	info := &RelayInfo{
+		RequestHeaders: map[string]string{"Session_id": "session-123"},
+		ChannelMeta: &ChannelMeta{ParamOverride: map[string]interface{}{
+			"operations": []interface{}{map[string]interface{}{
+				"mode":  "pass_headers",
+				"value": []interface{}{"Session_id"},
+			}},
+		}},
+	}
+
+	out, err := ApplySubscriptionOAuthHeaderPassthrough(input, info)
+
+	require.NoError(t, err)
+	require.JSONEq(t, string(input), string(out))
+	require.True(t, info.UseRuntimeHeadersOverride)
+	require.Equal(t, "session-123", info.RuntimeHeadersOverride["session_id"])
+}
+
 func TestApplyParamOverrideWithRelayInfoMoveAndCopyHeaders(t *testing.T) {
 	info := &RelayInfo{
 		ChannelMeta: &ChannelMeta{
@@ -2033,6 +2068,22 @@ func TestRemoveDisabledFieldsSkipWhenGlobalPassThroughEnabled(t *testing.T) {
 		t.Fatalf("RemoveDisabledFields returned error: %v", err)
 	}
 	assertJSONEqual(t, input, string(out))
+}
+
+func TestRemoveDisabledFieldsForSubscriptionOAuthIgnoresGlobalPassThrough(t *testing.T) {
+	original := model_setting.GetGlobalSettings().PassThroughRequestEnabled
+	model_setting.GetGlobalSettings().PassThroughRequestEnabled = true
+	t.Cleanup(func() {
+		model_setting.GetGlobalSettings().PassThroughRequestEnabled = original
+	})
+
+	out, err := RemoveDisabledFieldsForSubscriptionOAuth(
+		[]byte(`{"model":"gpt-5","service_tier":"flex","safety_identifier":"user-123"}`),
+		dto.ChannelOtherSettings{},
+	)
+
+	require.NoError(t, err)
+	require.JSONEq(t, `{"model":"gpt-5"}`, string(out))
 }
 
 func TestRemoveDisabledFieldsDefaultFiltering(t *testing.T) {

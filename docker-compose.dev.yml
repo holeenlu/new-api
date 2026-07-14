@@ -29,7 +29,7 @@ services:
     environment:
       - SQL_DSN=postgresql://root:123456@postgres:5432/new-api
       - REDIS_CONN_STRING=redis://redis
-      - TZ=Asia/Shanghai
+      - TZ=UTC
       - BATCH_UPDATE_ENABLED=true
       # Enable only when accessing the dev backend through HTTPS. SESSION_COOKIE_TRUSTED_URL is required when true.
       # - SESSION_COOKIE_SECURE=true

@@ -85,6 +85,18 @@ func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
 	return tokens, err
 }
 
+func GetAllPrivilegedTokens(startIdx int, num int) ([]*Token, error) {
+	var tokens []*Token
+	err := DB.Model(&Token{}).
+		Joins("JOIN users ON users.id = tokens.user_id").
+		Where("users.role >= ?", common.RoleAdminUser).
+		Order("tokens.id desc").
+		Limit(num).
+		Offset(startIdx).
+		Find(&tokens).Error
+	return tokens, err
+}
+
 // sanitizeLikePattern 校验并清洗用户输入的 LIKE 搜索模式。
 // 规则：
 //  1. 转义 ! 和 _（使用 ! 作为 ESCAPE 字符，兼容 MySQL/PostgreSQL/SQLite）
@@ -190,6 +202,42 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		return nil, 0, errors.New("搜索令牌失败")
 	}
 	return tokens, total, nil
+}
+
+func SearchPrivilegedTokens(keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
+	if limit <= 0 || limit > searchHardLimit {
+		limit = searchHardLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if token != "" {
+		token = strings.TrimPrefix(token, "sk-")
+	}
+
+	baseQuery := DB.Model(&Token{}).
+		Joins("JOIN users ON users.id = tokens.user_id").
+		Where("users.role >= ?", common.RoleAdminUser)
+	if keyword != "" {
+		keywordPattern, err := sanitizeLikePattern(keyword)
+		if err != nil {
+			return nil, 0, err
+		}
+		baseQuery = baseQuery.Where("tokens.name LIKE ? ESCAPE '!'", keywordPattern)
+	}
+	if token != "" {
+		tokenPattern, err := sanitizeLikePattern(token)
+		if err != nil {
+			return nil, 0, err
+		}
+		baseQuery = baseQuery.Where("tokens."+commonKeyCol+" LIKE ? ESCAPE '!'", tokenPattern)
+	}
+
+	if err = baseQuery.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	err = baseQuery.Order("tokens.id desc").Offset(offset).Limit(limit).Find(&tokens).Error
+	return tokens, total, err
 }
 
 func ValidateUserToken(key string) (token *Token, err error) {
@@ -444,6 +492,62 @@ func CountUserTokens(userId int) (int64, error) {
 	var total int64
 	err := DB.Model(&Token{}).Where("user_id = ?", userId).Count(&total).Error
 	return total, err
+}
+
+func CountPrivilegedTokens() (int64, error) {
+	var total int64
+	err := DB.Model(&Token{}).
+		Joins("JOIN users ON users.id = tokens.user_id").
+		Where("users.role >= ?", common.RoleAdminUser).
+		Count(&total).Error
+	return total, err
+}
+
+type TokenWithOwnerRole struct {
+	Token
+	OwnerRole int `gorm:"column:owner_role"`
+}
+
+func GetTokensWithOwnerRolesByIds(ids []int) ([]TokenWithOwnerRole, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids 不能为空")
+	}
+	var tokens []TokenWithOwnerRole
+	err := DB.Model(&Token{}).
+		Select("tokens.*", "users.role AS owner_role").
+		Joins("JOIN users ON users.id = tokens.user_id").
+		Where("tokens.id IN ?", ids).
+		Find(&tokens).Error
+	return tokens, err
+}
+
+func BatchDeleteTokensByIds(ids []int) (int, error) {
+	if len(ids) == 0 {
+		return 0, errors.New("ids 不能为空")
+	}
+
+	var tokens []Token
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id IN ?", ids).Find(&tokens).Error; err != nil {
+			return err
+		}
+		if len(tokens) != len(ids) {
+			return errors.New("令牌不存在")
+		}
+		return tx.Where("id IN ?", ids).Delete(&Token{}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			for _, token := range tokens {
+				_ = cacheDeleteToken(token.Key)
+			}
+		})
+	}
+	return len(tokens), nil
 }
 
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量

@@ -1431,15 +1431,6 @@ export function ChannelMutateDrawer({
         shouldDirty: true,
         shouldValidate: true,
       })
-      form.setValue(
-        'model_mapping',
-        JSON.stringify(
-          Object.fromEntries(modelList.map((model) => [model, model])),
-          null,
-          2
-        ),
-        { shouldDirty: true, shouldValidate: true }
-      )
       toast.success(t('Fetched {{count}} models', { count: modelList.length }))
     } catch (error) {
       toast.error(

@@ -45,6 +45,7 @@ import {
 import {
   ModelRatioVisualEditor,
   type ModelRatioVisualEditorHandle,
+  type ModelRatioPricingPatch,
 } from './model-ratio-visual-editor'
 
 type ModelFormValues = {
@@ -208,12 +209,32 @@ export const ModelRatioForm = memo(function ModelRatioForm({
   }, [])
 
   const handleSave = useCallback(async () => {
+    let pricingPatch: ModelRatioPricingPatch | undefined
     if (editMode === 'visual') {
       const committed = await visualEditorRef.current?.commitOpenEditor()
-      if (committed === false) return
+      if (!committed) return
+      pricingPatch = committed
     }
 
-    await form.handleSubmit(onSave)()
+    await form.handleSubmit(async (values) => {
+      if (!pricingPatch) {
+        await onSave(values)
+        return
+      }
+      await onSave({
+        ...values,
+        ModelPrice: pricingPatch.modelPrice,
+        ModelRatio: pricingPatch.modelRatio,
+        CacheRatio: pricingPatch.cacheRatio,
+        CreateCacheRatio: pricingPatch.createCacheRatio,
+        CompletionRatio: pricingPatch.completionRatio,
+        ImageRatio: pricingPatch.imageRatio,
+        AudioRatio: pricingPatch.audioRatio,
+        AudioCompletionRatio: pricingPatch.audioCompletionRatio,
+        BillingMode: pricingPatch.billingMode,
+        BillingExpr: pricingPatch.billingExpr,
+      })
+    })()
   }, [editMode, form, onSave])
 
   return (

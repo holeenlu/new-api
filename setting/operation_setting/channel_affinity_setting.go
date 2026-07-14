@@ -62,7 +62,6 @@ var codexCliPassThroughHeaders = []string{
 	"X-OpenAI-Memgen-Request",
 	//"X-OAI-Attestation",
 	"X-ResponsesAPI-Include-Timing-Metrics",
-	"X-OpenAI-Internal-Codex-Responses-Lite",
 }
 
 var claudeCliPassThroughHeaders = []string{

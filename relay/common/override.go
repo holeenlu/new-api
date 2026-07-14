@@ -202,6 +202,36 @@ func ApplyParamOverrideWithRelayInfo(jsonData []byte, info *RelayInfo) ([]byte, 
 	return result, nil
 }
 
+// ApplySubscriptionOAuthHeaderPassthrough applies only the affinity-generated
+// pass_headers operation. Subscription OAuth channels never permit request-body
+// mutation through channel parameter overrides.
+func ApplySubscriptionOAuthHeaderPassthrough(jsonData []byte, info *RelayInfo) ([]byte, error) {
+	paramOverride := getParamOverrideMap(info)
+	if len(paramOverride) == 0 {
+		return jsonData, nil
+	}
+	if len(buildLegacyParamOverride(paramOverride)) != 0 {
+		return nil, fmt.Errorf("subscription OAuth channels do not allow parameter overrides")
+	}
+	operations, ok := tryParseOperations(paramOverride)
+	if !ok {
+		return nil, fmt.Errorf("subscription OAuth channels require pass_headers-only operations")
+	}
+	for _, operation := range operations {
+		if strings.TrimSpace(operation.Mode) != "pass_headers" {
+			return nil, fmt.Errorf("subscription OAuth channels do not allow parameter override mode %q", operation.Mode)
+		}
+	}
+	return ApplyParamOverrideWithRelayInfo(jsonData, info)
+}
+
+func ApplyParamOverrideForChannel(jsonData []byte, info *RelayInfo) ([]byte, error) {
+	if info != nil && info.ChannelMeta != nil && IsSubscriptionOAuthChannel(info.ChannelType) {
+		return ApplySubscriptionOAuthHeaderPassthrough(jsonData, info)
+	}
+	return ApplyParamOverrideWithRelayInfo(jsonData, info)
+}
+
 func shouldEnableParamOverrideAudit(paramOverride map[string]interface{}) bool {
 	if common.DebugEnabled {
 		return true

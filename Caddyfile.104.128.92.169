@@ -2,6 +2,6 @@ http://104.128.92.169 {
 	reverse_proxy new-api:3000
 }
 
-vpn2.buildtoconnect.com {
+nextcode.buildtoconnect.com {
 	reverse_proxy new-api:3000
 }

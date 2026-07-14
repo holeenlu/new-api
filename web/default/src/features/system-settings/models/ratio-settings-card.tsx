@@ -27,7 +27,7 @@ import * as z from 'zod'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-import { resetModelRatios } from '../api'
+import { resetModelRatios, updateSystemOption } from '../api'
 import { SettingsPageTitleStatusPortal } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
@@ -162,6 +162,7 @@ export function RatioSettingsCard({
   const updateOption = useUpdateOption()
   const queryClient = useQueryClient()
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const [isSavingModelRatios, setIsSavingModelRatios] = useState(false)
 
   const resetMutation = useMutation({
     mutationFn: resetModelRatios,
@@ -341,15 +342,32 @@ export function RatioSettingsCard({
         return
       }
 
-      for (const key of updates) {
-        const apiKey = apiKeyMap[key as string] || (key as string)
-        await updateOption.mutateAsync({ key: apiKey, value: normalized[key] })
-      }
+      setIsSavingModelRatios(true)
+      try {
+        for (const key of updates) {
+          const apiKey = apiKeyMap[key as string] || (key as string)
+          const result = await updateSystemOption({
+            key: apiKey,
+            value: normalized[key],
+          })
+          if (!result.success) {
+            throw new Error(result.message || t('Failed to update setting'))
+          }
+        }
 
-      modelNormalizedDefaults.current = normalized
-      setSavedModelValues(normalized)
+        modelNormalizedDefaults.current = normalized
+        setSavedModelValues(normalized)
+        await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+        toast.success(t('Setting updated successfully'))
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : t('Failed to update setting')
+        )
+      } finally {
+        setIsSavingModelRatios(false)
+      }
     },
-    [t, updateOption]
+    [queryClient, t]
   )
 
   const saveGroupRatios = useCallback(
@@ -420,7 +438,7 @@ export function RatioSettingsCard({
           savedValues={savedModelValues}
           onSave={saveModelRatios}
           onReset={handleResetRatios}
-          isSaving={updateOption.isPending}
+          isSaving={isSavingModelRatios}
           isResetting={resetMutation.isPending}
           variant={tab === 'unset-models' ? 'unset' : 'default'}
         />

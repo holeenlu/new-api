@@ -31,15 +31,46 @@ func buildMaskedTokenResponses(tokens []*model.Token) []*model.Token {
 	return maskedTokens
 }
 
+func canManageOtherPrivilegedUserToken(actorRole int, ownerRole int) bool {
+	return ownerRole >= common.RoleAdminUser && canManageTargetRole(actorRole, ownerRole)
+}
+
+func getManageableToken(c *gin.Context, tokenId int) (*model.Token, error) {
+	userId := c.GetInt("id")
+	token, err := model.GetTokenById(tokenId)
+	if err != nil || token.UserId == userId {
+		return token, err
+	}
+	if c.GetInt("role") < common.RoleAdminUser {
+		return nil, fmt.Errorf("无权访问该令牌")
+	}
+	owner, err := model.GetUserById(token.UserId, false)
+	if err != nil {
+		return nil, err
+	}
+	if !canManageOtherPrivilegedUserToken(c.GetInt("role"), owner.Role) {
+		return nil, fmt.Errorf("无权访问该令牌")
+	}
+	return token, nil
+}
+
 func GetAllTokens(c *gin.Context) {
 	userId := c.GetInt("id")
 	pageInfo := common.GetPageQuery(c)
-	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	var tokens []*model.Token
+	var total int64
+	var err error
+	if c.GetInt("role") == common.RoleRootUser {
+		tokens, err = model.GetAllPrivilegedTokens(pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		total, _ = model.CountPrivilegedTokens()
+	} else {
+		tokens, err = model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		total, _ = model.CountUserTokens(userId)
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	total, _ := model.CountUserTokens(userId)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(buildMaskedTokenResponses(tokens))
 	common.ApiSuccess(c, pageInfo)
@@ -52,7 +83,14 @@ func SearchTokens(c *gin.Context) {
 
 	pageInfo := common.GetPageQuery(c)
 
-	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	var tokens []*model.Token
+	var total int64
+	var err error
+	if c.GetInt("role") == common.RoleRootUser {
+		tokens, total, err = model.SearchPrivilegedTokens(keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	} else {
+		tokens, total, err = model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -64,12 +102,11 @@ func SearchTokens(c *gin.Context) {
 
 func GetToken(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := getManageableToken(c, id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -79,12 +116,11 @@ func GetToken(c *gin.Context) {
 
 func GetTokenKey(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := getManageableToken(c, id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -235,8 +271,10 @@ func AddToken(c *gin.Context) {
 
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
-	err := model.DeleteTokenById(id, userId)
+	token, err := getManageableToken(c, id)
+	if err == nil {
+		err = token.Delete()
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -248,7 +286,6 @@ func DeleteToken(c *gin.Context) {
 }
 
 func UpdateToken(c *gin.Context) {
-	userId := c.GetInt("id")
 	statusOnly := c.Query("status_only")
 	token := model.Token{}
 	err := c.ShouldBindJSON(&token)
@@ -271,7 +308,7 @@ func UpdateToken(c *gin.Context) {
 			return
 		}
 	}
-	cleanToken, err := model.GetTokenByIds(token.Id, userId)
+	cleanToken, err := getManageableToken(c, token.Id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -322,8 +359,43 @@ func DeleteTokenBatch(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	ids := make([]int, 0, len(tokenBatch.Ids))
+	seen := make(map[int]struct{}, len(tokenBatch.Ids))
+	for _, id := range tokenBatch.Ids {
+		if id <= 0 {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	tokens, err := model.GetTokensWithOwnerRolesByIds(ids)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if len(tokens) != len(ids) {
+		common.ApiError(c, fmt.Errorf("令牌不存在"))
+		return
+	}
+
 	userId := c.GetInt("id")
-	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
+	actorRole := c.GetInt("role")
+	for _, token := range tokens {
+		if token.UserId == userId {
+			continue
+		}
+		if actorRole < common.RoleAdminUser || !canManageOtherPrivilegedUserToken(actorRole, token.OwnerRole) {
+			common.ApiError(c, fmt.Errorf("无权访问该令牌"))
+			return
+		}
+	}
+
+	count, err := model.BatchDeleteTokensByIds(ids)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -345,14 +417,13 @@ func GetTokenKeysBatch(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgBatchTooMany, map[string]any{"Max": 100})
 		return
 	}
-	userId := c.GetInt("id")
-	tokens, err := model.GetTokenKeysByIds(tokenBatch.Ids, userId)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	keysMap := make(map[int]string)
-	for _, t := range tokens {
+	for _, id := range tokenBatch.Ids {
+		t, err := getManageableToken(c, id)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		keysMap[t.Id] = t.GetFullKey()
 	}
 	common.ApiSuccess(c, gin.H{"keys": keysMap})

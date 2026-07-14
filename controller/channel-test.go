@@ -414,7 +414,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//}
 
 	if len(info.ParamOverride) > 0 {
-		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
+		jsonData, err = relaycommon.ApplyParamOverrideForChannel(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {
 				return testResult{
@@ -1033,7 +1033,7 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 	for _, channel := range channels {
 		// Subscription OAuth channels are intentionally excluded from scheduled
 		// inference probes. A manual single-channel test remains available.
-		if channel.Type == constant.ChannelTypeClaudeCode {
+		if channel.Type == constant.ChannelTypeClaudeCode || channel.Type == constant.ChannelTypeCodex {
 			continue
 		}
 		if channel.Status == common.ChannelStatusManuallyDisabled {

@@ -35,7 +35,6 @@ var codexClientHeaders = []string{
 	"x-codex-window-id",
 	"x-openai-memgen-request",
 	"x-openai-subagent",
-	"x-openai-internal-codex-responses-lite",
 	"x-responsesapi-include-timing-metrics",
 }
 
@@ -251,7 +250,6 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 			errors.New("codex OAuth channel concurrency limit reached; retry later"),
 			types.ErrorCodeDoRequestFailed,
 			http.StatusTooManyRequests,
-			types.ErrOptionWithSkipRetry(),
 		)
 	}
 	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {

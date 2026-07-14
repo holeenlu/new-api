@@ -40,7 +40,6 @@ const CODEX_CLI_HEADER_PASSTHROUGH_HEADERS = [
   'X-OpenAI-Memgen-Request',
   // 'X-OAI-Attestation',
   'X-ResponsesAPI-Include-Timing-Metrics',
-  'X-OpenAI-Internal-Codex-Responses-Lite',
 ]
 
 const CLAUDE_CLI_HEADER_PASSTHROUGH_HEADERS = [

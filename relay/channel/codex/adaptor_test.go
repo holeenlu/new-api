@@ -35,7 +35,7 @@ func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, "remote_compaction_v2", headers.Get("X-Codex-Beta-Features"))
-	require.Equal(t, "true", headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
+	require.Empty(t, headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
 	require.Equal(t, "session-123", headers.Get("Session-Id"))
 	require.Equal(t, "Bearer access-token", headers.Get("Authorization"))
 	require.Equal(t, "account-id", headers.Get("Chatgpt-Account-Id"))

@@ -65,11 +65,21 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	return search
 }
 
+func IsSubscriptionOAuthTransientError(channelType int, err *types.NewAPIError) bool {
+	if err == nil || (channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex) {
+		return false
+	}
+	return err.StatusCode >= 500 && err.StatusCode <= 599
+}
+
 // ApplyChannelErrorPolicy prevents subscription-backed channels from
-// amplifying an upstream rejection through gateway retries or auto-disable.
-// The client may retry later according to the upstream status/Retry-After.
+// amplifying client errors and rate-limit responses. Transient upstream 5xx
+// failures remain retryable so routing can fail over to another account.
 func ApplyChannelErrorPolicy(channelType int, err *types.NewAPIError) *types.NewAPIError {
 	if err == nil || (channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex) {
+		return err
+	}
+	if IsSubscriptionOAuthTransientError(channelType, err) {
 		return err
 	}
 	types.ErrOptionWithSkipRetry()(err)

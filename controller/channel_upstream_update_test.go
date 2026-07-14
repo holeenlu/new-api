@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
@@ -82,6 +83,43 @@ func TestCollectPendingApplyUpstreamModelChanges(t *testing.T) {
 
 	require.Equal(t, []string{"gpt-4o", "gpt-4.1"}, pendingAddModels)
 	require.Equal(t, []string{"old-model"}, pendingRemoveModels)
+}
+
+func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	disabledChannel := &model.Channel{
+		Name:   "disabled-channel",
+		Key:    "key",
+		Status: common.ChannelStatusManuallyDisabled,
+	}
+	disabledChannel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: true,
+	})
+	require.NoError(t, db.Create(disabledChannel).Error)
+
+	enabledChannel := &model.Channel{
+		Name:   "enabled-channel",
+		Key:    "key",
+		Status: common.ChannelStatusEnabled,
+	}
+	enabledChannel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: false,
+	})
+	require.NoError(t, db.Create(enabledChannel).Error)
+	require.False(t, modelUpdateHandler{}.Enabled())
+
+	enabledChannel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: true,
+	})
+	require.NoError(t, db.Model(enabledChannel).Update("settings", enabledChannel.OtherSettings).Error)
+	require.True(t, modelUpdateHandler{}.Enabled())
+
+	enabledChannel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: false,
+	})
+	require.NoError(t, db.Model(enabledChannel).Update("settings", enabledChannel.OtherSettings).Error)
+	require.False(t, modelUpdateHandler{}.Enabled())
 }
 
 func TestNormalizeChannelModelMapping(t *testing.T) {

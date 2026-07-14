@@ -469,10 +469,34 @@ export const ModelPricingEditorPanel = forwardRef<
       commitDraft: async () => {
         const isValid = await form.trigger()
         if (!isValid || !validatePricingValues()) return null
-        return buildSubmitData(form.getValues())
+
+        const values = form.getValues()
+        if (pricingMode === 'per-token') {
+          const inputPrice = toNumberOrNull(promptPrice)
+          values.ratio =
+            inputPrice === null ? '' : formatPricingNumber(inputPrice / 2)
+
+          laneConfigs.forEach(({ key }) => {
+            const ratioField = ratioFieldByLane[key]
+            values[ratioField] = laneEnabled[key]
+              ? deriveLaneRatio(key, lanePrices[key])
+              : ''
+          })
+        }
+
+        return buildSubmitData(values)
       },
     }),
-    [form, validatePricingValues, buildSubmitData]
+    [
+      buildSubmitData,
+      deriveLaneRatio,
+      form,
+      laneEnabled,
+      lanePrices,
+      pricingMode,
+      promptPrice,
+      validatePricingValues,
+    ]
   )
 
   const showActions = Boolean(onSave)

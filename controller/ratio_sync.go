@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 
 	"github.com/QuantumNous/new-api/dto"
@@ -91,6 +92,10 @@ type upstreamResult struct {
 	Err  string         `json:"err,omitempty"`
 }
 
+func supportsUpstreamPricingSync(channelType int) bool {
+	return channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex
+}
+
 func valueMap(value any) map[string]any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -152,9 +157,35 @@ func FetchUpstreamRatios(c *gin.Context) {
 	}
 
 	var upstreams []dto.UpstreamDTO
+	blockedResults := make([]upstreamResult, 0)
 
 	if len(req.Upstreams) > 0 {
+		channelIDs := make([]int, 0, len(req.Upstreams))
+		for _, upstream := range req.Upstreams {
+			if upstream.ID > 0 {
+				channelIDs = append(channelIDs, upstream.ID)
+			}
+		}
+		channelsByID := make(map[int]*model.Channel, len(channelIDs))
+		if len(channelIDs) > 0 {
+			dbChannels, err := model.GetChannelsByIds(channelIDs)
+			if err != nil {
+				logger.LogError(c.Request.Context(), "failed to query channels: "+err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "查询渠道失败"})
+				return
+			}
+			for _, channel := range dbChannels {
+				channelsByID[channel.Id] = channel
+			}
+		}
 		for _, u := range req.Upstreams {
+			if channel, ok := channelsByID[u.ID]; ok && !supportsUpstreamPricingSync(channel.Type) {
+				blockedResults = append(blockedResults, upstreamResult{
+					Name: fmt.Sprintf("%s(%d)", u.Name, u.ID),
+					Err:  "订阅 OAuth 渠道不支持上游价格同步",
+				})
+				continue
+			}
 			if strings.HasPrefix(u.BaseURL, "http") {
 				if u.Endpoint == "" {
 					u.Endpoint = defaultEndpoint
@@ -175,6 +206,13 @@ func FetchUpstreamRatios(c *gin.Context) {
 			return
 		}
 		for _, ch := range dbChannels {
+			if !supportsUpstreamPricingSync(ch.Type) {
+				blockedResults = append(blockedResults, upstreamResult{
+					Name: fmt.Sprintf("%s(%d)", ch.Name, ch.Id),
+					Err:  "订阅 OAuth 渠道不支持上游价格同步",
+				})
+				continue
+			}
 			if base := ch.GetBaseURL(); strings.HasPrefix(base, "http") {
 				upstreams = append(upstreams, dto.UpstreamDTO{
 					ID:       ch.Id,
@@ -186,7 +224,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 		}
 	}
 
-	if len(upstreams) == 0 {
+	if len(upstreams) == 0 && len(blockedResults) == 0 {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "无有效上游渠道"})
 		return
 	}
@@ -497,7 +535,14 @@ func FetchUpstreamRatios(c *gin.Context) {
 
 	localData := getLocalPricingSyncData()
 
-	var testResults []dto.TestResult
+	testResults := make([]dto.TestResult, 0, len(blockedResults)+len(upstreams))
+	for _, r := range blockedResults {
+		testResults = append(testResults, dto.TestResult{
+			Name:   r.Name,
+			Status: "error",
+			Error:  r.Err,
+		})
+	}
 	var successfulChannels []struct {
 		name string
 		data map[string]any
@@ -996,7 +1041,7 @@ func GetSyncableChannels(c *gin.Context) {
 
 	var syncableChannels []dto.SyncableChannel
 	for _, channel := range channels {
-		if channel.GetBaseURL() != "" {
+		if supportsUpstreamPricingSync(channel.Type) && channel.GetBaseURL() != "" {
 			syncableChannels = append(syncableChannels, dto.SyncableChannel{
 				ID:      channel.Id,
 				Name:    channel.Name,

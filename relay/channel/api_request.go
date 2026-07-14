@@ -163,7 +163,7 @@ func isCodexOAuthProtectedHeader(name string) bool {
 	}
 }
 
-func isSubscriptionOAuthProtectedHeader(channelType int, name string) bool {
+func IsSubscriptionOAuthProtectedHeader(channelType int, name string) bool {
 	switch channelType {
 	case rootconstant.ChannelTypeClaudeCode:
 		return isClaudeCodeOAuthProtectedHeader(name)
@@ -267,7 +267,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			if shouldSkipPassthroughHeader(name) {
 				continue
 			}
-			if isSubscriptionOAuthProtectedHeader(info.ChannelType, name) {
+			if IsSubscriptionOAuthProtectedHeader(info.ChannelType, name) {
 				continue
 			}
 			if !passAll {
@@ -298,7 +298,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		if key == "" {
 			continue
 		}
-		if isSubscriptionOAuthProtectedHeader(info.ChannelType, key) {
+		if IsSubscriptionOAuthProtectedHeader(info.ChannelType, key) {
 			if info.UseRuntimeHeadersOverride {
 				continue
 			}
@@ -526,7 +526,16 @@ func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	var client *http.Client
 	var err error
-	if info.ChannelSetting.Proxy != "" {
+	if common2.SubscriptionOAuthResponseHeaderTimeout > 0 &&
+		(info.ChannelType == rootconstant.ChannelTypeCodex || info.ChannelType == rootconstant.ChannelTypeClaudeCode) {
+		client, err = service.GetHttpClientWithResponseHeaderTimeout(
+			info.ChannelSetting.Proxy,
+			time.Duration(common2.SubscriptionOAuthResponseHeaderTimeout)*time.Second,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("new response header timeout client failed: %w", err)
+		}
+	} else if info.ChannelSetting.Proxy != "" {
 		client, err = service.NewProxyHttpClient(info.ChannelSetting.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("new proxy http client failed: %w", err)

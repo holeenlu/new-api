@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,7 @@ var (
 	ssrfProtectedHTTPClient *http.Client
 	proxyClientLock         sync.Mutex
 	proxyClients            = make(map[string]*http.Client)
+	responseTimeoutClients  = make(map[string]*http.Client)
 )
 
 func checkRedirect(req *http.Request, via []*http.Request) error {
@@ -117,7 +119,41 @@ func ResetProxyClientCache() {
 			transport.CloseIdleConnections()
 		}
 	}
+	for _, client := range responseTimeoutClients {
+		if transport, ok := client.Transport.(*http.Transport); ok && transport != nil {
+			transport.CloseIdleConnections()
+		}
+	}
 	proxyClients = make(map[string]*http.Client)
+	responseTimeoutClients = make(map[string]*http.Client)
+}
+
+// GetHttpClientWithResponseHeaderTimeout returns a cached client whose timeout
+// only covers the wait for upstream response headers. Streaming response bodies
+// remain unbounded and continue to use the normal streaming idle timeout.
+func GetHttpClientWithResponseHeaderTimeout(proxyURL string, timeout time.Duration) (*http.Client, error) {
+	baseClient, err := GetHttpClientWithProxy(proxyURL)
+	if err != nil || timeout <= 0 {
+		return baseClient, err
+	}
+
+	cacheKey := strings.TrimSpace(proxyURL) + "\x00" + timeout.String()
+	proxyClientLock.Lock()
+	defer proxyClientLock.Unlock()
+	if client, ok := responseTimeoutClients[cacheKey]; ok {
+		return client, nil
+	}
+
+	transport, ok := baseClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		return nil, fmt.Errorf("response header timeout requires an HTTP transport")
+	}
+	clientCopy := *baseClient
+	transportCopy := transport.Clone()
+	transportCopy.ResponseHeaderTimeout = timeout
+	clientCopy.Transport = transportCopy
+	responseTimeoutClients[cacheKey] = &clientCopy
+	return &clientCopy, nil
 }
 
 // NewProxyHttpClient 创建支持代理的 HTTP 客户端

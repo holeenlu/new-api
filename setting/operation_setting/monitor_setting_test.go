@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGetMonitorSetting_ChannelTestEnabledEnvOverridesEnabledConfig(t *testing.T) {
+func TestGetMonitorSetting_ChannelTestEnvironmentCannotOverrideEnabledConfig(t *testing.T) {
 	orig := monitorSetting
 	t.Cleanup(func() { monitorSetting = orig })
 
@@ -21,11 +21,12 @@ func TestGetMonitorSetting_ChannelTestEnabledEnvOverridesEnabledConfig(t *testin
 	setting := GetMonitorSetting()
 
 	require.NotNil(t, setting)
-	assert.False(t, setting.AutoTestChannelEnabled)
-	assert.Equal(t, float64(5), setting.AutoTestChannelMinutes)
+	assert.True(t, setting.AutoTestChannelEnabled)
+	assert.Equal(t, float64(20), setting.AutoTestChannelMinutes)
+	assert.Equal(t, ChannelTestModeScheduledAll, setting.ChannelTestMode)
 }
 
-func TestGetMonitorSetting_ChannelTestEnabledEnvCanEnableDisabledConfig(t *testing.T) {
+func TestGetMonitorSetting_ChannelTestEnvironmentCannotEnableDisabledConfig(t *testing.T) {
 	orig := monitorSetting
 	t.Cleanup(func() { monitorSetting = orig })
 
@@ -38,6 +39,6 @@ func TestGetMonitorSetting_ChannelTestEnabledEnvCanEnableDisabledConfig(t *testi
 	setting := GetMonitorSetting()
 
 	require.NotNil(t, setting)
-	assert.True(t, setting.AutoTestChannelEnabled)
+	assert.False(t, setting.AutoTestChannelEnabled)
 	assert.Equal(t, float64(12), setting.AutoTestChannelMinutes)
 }

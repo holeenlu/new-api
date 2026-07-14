@@ -16,7 +16,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
-	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
@@ -211,6 +210,9 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 		if relaychannel.IsHeaderPassthroughRuleKey(k) {
 			continue
 		}
+		if relaychannel.IsSubscriptionOAuthProtectedHeader(channel.Type, k) {
+			return nil, fmt.Errorf("critical header %q cannot be overridden for subscription OAuth channels", k)
+		}
 		str, ok := v.(string)
 		if !ok {
 			return nil, fmt.Errorf("invalid header override for key %s", k)
@@ -237,7 +239,7 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	ids, err := fetchChannelUpstreamModelIDs(channel)
+	ids, err := fetchChannelUpstreamModelIDs(c.Request.Context(), channel)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -531,13 +533,21 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 				return err
 			}
 		}
+	}
+
+	if channel.Type == constant.ChannelTypeClaudeCode || channel.Type == constant.ChannelTypeCodex {
 		if channel.GetSetting().PassThroughBodyEnabled {
-			return fmt.Errorf("claude code channel: pass-through body is not allowed")
+			return fmt.Errorf("subscription OAuth channel: pass-through body is not allowed")
 		}
 		if channel.ParamOverride != nil {
 			paramOverride := strings.TrimSpace(*channel.ParamOverride)
 			if paramOverride != "" && paramOverride != "{}" && paramOverride != "[]" {
-				return fmt.Errorf("claude code channel: parameter overrides are not allowed")
+				return fmt.Errorf("subscription OAuth channel: parameter overrides are not allowed")
+			}
+		}
+		for headerName := range channel.GetHeaderOverride() {
+			if relaychannel.IsSubscriptionOAuthProtectedHeader(channel.Type, headerName) {
+				return fmt.Errorf("subscription OAuth channel: critical header %q cannot be overridden", headerName)
 			}
 		}
 	}
@@ -1244,7 +1254,7 @@ func FetchModels(c *gin.Context) {
 	}
 
 	if req.Type == constant.ChannelTypeCodex {
-		models, err := codex.FetchUpstreamModels(c.Request.Context(), &http.Client{}, baseURL, key)
+		models, err := fetchCodexUpstreamModelIDs(c.Request.Context(), baseURL, key, "")
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,

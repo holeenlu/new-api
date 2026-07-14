@@ -27,6 +27,10 @@ type ThinkingContentInfo struct {
 	HasSentThinkingContent  bool
 }
 
+func IsSubscriptionOAuthChannel(channelType int) bool {
+	return channelType == constant.ChannelTypeClaudeCode || channelType == constant.ChannelTypeCodex
+}
+
 const (
 	LastMessageTypeNone     = "none"
 	LastMessageTypeText     = "text"
@@ -800,6 +804,16 @@ func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOther
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || channelPassThroughEnabled {
 		return jsonData, nil
 	}
+	return removeDisabledFields(jsonData, channelOtherSettings)
+}
+
+// RemoveDisabledFieldsForSubscriptionOAuth always applies the provider safety
+// filters, even when passthrough was enabled globally or by legacy channel data.
+func RemoveDisabledFieldsForSubscriptionOAuth(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings) ([]byte, error) {
+	return removeDisabledFields(jsonData, channelOtherSettings)
+}
+
+func removeDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings) ([]byte, error) {
 	if !hasRemovableDisabledField(jsonData, channelOtherSettings) {
 		return jsonData, nil
 	}

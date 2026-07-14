@@ -51,7 +51,7 @@ func EmbeddingHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 
 	if len(info.ParamOverride) > 0 {
-		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
+		jsonData, err = relaycommon.ApplyParamOverrideForChannel(jsonData, info)
 		if err != nil {
 			return newAPIErrorFromParamOverride(err)
 		}

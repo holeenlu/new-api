@@ -352,6 +352,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
 	}
+	if service.IsSubscriptionOAuthTransientError(c.GetInt("channel_type"), openaiErr) {
+		return true
+	}
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
 

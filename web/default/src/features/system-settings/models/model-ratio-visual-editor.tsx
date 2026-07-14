@@ -96,8 +96,22 @@ type ModelRatioVisualEditorProps = {
 }
 
 export type ModelRatioVisualEditorHandle = {
-  commitOpenEditor: () => Promise<boolean>
+  commitOpenEditor: () => Promise<ModelRatioPricingPatch | null>
 }
+
+export type ModelRatioPricingPatch = Pick<
+  ModelRatioVisualEditorProps,
+  | 'modelPrice'
+  | 'modelRatio'
+  | 'cacheRatio'
+  | 'createCacheRatio'
+  | 'completionRatio'
+  | 'imageRatio'
+  | 'audioRatio'
+  | 'audioCompletionRatio'
+  | 'billingMode'
+  | 'billingExpr'
+>
 
 const STORAGE_KEY = 'model-ratio-column-visibility'
 
@@ -577,25 +591,31 @@ const ModelRatioVisualEditorComponent = forwardRef<
         }
       })
 
-      onChange('ModelPrice', JSON.stringify(priceMap, null, 2))
-      onChange('ModelRatio', JSON.stringify(ratioMap, null, 2))
-      onChange('CacheRatio', JSON.stringify(cacheMap, null, 2))
-      onChange('CreateCacheRatio', JSON.stringify(createCacheMap, null, 2))
-      onChange('CompletionRatio', JSON.stringify(completionMap, null, 2))
-      onChange('ImageRatio', JSON.stringify(imageMap, null, 2))
-      onChange('AudioRatio', JSON.stringify(audioMap, null, 2))
-      onChange(
-        'AudioCompletionRatio',
-        JSON.stringify(audioCompletionMap, null, 2)
-      )
-      onChange(
-        'billing_setting.billing_mode',
-        JSON.stringify(billingModeMap, null, 2)
-      )
-      onChange(
-        'billing_setting.billing_expr',
-        JSON.stringify(billingExprMap, null, 2)
-      )
+      const patch: ModelRatioPricingPatch = {
+        modelPrice: JSON.stringify(priceMap, null, 2),
+        modelRatio: JSON.stringify(ratioMap, null, 2),
+        cacheRatio: JSON.stringify(cacheMap, null, 2),
+        createCacheRatio: JSON.stringify(createCacheMap, null, 2),
+        completionRatio: JSON.stringify(completionMap, null, 2),
+        imageRatio: JSON.stringify(imageMap, null, 2),
+        audioRatio: JSON.stringify(audioMap, null, 2),
+        audioCompletionRatio: JSON.stringify(audioCompletionMap, null, 2),
+        billingMode: JSON.stringify(billingModeMap, null, 2),
+        billingExpr: JSON.stringify(billingExprMap, null, 2),
+      }
+
+      onChange('ModelPrice', patch.modelPrice)
+      onChange('ModelRatio', patch.modelRatio)
+      onChange('CacheRatio', patch.cacheRatio)
+      onChange('CreateCacheRatio', patch.createCacheRatio)
+      onChange('CompletionRatio', patch.completionRatio)
+      onChange('ImageRatio', patch.imageRatio)
+      onChange('AudioRatio', patch.audioRatio)
+      onChange('AudioCompletionRatio', patch.audioCompletionRatio)
+      onChange('billing_setting.billing_mode', patch.billingMode)
+      onChange('billing_setting.billing_expr', patch.billingExpr)
+
+      return patch
     },
     [
       modelPrice,
@@ -653,15 +673,41 @@ const ModelRatioVisualEditorComponent = forwardRef<
     ref,
     () => ({
       commitOpenEditor: async () => {
-        if (!editorOpen || !editorPanelRef.current) return true
+        if (!editorOpen || !editorPanelRef.current) {
+          return {
+            modelPrice,
+            modelRatio,
+            cacheRatio,
+            createCacheRatio,
+            completionRatio,
+            imageRatio,
+            audioRatio,
+            audioCompletionRatio,
+            billingMode,
+            billingExpr,
+          }
+        }
         const data = await editorPanelRef.current.commitDraft()
-        if (!data) return false
-        persistPricingData(data)
+        if (!data) return null
+        const patch = persistPricingData(data)
         setEditData(data)
-        return true
+        return patch
       },
     }),
-    [editorOpen, persistPricingData]
+    [
+      audioCompletionRatio,
+      audioRatio,
+      billingExpr,
+      billingMode,
+      cacheRatio,
+      completionRatio,
+      createCacheRatio,
+      editorOpen,
+      imageRatio,
+      modelPrice,
+      modelRatio,
+      persistPricingData,
+    ]
   )
 
   const hasRows = table.getRowModel().rows.length > 0

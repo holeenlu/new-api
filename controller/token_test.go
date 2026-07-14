@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -444,6 +445,28 @@ func TestSearchTokensMasksKeyInResponse(t *testing.T) {
 	}
 }
 
+func TestAdminTokenListExcludesOtherPrivilegedUsers(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	adminToken := seedToken(t, db, 1, "admin-token", "admin1234token5678")
+	rootToken := seedToken(t, db, 2, "root-token", "root1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/?p=1&size=10", nil, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	GetAllTokens(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var page tokenPageResponse
+	require.NoError(t, common.Unmarshal(response.Data, &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, adminToken.Id, page.Items[0].ID)
+	require.NotContains(t, recorder.Body.String(), rootToken.Name)
+	require.NotContains(t, recorder.Body.String(), rootToken.Key)
+}
+
 func TestGetTokenMasksKeyInResponse(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "detail-token", "qrst1234uvwx5678")
@@ -537,4 +560,60 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	if strings.Contains(unauthorizedRecorder.Body.String(), token.Key) {
 		t.Fatalf("unauthorized key response leaked raw token key: %s", unauthorizedRecorder.Body.String())
 	}
+}
+
+func TestAdminCannotManageRootUserToken(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	token := seedToken(t, db, 2, "root-token", "root1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+	GetTokenKey(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.False(t, response.Success)
+	require.NotContains(t, recorder.Body.String(), token.Key)
+}
+
+func TestRootCanManageAdminUserToken(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	token := seedToken(t, db, 2, "admin-token", "admin1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, 1)
+	ctx.Set("role", common.RoleRootUser)
+	ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+	GetTokenKey(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var keyData tokenKeyResponse
+	require.NoError(t, common.Unmarshal(response.Data, &keyData))
+	require.Equal(t, token.GetFullKey(), keyData.Key)
+}
+
+func TestBatchDeleteTokensDoesNotPartiallyDeleteOnAuthorizationFailure(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	adminToken := seedToken(t, db, 1, "admin-token", "admin1234token5678")
+	rootToken := seedToken(t, db, 2, "root-token", "root1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodDelete, "/api/token/batch", TokenBatch{Ids: []int{adminToken.Id, rootToken.Id}}, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	DeleteTokenBatch(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.False(t, response.Success)
+	_, err := model.GetTokenById(adminToken.Id)
+	require.NoError(t, err)
+	_, err = model.GetTokenById(rootToken.Id)
+	require.NoError(t, err)
 }
