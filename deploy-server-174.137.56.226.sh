@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Compatibility entry point for deploying new-api to 104.128.92.169.
-# The canonical implementation is bin/deploy-104.128.92.169.sh.
+# Compatibility entry point for deploying new-api to 174.137.56.226.
+# The canonical implementation is bin/deploy-174.137.56.226.sh.
 #
 # Supported compatibility variables:
 #   REMOTE / DEPLOY_TARGET
@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-export DEPLOY_TARGET=${DEPLOY_TARGET:-${REMOTE:-root@104.128.92.169}}
+export DEPLOY_TARGET=${DEPLOY_TARGET:-${REMOTE:-root@174.137.56.226}}
 export REMOTE_IMAGE=${REMOTE_IMAGE:-${IMAGE:-new-api:oauth-local}}
 
-exec "$ROOT_DIR/bin/deploy-104.128.92.169.sh" "$@"
+exec "$ROOT_DIR/bin/deploy-174.137.56.226.sh" "$@"

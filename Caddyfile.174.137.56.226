@@ -1,4 +1,4 @@
-http://104.128.92.169 {
+http://174.137.56.226 {
 	redir https://nextcode.buildtoconnect.com{uri} permanent
 }
 
