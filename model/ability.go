@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -105,23 +106,81 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
-func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+func GetChannel(group string, model string, retry int, requestPath string, filters ...ChannelCandidateFilter) (*Channel, error) {
 	var abilities []Ability
 
 	var err error = nil
-	channelQuery, err := getChannelQuery(group, model, retry)
-	if err != nil {
-		return nil, err
-	}
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) || common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
+	filterCandidates := len(filters) > 0 && filters[0] != nil
+	if filterCandidates {
+		err = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+			Order("priority DESC").
+			Order("weight DESC").
+			Find(&abilities).Error
 	} else {
+		channelQuery, queryErr := getChannelQuery(group, model, retry)
+		if queryErr != nil {
+			return nil, queryErr
+		}
 		err = channelQuery.Order("weight DESC").Find(&abilities).Error
 	}
 	if err != nil {
 		return nil, err
 	}
 	abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
+	if filterCandidates && len(abilities) > 0 {
+		channelIDs := make([]int, 0, len(abilities))
+		for _, ability := range abilities {
+			channelIDs = append(channelIDs, ability.ChannelId)
+		}
+		var channels []*Channel
+		if err := DB.Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+		allowed := make(map[int]bool, len(channels))
+		for _, candidate := range channels {
+			allowed[candidate.Id] = filters[0](candidate)
+		}
+		filtered := make([]Ability, 0, len(abilities))
+		for _, ability := range abilities {
+			if allowed[ability.ChannelId] {
+				filtered = append(filtered, ability)
+			}
+		}
+		abilities = filtered
+
+		priorities := make([]int64, 0)
+		seenPriorities := make(map[int64]struct{})
+		for _, ability := range abilities {
+			priority := int64(0)
+			if ability.Priority != nil {
+				priority = *ability.Priority
+			}
+			if _, seen := seenPriorities[priority]; seen {
+				continue
+			}
+			seenPriorities[priority] = struct{}{}
+			priorities = append(priorities, priority)
+		}
+		if len(priorities) > 0 {
+			sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+			priorityIndex := retry
+			if priorityIndex >= len(priorities) {
+				priorityIndex = len(priorities) - 1
+			}
+			targetPriority := priorities[priorityIndex]
+			filtered = filtered[:0]
+			for _, ability := range abilities {
+				priority := int64(0)
+				if ability.Priority != nil {
+					priority = *ability.Priority
+				}
+				if priority == targetPriority {
+					filtered = append(filtered, ability)
+				}
+			}
+			abilities = filtered
+		}
+	}
 	channel := Channel{}
 	if len(abilities) > 0 {
 		// Randomly choose one

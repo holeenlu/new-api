@@ -386,18 +386,17 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
 		}
 
-		// 打印类似 curl 命令格式的信息
-		logger.LogDebug(c.Request.Context(), "--form 'model=\"%s\"'", request.Model)
+		logger.LogDebug(c.Request.Context(), "audio multipart request model=%s; field values omitted", request.Model)
 
-		// 遍历表单字段并打印输出
+		// Copy form fields without logging their values.
 		for key, values := range formData.Value {
 			if key == "model" {
 				continue
 			}
 			for _, value := range values {
 				writer.WriteField(key, value)
-				logger.LogDebug(c.Request.Context(), "--form '%s=\"%s\"'", key, value)
 			}
+			logger.LogDebug(c.Request.Context(), "audio multipart field=%s value_count=%d", key, len(values))
 		}
 
 		// 从 formData 中获取文件
@@ -408,8 +407,8 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 
 		// 使用 formData 中的第一个文件
 		fileHeader := fileHeaders[0]
-		logger.LogDebug(c.Request.Context(), "--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
-			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type"))
+		logger.LogDebug(c.Request.Context(), "audio multipart file content omitted (size: %d bytes, content-type: %s)",
+			fileHeader.Size, fileHeader.Header.Get("Content-Type"))
 
 		file, err := fileHeader.Open()
 		if err != nil {

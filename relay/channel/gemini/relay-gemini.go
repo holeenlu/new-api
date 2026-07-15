@@ -302,7 +302,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	service.CloseResponseBodyGracefully(resp)
-	logger.LogDebug(c, "Gemini response body: %s", responseBody)
+	logger.LogDebug(c, "upstream response body omitted from logs (%d bytes)", len(responseBody))
 	var geminiResponse dto.GeminiChatResponse
 	err = common.Unmarshal(responseBody, &geminiResponse)
 	if err != nil {
@@ -513,7 +513,7 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			body, _ := io.ReadAll(response.Body)
 			response.Body.Close()
 			cancel()
-			return nil, fmt.Errorf("服务器返回错误 %d: %s", response.StatusCode, string(body))
+			return nil, fmt.Errorf("服务器返回错误 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 		}
 
 		body, err := io.ReadAll(response.Body)

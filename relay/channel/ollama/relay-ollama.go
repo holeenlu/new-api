@@ -300,7 +300,7 @@ func FetchOllamaModels(baseURL, apiKey string) ([]OllamaModel, error) {
 
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
-		return nil, fmt.Errorf("服务器返回错误 %d: %s", response.StatusCode, string(body))
+		return nil, fmt.Errorf("服务器返回错误 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 	}
 
 	var tagsResponse OllamaTagsResponse
@@ -352,7 +352,7 @@ func PullOllamaModel(baseURL, apiKey, modelName string) error {
 
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("拉取模型失败 %d: %s", response.StatusCode, string(body))
+		return fmt.Errorf("拉取模型失败 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 	}
 
 	return nil
@@ -393,7 +393,7 @@ func PullOllamaModelStream(baseURL, apiKey, modelName string, progressCallback f
 
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("拉取模型失败 %d: %s", response.StatusCode, string(body))
+		return fmt.Errorf("拉取模型失败 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 	}
 
 	// 读取流式响应
@@ -467,7 +467,7 @@ func DeleteOllamaModel(baseURL, apiKey, modelName string) error {
 
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("删除模型失败 %d: %s", response.StatusCode, string(body))
+		return fmt.Errorf("删除模型失败 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 	}
 
 	return nil
@@ -503,7 +503,7 @@ func FetchOllamaVersion(baseURL, apiKey string) (string, error) {
 	}
 
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("查询版本失败 %d: %s", response.StatusCode, string(body))
+		return "", fmt.Errorf("查询版本失败 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 	}
 
 	var versionResp struct {

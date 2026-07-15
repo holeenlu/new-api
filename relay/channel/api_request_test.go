@@ -139,6 +139,69 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 	require.False(t, hasAcceptEncoding)
 }
 
+func TestProcessHeaderOverride_PassthroughSkipsClientNetworkHeaders(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Trace-Id", "trace-123")
+	ctx.Request.Header.Set("X-Forwarded-For", "203.0.113.10")
+	ctx.Request.Header.Set("X-Real-Ip", "203.0.113.10")
+	ctx.Request.Header.Set("Cf-Connecting-Ip", "203.0.113.10")
+	ctx.Request.Header.Set("Forwarded", "for=203.0.113.10")
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			HeadersOverride: map[string]any{"*": ""},
+		},
+	}
+
+	headers, err := processHeaderOverride(info, ctx)
+	require.NoError(t, err)
+	require.Equal(t, "trace-123", headers["x-trace-id"])
+	require.NotContains(t, headers, "x-forwarded-for")
+	require.NotContains(t, headers, "x-real-ip")
+	require.NotContains(t, headers, "cf-connecting-ip")
+	require.NotContains(t, headers, "forwarded")
+}
+
+func TestProcessHeaderOverride_RejectsExplicitClientNetworkHeader(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			HeadersOverride: map[string]any{
+				"X-Forwarded-For": "{client_header:X-Forwarded-For}",
+			},
+		},
+	}
+
+	_, err := processHeaderOverride(info, ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot be forwarded upstream")
+}
+
+func TestStripSensitiveClientNetworkHeadersFinalOutboundGuard(t *testing.T) {
+	t.Parallel()
+
+	header := http.Header{
+		"X-Forwarded-For":          {"203.0.113.10"},
+		"X-Envoy-External-Address": {"203.0.113.10"},
+		"X-Trace-Id":               {"trace-123"},
+	}
+
+	stripSensitiveClientNetworkHeaders(header)
+
+	require.Empty(t, header.Get("X-Forwarded-For"))
+	require.Empty(t, header.Get("X-Envoy-External-Address"))
+	require.Equal(t, "trace-123", header.Get("X-Trace-Id"))
+}
+
 func TestProcessHeaderOverride_ClaudeCodeRejectsProtectedHeaders(t *testing.T) {
 	t.Parallel()
 
@@ -197,7 +260,8 @@ func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelType: constant.ChannelTypeCodex,
 			HeadersOverride: map[string]any{
-				"User-Agent": "untrusted-client",
+				"User-Agent":                             "untrusted-client",
+				"X-OpenAI-Internal-Codex-Responses-Lite": "true",
 			},
 		},
 	}
@@ -217,9 +281,11 @@ func TestProcessHeaderOverride_CodexRuntimeHeadersSkipProtectedIdentity(t *testi
 	info := &relaycommon.RelayInfo{
 		UseRuntimeHeadersOverride: true,
 		RuntimeHeadersOverride: map[string]any{
-			"originator": "Codex Desktop",
-			"user-agent": "untrusted-client",
-			"session-id": "session-123",
+			"originator":                             "Codex Desktop",
+			"user-agent":                             "untrusted-client",
+			"x-openai-internal-codex-responses-lite": "true",
+			"x-codex-beta-features":                  "untrusted-beta",
+			"session-id":                             "session-123",
 		},
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelType: constant.ChannelTypeCodex,
@@ -230,6 +296,8 @@ func TestProcessHeaderOverride_CodexRuntimeHeadersSkipProtectedIdentity(t *testi
 	require.NoError(t, err)
 	require.NotContains(t, headers, "originator")
 	require.NotContains(t, headers, "user-agent")
+	require.NotContains(t, headers, "x-openai-internal-codex-responses-lite")
+	require.NotContains(t, headers, "x-codex-beta-features")
 	require.Equal(t, "session-123", headers["session-id"])
 }
 

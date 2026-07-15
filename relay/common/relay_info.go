@@ -31,6 +31,15 @@ func IsSubscriptionOAuthChannel(channelType int) bool {
 	return channelType == constant.ChannelTypeClaudeCode || channelType == constant.ChannelTypeCodex
 }
 
+// IsRequestPassThroughEnabled centralizes request body passthrough policy.
+// Subscription OAuth channels must always use the converted request body.
+func IsRequestPassThroughEnabled(info *RelayInfo) bool {
+	if info == nil || info.ChannelMeta == nil || IsSubscriptionOAuthChannel(info.ChannelType) {
+		return false
+	}
+	return model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled
+}
+
 const (
 	LastMessageTypeNone     = "none"
 	LastMessageTypeText     = "text"

@@ -141,7 +141,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		var responseItems []dto.MidjourneyDto
 		err = common.Unmarshal(responseBody, &responseItems)
 		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("Get Mjp Task parse body error2: %v, body: %s", err, string(responseBody)))
+			logger.LogError(ctx, fmt.Sprintf("Get Mjp Task parse body error: %v; response body omitted (%d bytes)", err, len(responseBody)))
 			resp.Body.Close()
 			cancel()
 			continue

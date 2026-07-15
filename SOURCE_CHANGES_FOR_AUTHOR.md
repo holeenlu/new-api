@@ -4,20 +4,17 @@
 
 ## 1. ChatGPT/Codex 订阅渠道
 
-### 1.1 固定可用模型
+### 1.1 上游动态模型发现与可选限制
 
 文件：`relay/channel/codex/constants.go`
 
-将 Codex 渠道模型列表限制为：
+Codex 渠道不再在代码中固定模型列表。模型列表由环境变量
+`CODEX_MODEL_LIST` 控制：
 
-```text
-gpt-5.6-sol
-gpt-5.6-terra
-gpt-5.6-luna
-gpt-5.5
-```
+- 未设置或为空：不返回本地预设模型，渠道编辑器通过 OAuth 授权后的上游模型接口获取当前账号实际可用的模型；
+- 设置为逗号分隔列表：仅将该列表作为管理员显式限制，自动去除空项和重复项。
 
-原先的 `gpt-5.4`、`gpt-5.4 mini` 以及其他自动生成的模型和 compact 后缀模型不再出现在 Codex 模型列表中。
+因此，不再维护 `gpt-5.4`、`gpt-5.4 mini`、`gpt-5.6-*` 或 compact 后缀模型的代码内白名单，避免本地目录与上游账号实际权限脱节。
 
 ### 1.2 Codex OAuth 浏览器授权流程
 
@@ -106,9 +103,11 @@ x-responsesapi-include-timing-metrics
 
 认证、账号、`originator`、`user-agent`、`content-type` 等身份与协议 Header
 由服务端生成，客户端和渠道静态配置均不能覆盖。内部
-`x-openai-internal-codex-responses-lite` 不接受客户端透传，只在 Lite 渠道测试中由服务端补充。
+`x-openai-internal-codex-responses-lite` 不接受客户端透传，也不能通过渠道
+Header Override 强制开启；服务端仅在映射后的上游模型属于 `gpt-5.6-*`
+且端点为 `/v1/responses` 时受控补充。
 
-对于 `gpt-5.6-*` 模型的渠道测试请求，自动补充：
+对于 `gpt-5.6-*` 模型的渠道测试和正常 OAuth API 请求，自动补充：
 
 ```text
 originator: Codex Desktop
@@ -124,7 +123,15 @@ x-codex-beta-features: remote_compaction_v2
 - `tool_choice: "auto"`；
 - `text: {"verbosity":"low"}`；
 - `reasoning.context: "all_turns"`；
-- 固定的 session/thread/turn/window 元数据。
+- 与客户端会话一致的 session/thread/turn/window 元数据；客户端未提供时由服务端生成。
+
+Lite 请求还必须满足：
+
+- `stream: true`；
+- `store: false`；
+- 工具仅允许 `function`、`custom`，以及 `execution: "client"` 的
+  `tool_search`。包含 `namespace`、托管 `tool_search` 或其他服务端工具时，
+  保留原始工具结构并自动回退到普通 Responses 模式，不会静默删除或改写工具。
 
 这些修改用于解决 Codex Lite 对请求头、流式响应和 reasoning context 的严格校验。
 
@@ -153,7 +160,7 @@ Context json.RawMessage `json:"context,omitempty"`
 - `controller/channel_upstream_update.go`
 
 Codex 渠道测试强制使用 stream 模式，定时自动测试会跳过订阅 OAuth 渠道。
-适配器的默认模型列表保持为本地固定 `ModelList`；管理端手动抓取模型和上游模型巡检则调用
+适配器仅在配置 `CODEX_MODEL_LIST` 时返回该显式限制列表；管理端手动抓取模型和上游模型巡检调用
 `/backend-api/codex/models`，按当前 ChatGPT 账号返回实际可用模型。模型抓取继承请求或任务
 Context，并受到订阅 OAuth 超时限制，不再使用不可取消的 `context.Background()`。
 上游价格同步明确排除 Codex 与 Claude Code OAuth 渠道。
@@ -258,7 +265,7 @@ x-app: cli
 - 每个渠道默认最多 5 个并发请求，相邻请求启动间隔默认 750ms；
 - 等待上游首个响应头默认最多 30 秒；
 - 本地并发保护触发时返回可重试的 503，以便切换到备用订阅渠道；
-- 上游 5xx、504、524 可进入渠道重试和故障转移，确定性的客户端错误不重试；
+- 上游 5xx、504、524 可进入重试判断，但默认只允许当前多 Key 渠道换 Key 重试；只有管理员显式配置相同供应商端点或相同数据策略组后，才允许跨渠道重试；
 - 定时推理测试和上游价格同步跳过订阅 OAuth 渠道。
 
 ## 3. 管理与模型价格
@@ -362,9 +369,39 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 `http://192.168.11.12:3000`；104 服务器保留宿主机本地诊断映射
 `http://127.0.0.1:3001`，公网入口为 `https://nextcode.buildtoconnect.com`。
 
-## 7. 已知限制和建议
+## 7. HTTPS、日志和重试数据治理
 
-### 7.1 Anthropic OAuth 组织权限
+- `104.128.92.169` 公网部署强制启用 `SESSION_COOKIE_SECURE=true`，可信入口默认为 `https://nextcode.buildtoconnect.com`；Caddy 将公网 IP 的 HTTP 请求永久重定向到该 HTTPS 域名并发送 HSTS；
+- 本地和 `192.168.11.12` 内网部署不强制 Secure Cookie，继续支持 HTTP；
+- 请求正文、上游响应正文、SSE 事件、OAuth code/token、Webhook 签名和正文不写入运行日志，诊断日志仅保留状态码、字节数和非内容元数据；
+- 渠道编辑器新增“数据治理”，可填写真实供应商、数据区域、保留期、训练策略、重试隔离范围和策略组；
+- 默认 `channel` 隔离不把提示词发送到其他渠道；当前渠道为多 Key 时才可在该渠道内换 Key；
+- `provider` 隔离要求渠道类型、规范化上游端点、显式供应商、区域、保留期和训练策略全部一致；
+- `policy_group` 隔离要求显式供应商、区域、保留期、训练策略和策略组全部一致；配置不完整或非法时运行期自动回退到 `channel`，失败关闭；
+- 已尝试的单 Key 渠道不会再次入选；内存缓存和数据库直查路径使用同一候选过滤边界；找不到合规备用渠道时保留并返回原始上游错误；
+- 响应通过 `X-Relay-Upstream-Provider`、`X-Relay-Attempt`、`X-Relay-Retry-Count`、`X-Relay-Retry-Isolation`、`X-Relay-Data-Region`、`X-Relay-Data-Retention` 和 `X-Relay-Data-Training` 披露实际处理策略，CORS 同步暴露这些 Header。
+
+新增回归测试：`service/retry_data_policy_test.go`，覆盖默认隔离、多 Key 渠道内重试、配置不完整时失败关闭、相同供应商边界、策略组边界和响应头披露。
+
+## 8. 上游位置与客户端 IP 隐私
+
+- 所有 JSON 模型请求在最终出站边界执行位置隐私策略，参数覆盖和渠道正文直通不能绕过；
+- `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
+- `UPSTREAM_LOCATION_MODE=auto` 根据真实网络路径选择画像：渠道配置代理或 `UPSTREAM_SYSTEM_PROXY_ENABLED=true` 时使用 VPN/代理出口画像，否则使用宿主网络出口画像；两套画像可分别由 `UPSTREAM_EGRESS_LOCATION_*` 和 `UPSTREAM_HOST_LOCATION_*` 显式配置；
+- `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径和已启用的系统代理/VPN 路径检查 ChatGPT、Claude 连通性；两者均可建立 HTTP 连接后，通过 Cloudflare trace 获取该路径的实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度。显式环境变量始终优先，探测只补充空字段；探测失败不会放行客户端位置；
+- `UPSTREAM_LOCATION_MODE=egress` 仅在客户端原本提供位置的协议位置上，改写为通过 `UPSTREAM_EGRESS_LOCATION_*` 配置的最终 VPN/代理出口位置，而不是宿主机物理位置；配置缺失时失败关闭并删除原字段；旧的 `relay` 和 `RELAY_LOCATION_*` 仍作为兼容别名；
+- `UPSTREAM_LOCATION_MODE=client` 明确允许客户端正文位置透传，但客户端真实 IP 无论位于 Header 还是协议 metadata 都仍禁止发送；
+- `Forwarded`、`X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP` 以及常见 CDN/代理客户端 IP Header 被加入强制出站禁止名单，通配、正则和显式 Header Override 均不能绕过；
+- 中转服务器不伪造或添加自己的 `X-Forwarded-For`，模型服务商通过连接来源自然看到中转服务器出口 IP；
+- 国内宿主机通过 VPN、SOCKS5 或 HTTP 代理访问上游时，上游自然看到代理出口 IP；代理必须禁止自行追加客户端或宿主机的 `Forwarded`/`X-Forwarded-For`，否则该 Header 是在离开应用后由代理新增，应用无法再次清理；
+- Root 控制面板的“系统设置 → 操作设置 → 上游隐私”可保存位置转发模式，并只读展示系统级 VPN/TUN 状态、自动选择规则、宿主画像和代理出口画像；模式保存到数据库并在运行时热更新、多节点按既有 Option 同步周期传播，`UPSTREAM_LOCATION_MODE` 仅作为数据库尚未配置时的启动默认值；画像数据来自当前进程加载的显式环境变量及启动探测结果，不暴露代理 URL 或凭证；
+- `UPSTREAM_HOST_PUBLIC_IP` 和 `UPSTREAM_EGRESS_PUBLIC_IP` 仅作为 Root 控制面板中的出口 IP 展示值，不会写入模型请求；真实网络来源仍由 TCP/TLS 出口决定；
+- 自动探测只发送无凭证的连通性请求，不携带客户端请求、OAuth Token 或模型数据；公网出口 IP 会被 Cloudflare 和 `ipwho.is` 看到。对第三方 IP 地理定位服务有合规限制时，可设置 `UPSTREAM_LOCATION_DISCOVERY_ENABLED=false` 并完全使用显式画像；
+- 三套部署入口共用 `docker-compose.deploy.yml` 的隐私环境变量，部署脚本会为已有或新建 `.env` 补齐 `UPSTREAM_LOCATION_MODE=strip`、`UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 和 8 秒总探测超时。安全默认仍为删除客户端位置，探测画像不会自动改变转发模式。
+
+## 9. 已知限制和建议
+
+### 9.1 Anthropic OAuth 组织权限
 
 如果上游返回：
 
@@ -374,7 +411,7 @@ OAuth authentication is currently not allowed for this organization.
 
 表示 Token 已被上游识别，但所属 Anthropic 组织不允许 OAuth API 访问。该错误不是网关请求头错误，无法由本项目绕过。建议对该错误增加专门提示，而不是统一显示为 `unknown_error`。
 
-### 7.2 建议作者审阅
+### 9.2 建议作者审阅
 
 1. Codex OAuth client ID、redirect URI 和 scope 是否应由配置项管理；
 2. Codex 渠道测试使用的固定 session/turn 元数据是否应改为每次动态生成；

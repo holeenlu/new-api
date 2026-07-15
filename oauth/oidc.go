@@ -53,7 +53,7 @@ func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Co
 		return nil, NewOAuthError(i18n.MsgOAuthInvalidCode, nil)
 	}
 
-	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken: code=%s...", code[:min(len(code), 10)])
+	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken started; authorization code omitted")
 
 	settings := system_setting.GetOIDCSettings()
 	redirectUri := fmt.Sprintf("%s/oauth/oidc", system_setting.ServerAddress)
@@ -64,7 +64,7 @@ func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Co
 	values.Set("grant_type", "authorization_code")
 	values.Set("redirect_uri", redirectUri)
 
-	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken: token_endpoint=%s, redirect_uri=%s", settings.TokenEndpoint, redirectUri)
+	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken request prepared; endpoint and redirect URI omitted")
 
 	req, err := http.NewRequestWithContext(ctx, "POST", settings.TokenEndpoint, strings.NewReader(values.Encode()))
 	if err != nil {

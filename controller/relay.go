@@ -88,7 +88,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
-			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			logger.LogError(c, fmt.Sprintf(
+				"relay error: status_code=%d error_type=%v error_code=%v detail=%s",
+				newAPIError.StatusCode,
+				newAPIError.GetErrorType(),
+				newAPIError.GetErrorCode(),
+				newAPIError.Error(),
+			))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -193,11 +199,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			newAPIError = channelErr
+			if retryParam.GetRetry() > 0 && relayInfo.LastError != nil {
+				newAPIError = relayInfo.LastError
+			} else {
+				newAPIError = channelErr
+			}
 			break
 		}
 
 		addUsedChannel(c, channel.Id)
+		attempt := len(c.GetStringSlice("use_channel"))
+		service.ApplyRelayDataPolicyHeaders(c, channel, attempt)
+		if retryParam.Boundary == nil {
+			retryParam.Boundary = service.NewRetryBoundary(channel)
+			if retryParam.Boundary != nil {
+				retryParam.CandidateFilter = retryParam.Boundary.Allows
+			}
+		}
+		if retryParam.Boundary != nil {
+			retryParam.Boundary.MarkAttempt(channel)
+		}
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -293,17 +314,11 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
 	if info.ChannelMeta == nil {
-		autoBan := c.GetBool("auto_ban")
-		autoBanInt := 1
-		if !autoBan {
-			autoBanInt = 0
+		channel, err := model.CacheGetChannel(c.GetInt("channel_id"))
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
-		return &model.Channel{
-			Id:      c.GetInt("channel_id"),
-			Type:    c.GetInt("channel_type"),
-			Name:    c.GetString("channel_name"),
-			AutoBan: &autoBanInt,
-		}, nil
+		return channel, nil
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
 
@@ -359,12 +374,21 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
-	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+	errorSummary := fmt.Sprintf(
+		"status_code=%d, error_type=%v, error_code=%v",
+		err.StatusCode,
+		err.GetErrorType(),
+		err.GetErrorCode(),
+	)
+	// Keep the compact summary for automatic channel policy decisions, but retain
+	// the actual upstream/network error in runtime and persisted error logs.
+	errorDetail := err.ErrorWithStatusCode()
+	logger.LogError(c, fmt.Sprintf("channel error (channel #%d): %s; detail: %s", channelError.ChannelId, errorSummary, errorDetail))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
-			service.DisableChannel(channelError, err.ErrorWithStatusCode())
+			service.DisableChannel(channelError, errorSummary)
 		})
 	}
 
@@ -400,7 +424,10 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		model.RecordErrorLog(
+			c, userId, channelId, modelName, tokenName, errorDetail, tokenId,
+			useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other,
+		)
 	}
 
 }

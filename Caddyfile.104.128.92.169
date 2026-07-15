@@ -1,7 +1,8 @@
 http://104.128.92.169 {
-	reverse_proxy new-api:3000
+	redir https://nextcode.buildtoconnect.com{uri} permanent
 }
 
 nextcode.buildtoconnect.com {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	reverse_proxy new-api:3000
 }

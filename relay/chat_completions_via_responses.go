@@ -136,7 +136,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
-	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -161,7 +161,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	upstreamStream := isResponsesEventStreamContentType(httpResp.Header.Get("Content-Type"))
 	info.IsStream = clientStream || upstreamStream
 	if httpResp.StatusCode != http.StatusOK {
-		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr
 	}

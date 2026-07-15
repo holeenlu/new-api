@@ -132,8 +132,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		}
 	}
 
-	if !model_setting.GetGlobalSettings().PassThroughRequestEnabled &&
-		!info.ChannelSetting.PassThroughBodyEnabled &&
+	if !relaycommon.IsRequestPassThroughEnabled(info) &&
 		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
 		result, convErr := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
 		if convErr != nil {
@@ -154,15 +153,21 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	}
 
 	var requestBody io.Reader
-	passThroughEnabled := !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
-		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
+	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
 	if passThroughEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		info.UpstreamRequestBodySize = storage.Size()
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.NewPrivacyFilteredPassThroughJSONBody(storage, info.ChannelSetting.Proxy != "")
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
 		convertedRequest, err := adaptor.ConvertClaudeRequest(c, info, request)
 		if err != nil {
@@ -192,12 +197,8 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 			}
 		}
 
-		if info.ChannelType == constant.ChannelTypeClaudeCode {
-			logger.LogDebug(c, "Claude Code OAuth request body omitted from logs (%d bytes)", len(jsonData))
-		} else {
-			logger.LogDebug(c, "requestBody: %s", jsonData)
-		}
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
+		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
@@ -218,7 +219,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError

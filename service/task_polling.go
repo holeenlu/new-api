@@ -256,11 +256,11 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 	var responseItems dto.TaskResponse[[]dto.SunoDataResponse]
 	err = common.Unmarshal(responseBody, &responseItems)
 	if err != nil {
-		logger.LogError(ctx, fmt.Sprintf("Get Suno Task parse body error2: %v, body: %s", err, string(responseBody)))
+		logger.LogError(ctx, fmt.Sprintf("Get Suno Task parse body error: %v; response body omitted (%d bytes)", err, len(responseBody)))
 		return err
 	}
 	if !responseItems.IsSuccess() {
-		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, 成功获取到任务数: %s", channelId, len(taskIds), string(responseBody)))
+		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, 上游响应正文已省略 (%d bytes)", channelId, len(taskIds), len(responseBody)))
 		return err
 	}
 
@@ -462,7 +462,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
 	}
 
-	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	logger.LogDebug(ctx, "upstream response body omitted from logs (%d bytes)", len(responseBody))
 
 	snap := task.Snapshot()
 
@@ -470,7 +470,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	// try parse as New API response format
 	var responseItems dto.TaskResponse[model.Task]
 	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
-		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
+		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new API response format")
 		t := responseItems.Data
 		taskResult.TaskID = t.TaskID
 		taskResult.Status = string(t.Status)
@@ -484,7 +484,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	task.Data = redactVideoResponseBody(responseBody)
 
-	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
+	logger.LogDebug(ctx, "updateVideoSingleTask parsed task status=%s", taskResult.Status)
 
 	now := time.Now().Unix()
 	if taskResult.Status == "" {
@@ -502,8 +502,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 				// 其他错误认为是任务失败，记录错误信息并更新任务状态
 				taskResult = relaycommon.FailTaskInfo("upstream returned error")
 			} else {
-				// unknown error format, log original response
-				logger.LogError(ctx, fmt.Sprintf("Task %s returned empty status with unrecognized error format, response: %s", taskId, string(responseBody)))
+					// Unknown error format: retain only status and size metadata.
+				logger.LogError(ctx, fmt.Sprintf("Task %s returned empty status with unrecognized error format; response body omitted (%d bytes)", taskId, len(responseBody)))
 				taskResult = relaycommon.FailTaskInfo("upstream returned unrecognized message")
 			}
 		}

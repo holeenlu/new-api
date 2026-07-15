@@ -50,7 +50,7 @@ func (p *GitHubProvider) ExchangeToken(ctx context.Context, code string, c *gin.
 		return nil, NewOAuthError(i18n.MsgOAuthInvalidCode, nil)
 	}
 
-	logger.LogDebug(ctx, "[OAuth-GitHub] ExchangeToken: code=%s...", code[:min(len(code), 10)])
+	logger.LogDebug(ctx, "[OAuth-GitHub] ExchangeToken started; authorization code omitted")
 
 	values := map[string]string{
 		"client_id":     common.GitHubClientId,
@@ -130,7 +130,7 @@ func (p *GitHubProvider) GetUserInfo(ctx context.Context, token *OAuthToken) (*O
 		if len(bodyStr) > 500 {
 			bodyStr = bodyStr[:500] + "..."
 		}
-		logger.LogError(ctx, fmt.Sprintf("[OAuth-GitHub] GetUserInfo failed: status=%d, body=%s", res.StatusCode, bodyStr))
+		logger.LogError(ctx, fmt.Sprintf("[OAuth-GitHub] GetUserInfo failed: status=%d, response body omitted (%d bytes)", res.StatusCode, len(bodyStr)))
 		return nil, NewOAuthErrorWithRaw(i18n.MsgOAuthGetUserErr, map[string]any{"Provider": "GitHub"}, fmt.Sprintf("status %d", res.StatusCode))
 	}
 

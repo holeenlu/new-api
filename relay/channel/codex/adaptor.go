@@ -43,17 +43,19 @@ const (
 	CodexOAuthUserAgent  = codexModelsUserAgent
 	CodexOAuthOriginator = "codex_cli_rs"
 	codexTestMetadataKey = "codex_channel_test_metadata"
+	codexLiteEnabledKey  = "codex_responses_lite_enabled"
 )
 
 type codexChannelTestMetadata struct {
 	SessionID      string
+	ThreadID       string
 	TurnID         string
 	InstallationID string
 	WindowID       string
 	TurnMetadata   string
 }
 
-func getOrCreateCodexChannelTestMetadata(c *gin.Context) (*codexChannelTestMetadata, error) {
+func getOrCreateCodexResponsesMetadata(c *gin.Context) (*codexChannelTestMetadata, error) {
 	if c != nil {
 		if existing, ok := c.Get(codexTestMetadataKey); ok {
 			if metadata, valid := existing.(*codexChannelTestMetadata); valid {
@@ -61,17 +63,44 @@ func getOrCreateCodexChannelTestMetadata(c *gin.Context) (*codexChannelTestMetad
 			}
 		}
 	}
-	sessionID := uuid.NewString()
+	var sessionID, threadID, windowID, suppliedTurnMetadata string
+	if c != nil {
+		sessionID = strings.TrimSpace(c.GetHeader("session-id"))
+		threadID = strings.TrimSpace(c.GetHeader("thread-id"))
+		windowID = strings.TrimSpace(c.GetHeader("x-codex-window-id"))
+		suppliedTurnMetadata = strings.TrimSpace(c.GetHeader("x-codex-turn-metadata"))
+	}
+	if sessionID == "" {
+		sessionID = uuid.NewString()
+	}
+	if threadID == "" {
+		threadID = sessionID
+	}
+	if windowID == "" {
+		windowID = sessionID + ":0"
+	}
 	metadata := &codexChannelTestMetadata{
 		SessionID:      sessionID,
+		ThreadID:       threadID,
 		TurnID:         uuid.NewString(),
 		InstallationID: uuid.NewString(),
-		WindowID:       sessionID + ":0",
+		WindowID:       windowID,
+	}
+	if supplied := suppliedTurnMetadata; supplied != "" {
+		var suppliedMetadata map[string]any
+		if err := common.Unmarshal([]byte(supplied), &suppliedMetadata); err == nil {
+			if value, ok := suppliedMetadata["turn_id"].(string); ok && strings.TrimSpace(value) != "" {
+				metadata.TurnID = strings.TrimSpace(value)
+			}
+			if value, ok := suppliedMetadata["installation_id"].(string); ok && strings.TrimSpace(value) != "" {
+				metadata.InstallationID = strings.TrimSpace(value)
+			}
+		}
 	}
 	turnMetadata, err := common.Marshal(map[string]any{
 		"installation_id":         metadata.InstallationID,
 		"session_id":              metadata.SessionID,
-		"thread_id":               metadata.SessionID,
+		"thread_id":               metadata.ThreadID,
 		"turn_id":                 metadata.TurnID,
 		"window_id":               metadata.WindowID,
 		"request_kind":            "turn",
@@ -87,6 +116,99 @@ func getOrCreateCodexChannelTestMetadata(c *gin.Context) (*codexChannelTestMetad
 		c.Set(codexTestMetadataKey, metadata)
 	}
 	return metadata, nil
+}
+
+func shouldUseCodexResponsesLite(info *relaycommon.RelayInfo) bool {
+	return info != nil &&
+		info.RelayMode == relayconstant.RelayModeResponses &&
+		isCodexLiteModel(info)
+}
+
+func codexResponsesLiteToolsCompatible(raw json.RawMessage) (bool, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return true, nil
+	}
+
+	var tools []json.RawMessage
+	if err := common.Unmarshal(raw, &tools); err != nil {
+		return false, types.NewErrorWithStatusCode(
+			errors.New("Codex Responses Lite requires tools to be a JSON array"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	for _, rawTool := range tools {
+		var tool struct {
+			Type      string `json:"type"`
+			Execution string `json:"execution"`
+		}
+		if err := common.Unmarshal(rawTool, &tool); err != nil {
+			return false, types.NewErrorWithStatusCode(
+				errors.New("Codex Responses Lite tool definitions must be JSON objects"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType == "function" || toolType == "custom" {
+			continue
+		}
+		if toolType == "tool_search" && strings.EqualFold(strings.TrimSpace(tool.Execution), "client") {
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func setCodexResponsesLiteEnabled(c *gin.Context, enabled bool) {
+	if c != nil {
+		c.Set(codexLiteEnabledKey, enabled)
+	}
+}
+
+func isCodexResponsesLiteEnabled(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if !shouldUseCodexResponsesLite(info) || c == nil {
+		return false
+	}
+	enabled, exists := c.Get(codexLiteEnabledKey)
+	if !exists {
+		return false
+	}
+	value, ok := enabled.(bool)
+	return ok && value
+}
+
+func ensureCodexLiteInclude(raw json.RawMessage) (json.RawMessage, error) {
+	const encryptedReasoning = "reasoning.encrypted_content"
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return json.RawMessage(`["reasoning.encrypted_content"]`), nil
+	}
+
+	var include []string
+	if err := common.Unmarshal(raw, &include); err != nil {
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("Codex Responses Lite requires include to be an array of strings"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	for _, item := range include {
+		if item == encryptedReasoning {
+			return raw, nil
+		}
+	}
+	include = append(include, encryptedReasoning)
+	encoded, err := common.Marshal(include)
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
 }
 
 var (
@@ -254,29 +376,74 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	if len(request.Instructions) == 0 {
 		request.Instructions = json.RawMessage(`""`)
 	}
-	if info != nil && info.IsChannelTest && isCodexLiteModel(info) {
-		metadata, err := getOrCreateCodexChannelTestMetadata(c)
+	useLite := false
+	if shouldUseCodexResponsesLite(info) {
+		if !info.IsStream {
+			return nil, types.NewErrorWithStatusCode(
+				errors.New("Codex Responses Lite requires stream=true"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		var err error
+		useLite, err = codexResponsesLiteToolsCompatible(request.Tools)
 		if err != nil {
 			return nil, err
 		}
-		clientMetadata := map[string]any{
+	}
+	setCodexResponsesLiteEnabled(c, useLite)
+	if useLite {
+		metadata, err := getOrCreateCodexResponsesMetadata(c)
+		if err != nil {
+			return nil, err
+		}
+		clientMetadata := make(map[string]any)
+		if trimmed := strings.TrimSpace(string(request.ClientMetadata)); trimmed != "" && trimmed != "null" {
+			if err := common.Unmarshal(request.ClientMetadata, &clientMetadata); err != nil {
+				return nil, types.NewErrorWithStatusCode(
+					errors.New("Codex Responses Lite requires client_metadata to be a JSON object"),
+					types.ErrorCodeInvalidRequest,
+					http.StatusBadRequest,
+					types.ErrOptionWithSkipRetry(),
+				)
+			}
+		}
+		generatedMetadata := map[string]any{
 			"session_id":              metadata.SessionID,
-			"thread_id":               metadata.SessionID,
+			"thread_id":               metadata.ThreadID,
 			"turn_id":                 metadata.TurnID,
 			"x-codex-installation-id": metadata.InstallationID,
 			"x-codex-turn-metadata":   metadata.TurnMetadata,
 			"x-codex-window-id":       metadata.WindowID,
+		}
+		for key, value := range generatedMetadata {
+			clientMetadata[key] = value
 		}
 		clientMetadataJSON, err := common.Marshal(clientMetadata)
 		if err != nil {
 			return nil, err
 		}
 		request.ClientMetadata = clientMetadataJSON
-		request.Include = json.RawMessage(`["reasoning.encrypted_content"]`)
+		request.Include, err = ensureCodexLiteInclude(request.Include)
+		if err != nil {
+			return nil, err
+		}
 		request.ParallelToolCalls = json.RawMessage(`false`)
-		request.ToolChoice = json.RawMessage(`"auto"`)
-		request.Text = json.RawMessage(`{"verbosity":"low"}`)
-		request.Reasoning = &dto.Reasoning{Effort: "medium", Context: json.RawMessage(`"all_turns"`)}
+		if len(request.ToolChoice) == 0 {
+			request.ToolChoice = json.RawMessage(`"auto"`)
+		}
+		if len(request.Text) == 0 {
+			request.Text = json.RawMessage(`{"verbosity":"low"}`)
+		}
+		if request.Reasoning == nil {
+			request.Reasoning = &dto.Reasoning{Effort: "medium"}
+		} else if request.Reasoning.Effort == "" {
+			request.Reasoning.Effort = "medium"
+		}
+		request.Reasoning.Context = json.RawMessage(`"all_turns"`)
+		stream := true
+		request.Stream = &stream
 	}
 
 	if isCompact {
@@ -359,8 +526,8 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 			req.Set(name, value)
 		}
 	}
-	if info.IsChannelTest && isCodexLiteModel(info) {
-		metadata, err := getOrCreateCodexChannelTestMetadata(c)
+	if isCodexResponsesLiteEnabled(c, info) {
+		metadata, err := getOrCreateCodexResponsesMetadata(c)
 		if err != nil {
 			return err
 		}
@@ -368,7 +535,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 		req.Set("x-openai-internal-codex-responses-lite", "true")
 		req.Set("x-codex-beta-features", "remote_compaction_v2")
 		req.Set("session-id", metadata.SessionID)
-		req.Set("thread-id", metadata.SessionID)
+		req.Set("thread-id", metadata.ThreadID)
 		req.Set("x-codex-turn-metadata", metadata.TurnMetadata)
 		req.Set("x-codex-window-id", metadata.WindowID)
 	}

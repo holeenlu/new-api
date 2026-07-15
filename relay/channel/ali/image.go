@@ -298,7 +298,7 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 	}
 
 	if aliTaskResponse.Message != "" {
-		logger.LogError(c, "ali_async_task_failed: "+aliTaskResponse.Message)
+		logger.LogError(c, "ali_async_task_failed; upstream message omitted")
 		return types.NewError(errors.New(aliTaskResponse.Message), types.ErrorCodeBadResponse), nil
 	}
 
@@ -327,9 +327,9 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 	}
 
 	if a.IsSyncImageModel {
-		logger.LogDebug(c, "ali_sync_image_result: %s", originRespBody)
+		logger.LogDebug(c, "ali_sync_image_result content omitted (%d bytes)", len(originRespBody))
 	} else {
-		logger.LogDebug(c, "ali_async_image_result: %s", originRespBody)
+		logger.LogDebug(c, "ali_async_image_result content omitted (%d bytes)", len(originRespBody))
 	}
 
 	imageResponses := responseAli2OpenAIImage(c, aliResponse, originRespBody, info, responseFormat)

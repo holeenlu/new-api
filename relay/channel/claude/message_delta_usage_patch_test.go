@@ -3,6 +3,7 @@ package claude
 import (
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -52,14 +53,22 @@ func TestShouldSkipClaudeMessageDeltaUsagePatch(t *testing.T) {
 	})
 
 	model_setting.GetGlobalSettings().PassThroughRequestEnabled = true
-	assert.True(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{}))
+	assert.True(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAnthropic},
+	}))
+	assert.False(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeClaudeCode},
+	}))
 
 	model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
 	assert.True(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: true}},
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAnthropic, ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: true}},
 	}))
 	assert.False(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: false}},
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAnthropic, ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: false}},
+	}))
+	assert.False(t, shouldSkipClaudeMessageDeltaUsagePatch(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeClaudeCode, ChannelSetting: dto.ChannelSettings{PassThroughBodyEnabled: true}},
 	}))
 }
 

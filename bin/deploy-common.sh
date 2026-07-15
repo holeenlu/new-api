@@ -40,10 +40,10 @@ deploy_source_version() {
 
 deploy_build_version() {
   local root_dir=$1
-  local source_version
-  source_version=$(deploy_source_version "$root_dir")
-  [[ -n "$source_version" ]] || deploy_die "Unable to determine the source version"
-  printf '%s-build.%s\n' "$source_version" "$(date -u +%Y%m%d%H%M%S)"
+  local release_version
+  release_version=$(git -C "$root_dir" describe --tags --abbrev=0 2>/dev/null || sed -n '1p' "$root_dir/VERSION")
+  [[ -n "$release_version" ]] || deploy_die "Unable to determine the release version"
+  printf '%s\n' "$release_version"
 }
 
 deploy_build_image() {
@@ -207,4 +207,8 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" CODEX_OAUTH_CLIENT_ID app_EMoamEEZ73f0CkXaXp7hrann
   deploy_env_ensure "$env_file" CODEX_OAUTH_REDIRECT_URI http://localhost:1455/auth/callback
   deploy_env_ensure "$env_file" CODEX_OAUTH_SCOPE "openid profile email offline_access"
+  deploy_env_ensure "$env_file" UPSTREAM_LOCATION_MODE strip
+  deploy_env_ensure "$env_file" UPSTREAM_SYSTEM_PROXY_ENABLED false
+  deploy_env_ensure "$env_file" UPSTREAM_LOCATION_DISCOVERY_ENABLED true
+  deploy_env_ensure "$env_file" UPSTREAM_LOCATION_DISCOVERY_TIMEOUT 8
 }

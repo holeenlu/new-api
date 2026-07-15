@@ -42,6 +42,7 @@ import {
   Route,
   Settings,
   SlidersHorizontal,
+  ShieldCheck,
   Wand2,
 } from 'lucide-react'
 import {
@@ -254,6 +255,7 @@ const CHANNEL_EDITOR_MAIN_SECTION_IDS = [
 ]
 const ADVANCED_SETTINGS_SECTION_IDS = {
   routingStrategy: 'channel-section-advanced-routing-strategy',
+  dataGovernance: 'channel-section-advanced-data-governance',
   internalNotes: 'channel-section-advanced-internal-notes',
   overrideRules: 'channel-section-advanced-override-rules',
   extraSettings: 'channel-section-advanced-extra-settings',
@@ -295,6 +297,12 @@ const SENSITIVE_FORM_FIELDS = [
   'allow_speed',
   'claude_beta_query',
   'disable_task_polling_sleep',
+  'data_provider',
+  'data_region',
+  'data_retention',
+  'data_training',
+  'retry_isolation',
+  'retry_policy_group',
   'upstream_model_update_check_enabled',
   'upstream_model_update_auto_sync_enabled',
   'upstream_model_update_ignored_models',
@@ -756,6 +764,12 @@ export function ChannelMutateDrawer({
   const currentAllowInferenceGeo = form.watch('allow_inference_geo')
   const currentAllowSpeed = form.watch('allow_speed')
   const currentClaudeBetaQuery = form.watch('claude_beta_query')
+  const currentDataProvider = form.watch('data_provider')
+  const currentDataRegion = form.watch('data_region')
+  const currentDataRetention = form.watch('data_retention')
+  const currentDataTraining = form.watch('data_training')
+  const currentRetryIsolation = form.watch('retry_isolation')
+  const currentRetryPolicyGroup = form.watch('retry_policy_group')
   const currentUpstreamModelUpdateAutoSyncEnabled = form.watch(
     'upstream_model_update_auto_sync_enabled'
   )
@@ -1025,11 +1039,20 @@ export function ChannelMutateDrawer({
     currentUpstreamModelUpdateAutoSyncEnabled ||
     currentUpstreamModelUpdateIgnoredModels?.trim()
   )
+  const dataGovernanceConfigured = Boolean(
+    currentDataProvider?.trim() ||
+    currentDataRegion?.trim() ||
+    currentDataRetention?.trim() ||
+    currentDataTraining !== 'provider_default' ||
+    currentRetryIsolation !== 'auto' ||
+    currentRetryPolicyGroup?.trim()
+  )
   const advancedConfigured = Boolean(
     routingStrategyConfigured ||
     internalNotesConfigured ||
     overrideRulesConfigured ||
     extraSettingsConfigured ||
+    dataGovernanceConfigured ||
     fieldPassthroughConfigured ||
     upstreamModelDetectionConfigured
   )
@@ -1038,6 +1061,11 @@ export function ChannelMutateDrawer({
       id: ADVANCED_SETTINGS_SECTION_IDS.routingStrategy,
       title: t('Routing Strategy'),
       configured: routingStrategyConfigured,
+    },
+    {
+      id: ADVANCED_SETTINGS_SECTION_IDS.dataGovernance,
+      title: t('Data governance'),
+      configured: dataGovernanceConfigured,
     },
     {
       id: ADVANCED_SETTINGS_SECTION_IDS.internalNotes,
@@ -3726,6 +3754,255 @@ export function ChannelMutateDrawer({
                                 </FormItem>
                               )}
                             />
+                          </div>
+
+                          <div
+                            id={ADVANCED_SETTINGS_SECTION_IDS.dataGovernance}
+                            className={configuredAdvancedSectionClassName(
+                              'flex scroll-mt-4 flex-col gap-4 border-t pt-4',
+                              dataGovernanceConfigured
+                            )}
+                          >
+                            <SubHeading
+                              title={t('Data governance')}
+                              icon={<ShieldCheck className='h-3.5 w-3.5' />}
+                              iconTone='success'
+                            />
+                            <Alert>
+                              <AlertDescription>
+                                {t(
+                                  'These values are disclosed in response headers and define the boundary for automatic retries.'
+                                )}
+                              </AlertDescription>
+                            </Alert>
+                            <div className='grid gap-4 sm:grid-cols-2'>
+                              <FormField
+                                control={form.control}
+                                name='data_provider'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>{t('Provider')}</FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder={t(
+                                          'Use the channel provider by default'
+                                        )}
+                                        disabled={sensitiveLocked}
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Public name of the upstream data processor'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='data_region'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>{t('Data region')}</FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder={t(
+                                          'Provider or account policy'
+                                        )}
+                                        disabled={sensitiveLocked}
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Region where prompts and outputs may be processed'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='data_retention'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>{t('Data retention')}</FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder={t(
+                                          'Provider or account policy'
+                                        )}
+                                        disabled={sensitiveLocked}
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Retention period disclosed to API clients'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='data_training'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>
+                                      {t('Training policy')}
+                                    </FormLabel>
+                                    <Select
+                                      disabled={sensitiveLocked}
+                                      items={[
+                                        {
+                                          value: 'provider_default',
+                                          label: t(
+                                            'Provider or account policy'
+                                          ),
+                                        },
+                                        {
+                                          value: 'disabled',
+                                          label: t('Disabled'),
+                                        },
+                                        {
+                                          value: 'enabled',
+                                          label: t('Enabled'),
+                                        },
+                                      ]}
+                                      onValueChange={field.onChange}
+                                      value={field.value}
+                                    >
+                                      <FormControl>
+                                        <SelectTrigger>
+                                          <SelectValue />
+                                        </SelectTrigger>
+                                      </FormControl>
+                                      <SelectContent
+                                        alignItemWithTrigger={false}
+                                      >
+                                        <SelectGroup>
+                                          <SelectItem value='provider_default'>
+                                            {t('Provider or account policy')}
+                                          </SelectItem>
+                                          <SelectItem value='disabled'>
+                                            {t('Disabled')}
+                                          </SelectItem>
+                                          <SelectItem value='enabled'>
+                                            {t('Enabled')}
+                                          </SelectItem>
+                                        </SelectGroup>
+                                      </SelectContent>
+                                    </Select>
+                                    <FormDescription>
+                                      {t(
+                                        'Whether upstream may use request data for model training'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='retry_isolation'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>
+                                      {t('Retry isolation')}
+                                    </FormLabel>
+                                    <Select
+                                      disabled={sensitiveLocked}
+                                      items={[
+                                        {
+                                          value: 'auto',
+                                          label: t('Automatic safe default'),
+                                        },
+                                        {
+                                          value: 'channel',
+                                          label: t('Current channel only'),
+                                        },
+                                        {
+                                          value: 'provider',
+                                          label: t('Same provider endpoint'),
+                                        },
+                                        {
+                                          value: 'policy_group',
+                                          label: t('Explicit policy group'),
+                                        },
+                                      ]}
+                                      onValueChange={field.onChange}
+                                      value={field.value}
+                                    >
+                                      <FormControl>
+                                        <SelectTrigger>
+                                          <SelectValue />
+                                        </SelectTrigger>
+                                      </FormControl>
+                                      <SelectContent
+                                        alignItemWithTrigger={false}
+                                      >
+                                        <SelectGroup>
+                                          <SelectItem value='auto'>
+                                            {t('Automatic safe default')}
+                                          </SelectItem>
+                                          <SelectItem value='channel'>
+                                            {t('Current channel only')}
+                                          </SelectItem>
+                                          <SelectItem value='provider'>
+                                            {t('Same provider endpoint')}
+                                          </SelectItem>
+                                          <SelectItem value='policy_group'>
+                                            {t('Explicit policy group')}
+                                          </SelectItem>
+                                        </SelectGroup>
+                                      </SelectContent>
+                                    </Select>
+                                    <FormDescription>
+                                      {t(
+                                        'Automatic mode keeps retries within the current channel. Select a broader scope only after verifying identical data terms.'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              {currentRetryIsolation === 'policy_group' && (
+                                <FormField
+                                  control={form.control}
+                                  name='retry_policy_group'
+                                  render={({ field }) => (
+                                    <FormItem>
+                                      <FormLabel>{t('Policy group')}</FormLabel>
+                                      <FormControl>
+                                        <Input
+                                          placeholder={t(
+                                            'Channels with identical data terms'
+                                          )}
+                                          disabled={sensitiveLocked}
+                                          {...field}
+                                        />
+                                      </FormControl>
+                                      <FormDescription>
+                                        {t(
+                                          'Only channels with the same provider, data policy, and group can receive retries.'
+                                        )}
+                                      </FormDescription>
+                                      <FormMessage />
+                                    </FormItem>
+                                  )}
+                                />
+                              )}
+                            </div>
                           </div>
 
                           <div

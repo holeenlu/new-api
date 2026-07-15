@@ -281,7 +281,10 @@ func RecordTopupLog(userId int, content string, callerIp string, paymentMethod s
 
 func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string, tokenName string, content string, tokenId int, useTimeSeconds int,
 	isStream bool, group string, other map[string]interface{}) {
-	logger.LogInfo(c, fmt.Sprintf("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
+	logger.LogInfo(c, fmt.Sprintf(
+		"record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s",
+		userId, channelId, modelName, tokenName,
+	))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)
@@ -344,7 +347,10 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	if !common.LogConsumeEnabled {
 		return
 	}
-	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
+	logger.LogInfo(c, fmt.Sprintf(
+		"record consume log: userId=%d, channelId=%d, modelName=%s, promptTokens=%d, completionTokens=%d, quota=%d",
+		userId, params.ChannelId, params.ModelName, params.PromptTokens, params.CompletionTokens, params.Quota,
+	))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)

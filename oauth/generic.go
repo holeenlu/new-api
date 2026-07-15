@@ -92,7 +92,7 @@ func (p *GenericOAuthProvider) ExchangeToken(ctx context.Context, code string, c
 		return nil, NewOAuthError(i18n.MsgOAuthInvalidCode, nil)
 	}
 
-	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken: code=%s...", p.config.Slug, code[:min(len(code), 10)])
+	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken started; authorization code omitted", p.config.Slug)
 
 	redirectUri := fmt.Sprintf("%s/oauth/%s", system_setting.ServerAddress, p.config.Slug)
 	values := url.Values{}
@@ -128,8 +128,8 @@ func (p *GenericOAuthProvider) ExchangeToken(ctx context.Context, code string, c
 		req.Header.Set("Authorization", "Basic "+credentials)
 	}
 
-	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken: token_endpoint=%s, redirect_uri=%s, auth_style=%d",
-		p.config.Slug, p.config.TokenEndpoint, redirectUri, authStyle)
+	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken request prepared; endpoint and redirect URI omitted, auth_style=%d",
+		p.config.Slug, authStyle)
 
 	client := http.Client{
 		Timeout: 20 * time.Second,
@@ -150,7 +150,7 @@ func (p *GenericOAuthProvider) ExchangeToken(ctx context.Context, code string, c
 	}
 
 	bodyStr := string(body)
-	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken response body: %s", p.config.Slug, bodyStr[:min(len(bodyStr), 500)])
+	logger.LogDebug(ctx, "[OAuth-Generic-%s] ExchangeToken response body omitted (%d bytes)", p.config.Slug, len(bodyStr))
 
 	// Try to parse as JSON first
 	var tokenResponse struct {
@@ -236,7 +236,7 @@ func (p *GenericOAuthProvider) GetUserInfo(ctx context.Context, token *OAuthToke
 	}
 
 	bodyStr := string(body)
-	logger.LogDebug(ctx, "[OAuth-Generic-%s] GetUserInfo response body: %s", p.config.Slug, bodyStr[:min(len(bodyStr), 500)])
+	logger.LogDebug(ctx, "[OAuth-Generic-%s] GetUserInfo response body omitted (%d bytes)", p.config.Slug, len(bodyStr))
 
 	// Extract fields using gjson (supports JSONPath-like syntax)
 	userId := gjson.Get(bodyStr, p.config.UserIdField).String()

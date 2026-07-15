@@ -107,6 +107,16 @@ export interface ChannelOtherSettings {
   upstream_model_update_last_check_time?: number
   upstream_model_update_last_detected_models?: string[]
   advanced_custom?: AdvancedCustomConfig
+  data_policy?: ChannelDataPolicy
+}
+
+export interface ChannelDataPolicy {
+  provider?: string
+  region?: string
+  retention?: string
+  training?: 'provider_default' | 'disabled' | 'enabled'
+  retry_isolation?: 'channel' | 'provider' | 'policy_group'
+  retry_policy_group?: string
 }
 
 export interface AdvancedCustomConfig {

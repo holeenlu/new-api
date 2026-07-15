@@ -136,13 +136,20 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	}
 
 	var requestBody io.Reader
-	if !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
-		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled) {
+	if relaycommon.IsRequestPassThroughEnabled(info) {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.NewPrivacyFilteredPassThroughJSONBody(storage, info.ChannelSetting.Proxy != "")
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
 		// 使用 ConvertGeminiRequest 转换请求格式
 		convertedRequest, err := adaptor.ConvertGeminiRequest(c, info, request)
@@ -163,9 +170,9 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 			}
 		}
 
-		logger.LogDebug(c, "Gemini request body: %s", jsonData)
+		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
 
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
@@ -188,7 +195,7 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError
@@ -269,8 +276,8 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo) (newAPI
 			return newAPIErrorFromParamOverride(err)
 		}
 	}
-	logger.LogDebug(c, "Gemini embedding request body: %s", jsonData)
-	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+	logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
+	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -290,7 +297,7 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo) (newAPI
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError
 		}

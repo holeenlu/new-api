@@ -9,6 +9,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestChannelDataPolicyValidateBroaderRetryRequirements(t *testing.T) {
+	valid := &ChannelDataPolicy{
+		Provider:       "OpenAI",
+		Region:         "us",
+		Retention:      "zero",
+		Training:       DataTrainingDisabled,
+		RetryIsolation: RetryIsolationProvider,
+	}
+	require.NoError(t, valid.Validate())
+
+	missingProvider := *valid
+	missingProvider.Provider = ""
+	err := missingProvider.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "explicit provider")
+
+	missingGroup := *valid
+	missingGroup.RetryIsolation = RetryIsolationPolicyGroup
+	err = missingGroup.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "retry_policy_group is required")
+}
+
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

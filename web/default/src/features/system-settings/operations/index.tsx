@@ -56,6 +56,22 @@ const defaultOperationsSettings: OperationsSettings = {
   'perf_metrics_setting.flush_interval': 5,
   'perf_metrics_setting.bucket_time': 'hour',
   'perf_metrics_setting.retention_days': 0,
+  UpstreamLocationMode: 'strip',
+  UpstreamSystemProxyEnabled: false,
+  UpstreamHostPublicIP: '',
+  UpstreamHostLocationCountry: '',
+  UpstreamHostLocationRegion: '',
+  UpstreamHostLocationCity: '',
+  UpstreamHostLocationTimezone: '',
+  UpstreamHostLocationLatitude: '',
+  UpstreamHostLocationLongitude: '',
+  UpstreamEgressPublicIP: '',
+  UpstreamEgressLocationCountry: '',
+  UpstreamEgressLocationRegion: '',
+  UpstreamEgressLocationCity: '',
+  UpstreamEgressLocationTimezone: '',
+  UpstreamEgressLocationLatitude: '',
+  UpstreamEgressLocationLongitude: '',
 }
 
 export function OperationsSettings() {

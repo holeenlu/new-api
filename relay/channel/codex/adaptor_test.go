@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +28,8 @@ func TestCodexChannelTestMetadataIsStablePerRequestAndUniqueAcrossRequests(t *te
 	secondContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: true,
+		IsStream:      true,
+		RelayMode:     relayconstant.RelayModeResponses,
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ApiKey:            `{"access_token":"access-token","account_id":"account-id"}`,
 			UpstreamModelName: "gpt-5.6-sol",
@@ -44,13 +48,160 @@ func TestCodexChannelTestMetadataIsStablePerRequestAndUniqueAcrossRequests(t *te
 	require.Equal(t, clientMetadata["thread_id"], headers.Get("thread-id"))
 	require.Equal(t, clientMetadata["x-codex-window-id"], headers.Get("x-codex-window-id"))
 
-	firstMetadata, err := getOrCreateCodexChannelTestMetadata(firstContext)
+	firstMetadata, err := getOrCreateCodexResponsesMetadata(firstContext)
 	require.NoError(t, err)
-	secondMetadata, err := getOrCreateCodexChannelTestMetadata(secondContext)
+	secondMetadata, err := getOrCreateCodexResponsesMetadata(secondContext)
 	require.NoError(t, err)
 	require.NotEqual(t, firstMetadata.SessionID, secondMetadata.SessionID)
 	require.NotEqual(t, firstMetadata.TurnID, secondMetadata.TurnID)
 	require.NotEqual(t, firstMetadata.InstallationID, secondMetadata.InstallationID)
+}
+
+func TestCodexResponsesLiteProductionRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Session-Id", "session-123")
+	c.Request.Header.Set("Thread-Id", "thread-456")
+	c.Request.Header.Set("X-Codex-Window-Id", "window-789")
+
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ApiKey:            `{"access_token":"access-token","account_id":"account-id"}`,
+			UpstreamModelName: "gpt-5.6-terra",
+		},
+	}
+	request := dto.OpenAIResponsesRequest{
+		Reasoning: &dto.Reasoning{Effort: "high", Summary: "auto"},
+		Include:   json.RawMessage(`["message.output_text.logprobs"]`),
+		Tools:     json.RawMessage(`[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"}]`),
+	}
+
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, request)
+	require.NoError(t, err)
+	got := converted.(dto.OpenAIResponsesRequest)
+	require.Equal(t, "high", got.Reasoning.Effort)
+	require.Equal(t, "auto", got.Reasoning.Summary)
+	require.JSONEq(t, `"all_turns"`, string(got.Reasoning.Context))
+	require.JSONEq(t, `false`, string(got.ParallelToolCalls))
+	require.JSONEq(t, `false`, string(got.Store))
+	require.NotNil(t, got.Stream)
+	require.True(t, *got.Stream)
+	require.Contains(t, string(got.Include), "reasoning.encrypted_content")
+	require.Contains(t, string(got.Include), "message.output_text.logprobs")
+
+	var clientMetadata map[string]any
+	require.NoError(t, common.Unmarshal(got.ClientMetadata, &clientMetadata))
+	require.Equal(t, "session-123", clientMetadata["session_id"])
+	require.Equal(t, "thread-456", clientMetadata["thread_id"])
+	require.Equal(t, "window-789", clientMetadata["x-codex-window-id"])
+
+	headers := make(http.Header)
+	require.NoError(t, (&Adaptor{}).SetupRequestHeader(c, &headers, info))
+	require.Equal(t, "true", headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
+	require.Equal(t, "remote_compaction_v2", headers.Get("X-Codex-Beta-Features"))
+	require.Equal(t, "session-123", headers.Get("Session-Id"))
+	require.Equal(t, "thread-456", headers.Get("Thread-Id"))
+}
+
+func TestCodexResponsesLiteRejectsNonStreamRequest(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	_, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, &relaycommon.RelayInfo{
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gpt-5.6-luna",
+		},
+	}, dto.OpenAIResponsesRequest{})
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	require.Contains(t, apiErr.Error(), "stream=true")
+}
+
+func TestCodexResponsesLiteToolValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		tools          string
+		wantCompatible bool
+		wantErr        bool
+	}{
+		{name: "empty", tools: `[]`, wantCompatible: true},
+		{name: "function", tools: `[{"type":"function","name":"lookup"}]`, wantCompatible: true},
+		{name: "custom", tools: `[{"type":"custom","name":"shell"}]`, wantCompatible: true},
+		{name: "client tool search", tools: `[{"type":"tool_search","execution":"client"}]`, wantCompatible: true},
+		{name: "namespace", tools: `[{"type":"namespace","name":"crm","tools":[{"type":"function","name":"lookup"}]}]`},
+		{name: "hosted tool search", tools: `[{"type":"tool_search"}]`},
+		{name: "server tool search", tools: `[{"type":"tool_search","execution":"server"}]`},
+		{name: "web search", tools: `[{"type":"web_search"}]`},
+		{name: "unknown", tools: `[{"type":"unknown"}]`},
+		{name: "malformed", tools: `{`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			compatible, err := codexResponsesLiteToolsCompatible(json.RawMessage(test.tools))
+			if test.wantErr {
+				require.Error(t, err)
+				var apiErr *types.NewAPIError
+				require.ErrorAs(t, err, &apiErr)
+				require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.wantCompatible, compatible)
+		})
+	}
+}
+
+func TestCodexResponsesNamespaceFallsBackToStandardMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ApiKey:            `{"access_token":"access-token","account_id":"account-id"}`,
+			UpstreamModelName: "gpt-5.6-terra",
+		},
+	}
+	tools := json.RawMessage(`[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}]`)
+
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{Tools: tools})
+	require.NoError(t, err)
+	got := converted.(dto.OpenAIResponsesRequest)
+	require.JSONEq(t, string(tools), string(got.Tools))
+	require.Nil(t, got.Reasoning)
+	require.Empty(t, got.ClientMetadata)
+
+	headers := make(http.Header)
+	require.NoError(t, (&Adaptor{}).SetupRequestHeader(c, &headers, info))
+	require.Empty(t, headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
+	require.Equal(t, CodexOAuthOriginator, headers.Get("Originator"))
+}
+
+func TestCodexResponsesLiteIsNotEnabledForOtherModelsOrCompact(t *testing.T) {
+	for _, info := range []*relaycommon.RelayInfo{
+		{
+			IsStream:  true,
+			RelayMode: relayconstant.RelayModeResponses,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				UpstreamModelName: "gpt-5.5",
+			},
+		},
+		{
+			IsStream:  true,
+			RelayMode: relayconstant.RelayModeResponsesCompact,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				UpstreamModelName: "gpt-5.6-sol",
+			},
+		},
+	} {
+		require.False(t, shouldUseCodexResponsesLite(info))
+	}
 }
 
 func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {

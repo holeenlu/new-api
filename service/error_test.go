@@ -64,7 +64,7 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
-func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
+func TestRelayErrorHandlerIncludesInvalidJSONBodyInErrorAndLog(t *testing.T) {
 	withDebugEnabled(t, false)
 
 	body := strings.Repeat("b", common.LocalLogContentLimit+256)
@@ -88,10 +88,8 @@ func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
 	newAPIError := RelayErrorHandler(context.Background(), resp, false)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, "bad response status code 500", newAPIError.Error())
-	require.Contains(t, logBuffer.String(), "[truncated")
-	require.Contains(t, logBuffer.String(), fmt.Sprintf("original_length=%d", len(body)))
-	require.NotContains(t, logBuffer.String(), strings.Repeat("b", common.LocalLogContentLimit+1))
+	require.Equal(t, fmt.Sprintf("bad response status code 500, body: %s", body), newAPIError.Error())
+	require.Contains(t, logBuffer.String(), body)
 }
 
 func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
@@ -105,7 +103,7 @@ func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
 	newAPIError := RelayErrorHandler(context.Background(), resp, false)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, message, newAPIError.Error())
+	require.Equal(t, fmt.Sprintf("bad response status code 500, message: %s, body: %s", message, body), newAPIError.Error())
 }
 
 func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
@@ -119,10 +117,10 @@ func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
 	newAPIError := RelayErrorHandler(context.Background(), resp, false)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, message, newAPIError.Error())
+	require.Equal(t, fmt.Sprintf("bad response status code 500, message: %s, body: %s", message, body), newAPIError.Error())
 }
 
-func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
+func TestRelayErrorHandlerIncludesInvalidJSONBodyInDebugLog(t *testing.T) {
 	withDebugEnabled(t, true)
 
 	body := strings.Repeat("e", common.LocalLogContentLimit+256)
@@ -146,7 +144,6 @@ func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
 	newAPIError := RelayErrorHandler(context.Background(), resp, false)
 
 	require.NotNil(t, newAPIError)
-	require.NotContains(t, logBuffer.String(), "[truncated")
 	require.Contains(t, logBuffer.String(), body)
 }
 

@@ -19,6 +19,75 @@ type ChannelSettings struct {
 	SystemPromptOverride   bool   `json:"system_prompt_override,omitempty"`
 }
 
+type RetryIsolation string
+
+const (
+	RetryIsolationChannel     RetryIsolation = "channel"
+	RetryIsolationProvider    RetryIsolation = "provider"
+	RetryIsolationPolicyGroup RetryIsolation = "policy_group"
+)
+
+type DataTrainingPolicy string
+
+const (
+	DataTrainingProviderDefault DataTrainingPolicy = "provider_default"
+	DataTrainingDisabled        DataTrainingPolicy = "disabled"
+	DataTrainingEnabled         DataTrainingPolicy = "enabled"
+)
+
+// ChannelDataPolicy describes the upstream processing boundary disclosed to
+// downstream callers and used to constrain automatic retries.
+type ChannelDataPolicy struct {
+	Provider         string             `json:"provider,omitempty"`
+	Region           string             `json:"region,omitempty"`
+	Retention        string             `json:"retention,omitempty"`
+	Training         DataTrainingPolicy `json:"training,omitempty"`
+	RetryIsolation   RetryIsolation     `json:"retry_isolation,omitempty"`
+	RetryPolicyGroup string             `json:"retry_policy_group,omitempty"`
+}
+
+func (p *ChannelDataPolicy) Validate() error {
+	if p == nil {
+		return nil
+	}
+	for name, value := range map[string]string{
+		"provider":           p.Provider,
+		"region":             p.Region,
+		"retention":          p.Retention,
+		"retry_policy_group": p.RetryPolicyGroup,
+	} {
+		if len([]rune(value)) > 128 {
+			return fmt.Errorf("data policy %s must be at most 128 characters", name)
+		}
+		if strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return fmt.Errorf("data policy %s contains control characters", name)
+		}
+	}
+	switch p.Training {
+	case "", DataTrainingProviderDefault, DataTrainingDisabled, DataTrainingEnabled:
+	default:
+		return fmt.Errorf("invalid data policy training value %q", p.Training)
+	}
+	switch p.RetryIsolation {
+	case "", RetryIsolationChannel, RetryIsolationProvider:
+	case RetryIsolationPolicyGroup:
+		if strings.TrimSpace(p.RetryPolicyGroup) == "" {
+			return fmt.Errorf("retry_policy_group is required for policy_group retry isolation")
+		}
+	default:
+		return fmt.Errorf("invalid retry isolation value %q", p.RetryIsolation)
+	}
+	if p.RetryIsolation == RetryIsolationProvider || p.RetryIsolation == RetryIsolationPolicyGroup {
+		if strings.TrimSpace(p.Provider) == "" ||
+			strings.TrimSpace(p.Region) == "" ||
+			strings.TrimSpace(p.Retention) == "" ||
+			p.Training == "" || p.Training == DataTrainingProviderDefault {
+			return fmt.Errorf("broader retry isolation requires explicit provider, region, retention, and training policy")
+		}
+	}
+	return nil
+}
+
 type VertexKeyType string
 
 const (
@@ -53,6 +122,7 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
+	DataPolicy                            *ChannelDataPolicy     `json:"data_policy,omitempty"`
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

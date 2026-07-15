@@ -175,6 +175,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
+	common.OptionMap["UpstreamLocationMode"] = common.GetUpstreamLocationMode()
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
@@ -205,6 +206,9 @@ func SyncOptions(frequency int) {
 }
 
 func UpdateOption(key string, value string) error {
+	if err := validateOptionValue(key, value); err != nil {
+		return err
+	}
 	// Save to database first
 	option := Option{
 		Key: key,
@@ -228,6 +232,11 @@ func UpdateOption(key string, value string) error {
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
+	}
+	for key, value := range values {
+		if err := validateOptionValue(key, value); err != nil {
+			return err
+		}
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
@@ -254,6 +263,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if err := validateOptionValue(key, value); err != nil {
+		return err
+	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
@@ -572,8 +584,17 @@ func updateOptionMap(key string, value string) (err error) {
 		// WaffoPayMethods is read directly from OptionMap via setting.GetWaffoPayMethods().
 		// The value is already stored in OptionMap at the top of this function (line: common.OptionMap[key] = value).
 		// No additional in-memory variable to update.
+	case "UpstreamLocationMode":
+		err = common.SetUpstreamLocationMode(value)
 	}
 	return err
+}
+
+func validateOptionValue(key string, value string) error {
+	if key == "UpstreamLocationMode" {
+		return common.ValidateUpstreamLocationMode(value)
+	}
+	return nil
 }
 
 // handleConfigUpdate 处理分层配置更新，返回是否已处理

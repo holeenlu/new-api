@@ -171,7 +171,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	var vResp responsePayload
 	err = common.Unmarshal(responseBody, &vResp)
 	if err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrap(err, fmt.Sprintf("%s", responseBody)), "unmarshal_response_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(errors.Wrap(err, "unmarshal upstream response failed"), "unmarshal_response_failed", http.StatusInternalServerError)
 		return
 	}
 

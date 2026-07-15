@@ -14,7 +14,6 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -81,14 +80,21 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 	adaptor.Init(info)
 	var requestBody io.Reader
-	passThroughEnabled := !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
-		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
+	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
 	if passThroughEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.NewPrivacyFilteredPassThroughJSONBody(storage, info.ChannelSetting.Proxy != "")
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIResponsesRequest(c, info, *request)
 		if err != nil {
@@ -118,12 +124,8 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 		}
 
-		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-			logger.LogDebug(c, "subscription OAuth request body omitted from logs (%d bytes)", len(jsonData))
-		} else {
-			logger.LogDebug(c, "requestBody: %s", jsonData)
-		}
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
+		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
@@ -145,7 +147,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		httpResp = resp.(*http.Response)
 
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError

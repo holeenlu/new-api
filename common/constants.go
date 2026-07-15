@@ -20,9 +20,11 @@ var Logo = ""
 var TopUpLink = ""
 
 var themeValue atomic.Value // stores string; safe for concurrent read/write
+var upstreamLocationModeValue atomic.Value
 
 func init() {
 	themeValue.Store("classic")
+	upstreamLocationModeValue.Store(UpstreamLocationModeStrip)
 }
 
 func GetTheme() string {
@@ -189,6 +191,31 @@ var RelayIdleConnTimeout int // unit is second
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 var SubscriptionOAuthResponseHeaderTimeout int // unit is second
+
+const (
+	UpstreamLocationModeStrip  = "strip"
+	UpstreamLocationModeAuto   = "auto"
+	UpstreamLocationModeHost   = "host"
+	UpstreamLocationModeEgress = "egress"
+	UpstreamLocationModeRelay  = "relay" // Legacy alias for egress.
+	UpstreamLocationModeClient = "client"
+)
+
+type UpstreamLocationProfile struct {
+	PublicIP  string
+	Country   string
+	Region    string
+	City      string
+	Timezone  string
+	Latitude  *float64
+	Longitude *float64
+}
+
+var UpstreamSystemProxyEnabled bool
+var UpstreamLocationDiscoveryEnabled bool
+var UpstreamLocationDiscoveryTimeout int // unit is second
+var UpstreamHostLocationSettings UpstreamLocationProfile
+var UpstreamEgressLocationSettings UpstreamLocationProfile
 
 var GeminiSafetySetting string
 

@@ -94,6 +94,23 @@ var passthroughSkipHeaderNamesLower = map[string]struct{}{
 	"sec-websocket-extensions": {},
 }
 
+var sensitiveClientNetworkHeaderNamesLower = map[string]struct{}{
+	"cf-connecting-ip":         {},
+	"fastly-client-ip":         {},
+	"fly-client-ip":            {},
+	"forwarded":                {},
+	"true-client-ip":           {},
+	"x-appengine-user-ip":      {},
+	"x-azure-clientip":         {},
+	"x-client-ip":              {},
+	"x-cluster-client-ip":      {},
+	"x-envoy-external-address": {},
+	"x-forwarded-for":          {},
+	"x-original-forwarded-for": {},
+	"x-real-ip":                {},
+	"x-vercel-forwarded-for":   {},
+}
+
 var headerPassthroughRegexCache sync.Map // map[string]*regexp.Regexp
 
 func getHeaderPassthroughRegex(pattern string) (*regexp.Regexp, error) {
@@ -142,7 +159,23 @@ func shouldSkipPassthroughHeader(name string) bool {
 	if _, ok := passthroughSkipHeaderNamesLower[lower]; ok {
 		return true
 	}
+	if _, ok := sensitiveClientNetworkHeaderNamesLower[lower]; ok {
+		return true
+	}
 	return false
+}
+
+func isSensitiveClientNetworkHeader(name string) bool {
+	_, ok := sensitiveClientNetworkHeaderNamesLower[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func stripSensitiveClientNetworkHeaders(header http.Header) {
+	for name := range header {
+		if isSensitiveClientNetworkHeader(name) {
+			header.Del(name)
+		}
+	}
 }
 
 func isClaudeCodeOAuthProtectedHeader(name string) bool {
@@ -156,7 +189,8 @@ func isClaudeCodeOAuthProtectedHeader(name string) bool {
 
 func isCodexOAuthProtectedHeader(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "authorization", "x-api-key", "chatgpt-account-id", "openai-beta", "originator", "user-agent", "content-type", "host":
+	case "authorization", "x-api-key", "chatgpt-account-id", "openai-beta", "originator", "user-agent", "content-type", "host",
+		"x-openai-internal-codex-responses-lite", "x-codex-beta-features":
 		return true
 	default:
 		return false
@@ -297,6 +331,13 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		key := strings.TrimSpace(strings.ToLower(k))
 		if key == "" {
 			continue
+		}
+		if isSensitiveClientNetworkHeader(key) {
+			return nil, types.NewError(
+				fmt.Errorf("client network header %q cannot be forwarded upstream", key),
+				types.ErrorCodeChannelHeaderOverrideInvalid,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
 		if IsSubscriptionOAuthProtectedHeader(info.ChannelType, key) {
 			if info.UseRuntimeHeadersOverride {
@@ -524,6 +565,7 @@ func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	return doRequest(c, req, info)
 }
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	stripSensitiveClientNetworkHeaders(req.Header)
 	var client *http.Client
 	var err error
 	if common2.SubscriptionOAuthResponseHeaderTimeout > 0 &&
@@ -567,7 +609,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")

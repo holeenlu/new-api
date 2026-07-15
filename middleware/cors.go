@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -12,6 +13,7 @@ func CORS() gin.HandlerFunc {
 	config.AllowCredentials = true
 	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	config.AllowHeaders = []string{"*"}
+	config.ExposeHeaders = service.RelayDisclosureHeaders()
 	return cors.New(config)
 }
 

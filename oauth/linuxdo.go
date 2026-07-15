@@ -47,7 +47,7 @@ func (p *LinuxDOProvider) ExchangeToken(ctx context.Context, code string, c *gin
 		return nil, NewOAuthError(i18n.MsgOAuthInvalidCode, nil)
 	}
 
-	logger.LogDebug(ctx, "[OAuth-LinuxDO] ExchangeToken: code=%s...", code[:min(len(code), 10)])
+	logger.LogDebug(ctx, "[OAuth-LinuxDO] ExchangeToken started; authorization code omitted")
 
 	// Get access token using Basic auth
 	tokenEndpoint := common.GetEnvOrDefaultString("LINUX_DO_TOKEN_ENDPOINT", "https://connect.linux.do/oauth2/token")
@@ -61,7 +61,7 @@ func (p *LinuxDOProvider) ExchangeToken(ctx context.Context, code string, c *gin
 	}
 	redirectURI := fmt.Sprintf("%s://%s/api/oauth/linuxdo", scheme, c.Request.Host)
 
-	logger.LogDebug(ctx, "[OAuth-LinuxDO] ExchangeToken: token_endpoint=%s, redirect_uri=%s", tokenEndpoint, redirectURI)
+	logger.LogDebug(ctx, "[OAuth-LinuxDO] ExchangeToken request prepared; endpoint and redirect URI omitted")
 
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")

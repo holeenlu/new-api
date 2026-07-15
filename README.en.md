@@ -395,6 +395,12 @@ docker run --name new-api -d --restart always \
 
 **Retry configuration:** `Settings → Operation Settings → General Settings → Failure Retry Count`
 
+Automatic retries are confined to the current channel by default so the same prompt is not sent to another channel or provider. Administrators can configure the provider, data region, retention, and training policy under **Data governance** in the channel editor. Cross-channel retries require an explicitly named provider plus a provider-endpoint or policy-group scope with identical data terms.
+
+Every API response discloses the active processing policy through `X-Relay-Upstream-Provider`, `X-Relay-Attempt`, `X-Relay-Retry-Count`, `X-Relay-Retry-Isolation`, `X-Relay-Data-Region`, `X-Relay-Data-Retention`, and `X-Relay-Data-Training`.
+
+Provider and data-policy values are administrator-declared metadata, not provider-attested claims. Verify them against the upstream account contract before enabling cross-channel retry.
+
 **Cache configuration:**
 - `REDIS_CONN_STRING`: Redis cache (recommended)
 - `MEMORY_CACHE_ENABLED`: Memory cache

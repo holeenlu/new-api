@@ -14,7 +14,6 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
@@ -70,8 +69,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 	adaptor.Init(info)
 
-	passThroughEnabled := !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
-		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
+	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
 	useResponsesCompatibility := service.ShouldChatCompletionsUseResponsesGlobal(
 		info.ChannelId,
 		info.ChannelType,
@@ -106,10 +104,18 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 		if common.DebugEnabled {
 			if debugBytes, bErr := storage.Bytes(); bErr == nil {
-				logger.LogDebug(c, "requestBody: %s", debugBytes)
+				logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(debugBytes))
 			}
 		}
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.NewPrivacyFilteredPassThroughJSONBody(storage, info.ChannelSetting.Proxy != "")
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIRequest(c, info, request)
 		if err != nil {
@@ -182,13 +188,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			}
 		}
 
-		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-			logger.LogDebug(c, "subscription OAuth request body omitted from logs (%d bytes)", len(jsonData))
-		} else {
-			logger.LogDebug(c, "text request body: %s", jsonData)
-		}
+		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
 
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
@@ -210,7 +212,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
-			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 			return newApiErr

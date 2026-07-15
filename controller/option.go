@@ -106,11 +106,41 @@ func GetOptions(c *gin.Context) {
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),
 	})
+	options = append(options, upstreamLocationRuntimeOptions()...)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
 		"data":    options,
 	})
+}
+
+func upstreamLocationRuntimeOptions() []*model.Option {
+	host := common.UpstreamHostLocationSettings
+	egress := common.UpstreamEgressLocationSettings
+	return []*model.Option{
+		{Key: "UpstreamSystemProxyEnabled", Value: strconv.FormatBool(common.UpstreamSystemProxyEnabled)},
+		{Key: "UpstreamHostPublicIP", Value: host.PublicIP},
+		{Key: "UpstreamHostLocationCountry", Value: host.Country},
+		{Key: "UpstreamHostLocationRegion", Value: host.Region},
+		{Key: "UpstreamHostLocationCity", Value: host.City},
+		{Key: "UpstreamHostLocationTimezone", Value: host.Timezone},
+		{Key: "UpstreamHostLocationLatitude", Value: formatLocationCoordinate(host.Latitude)},
+		{Key: "UpstreamHostLocationLongitude", Value: formatLocationCoordinate(host.Longitude)},
+		{Key: "UpstreamEgressPublicIP", Value: egress.PublicIP},
+		{Key: "UpstreamEgressLocationCountry", Value: egress.Country},
+		{Key: "UpstreamEgressLocationRegion", Value: egress.Region},
+		{Key: "UpstreamEgressLocationCity", Value: egress.City},
+		{Key: "UpstreamEgressLocationTimezone", Value: egress.Timezone},
+		{Key: "UpstreamEgressLocationLatitude", Value: formatLocationCoordinate(egress.Latitude)},
+		{Key: "UpstreamEgressLocationLongitude", Value: formatLocationCoordinate(egress.Longitude)},
+	}
+}
+
+func formatLocationCoordinate(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*value, 'f', -1, 64)
 }
 
 type OptionUpdateRequest struct {

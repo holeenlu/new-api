@@ -520,7 +520,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
 		common.SysLog(fmt.Sprintf("testing subscription OAuth channel #%d succeeded, response_bytes=%d", channel.Id, len(respBody)))
 	} else {
-		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+		common.SysLog(fmt.Sprintf("testing channel #%d, response body omitted (%d bytes)", channel.Id, len(respBody)))
 	}
 	return testResult{
 		context:     c,

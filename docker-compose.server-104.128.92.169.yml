@@ -2,6 +2,9 @@ services:
   new-api:
     ports: !override
       - "127.0.0.1:3001:3000"
+    environment:
+      - SESSION_COOKIE_SECURE=true
+      - SESSION_COOKIE_TRUSTED_URL=${SESSION_COOKIE_TRUSTED_URL:-https://nextcode.buildtoconnect.com}
 
   caddy:
     image: caddy:2-alpine

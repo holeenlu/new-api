@@ -205,12 +205,47 @@ export const channelFormSchema = z
     allow_speed: z.boolean().optional(), // Anthropic: speed mode control
     claude_beta_query: z.boolean().optional(), // Anthropic: beta query passthrough
     disable_task_polling_sleep: z.boolean().optional(),
+    data_provider: z.string().max(128).optional(),
+    data_region: z.string().max(128).optional(),
+    data_retention: z.string().max(128).optional(),
+    data_training: z
+      .enum(['provider_default', 'disabled', 'enabled'])
+      .optional(),
+    retry_isolation: z
+      .enum(['auto', 'channel', 'provider', 'policy_group'])
+      .optional(),
+    retry_policy_group: z.string().max(128).optional(),
     // Upstream model update settings (stored in settings JSON)
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (
+      data.retry_isolation === 'policy_group' &&
+      !data.retry_policy_group?.trim()
+    ) {
+      addRequiredIssue(
+        ctx,
+        'retry_policy_group',
+        'Retry policy group is required for policy group isolation'
+      )
+    }
+    if (
+      (data.retry_isolation === 'provider' ||
+        data.retry_isolation === 'policy_group') &&
+      (!data.data_provider?.trim() ||
+        !data.data_region?.trim() ||
+        !data.data_retention?.trim() ||
+        !data.data_training ||
+        data.data_training === 'provider_default')
+    ) {
+      addRequiredIssue(
+        ctx,
+        'retry_isolation',
+        'Broader retry isolation requires explicit provider, region, retention, and training policy'
+      )
+    }
     if ([3, 8, 36, 45].includes(data.type) && !data.base_url?.trim()) {
       addRequiredIssue(
         ctx,
@@ -345,6 +380,12 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   allow_speed: false,
   claude_beta_query: false,
   disable_task_polling_sleep: false,
+  data_provider: '',
+  data_region: '',
+  data_retention: '',
+  data_training: 'provider_default',
+  retry_isolation: 'auto',
+  retry_policy_group: '',
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
@@ -405,6 +446,13 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
   let advancedCustom = ''
+  let dataProvider = ''
+  let dataRegion = ''
+  let dataRetention = ''
+  let dataTraining: 'provider_default' | 'disabled' | 'enabled' =
+    'provider_default'
+  let retryIsolation: 'auto' | 'channel' | 'provider' | 'policy_group' = 'auto'
+  let retryPolicyGroup = ''
 
   if (channel.settings) {
     try {
@@ -432,6 +480,14 @@ export function transformChannelToFormDefaults(
         : ''
       if (parsed.advanced_custom) {
         advancedCustom = stringifyAdvancedCustomConfig(parsed.advanced_custom)
+      }
+      if (parsed.data_policy) {
+        dataProvider = parsed.data_policy.provider || ''
+        dataRegion = parsed.data_policy.region || ''
+        dataRetention = parsed.data_policy.retention || ''
+        dataTraining = parsed.data_policy.training || 'provider_default'
+        retryIsolation = parsed.data_policy.retry_isolation || 'auto'
+        retryPolicyGroup = parsed.data_policy.retry_policy_group || ''
       }
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -484,6 +540,12 @@ export function transformChannelToFormDefaults(
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
     advanced_custom: advancedCustom,
+    data_provider: dataProvider,
+    data_region: dataRegion,
+    data_retention: dataRetention,
+    data_training: dataTraining,
+    retry_isolation: retryIsolation,
+    retry_policy_group: retryPolicyGroup,
   }
 }
 
@@ -564,12 +626,15 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.allow_inference_geo = formData.allow_inference_geo === true
   } else {
     if ('disable_store' in settingsObj) delete settingsObj.disable_store
-    if ('allow_safety_identifier' in settingsObj)
+    if ('allow_safety_identifier' in settingsObj) {
       delete settingsObj.allow_safety_identifier
-    if ('allow_include_obfuscation' in settingsObj)
+    }
+    if ('allow_include_obfuscation' in settingsObj) {
       delete settingsObj.allow_include_obfuscation
-    if (formData.type !== 14 && 'allow_inference_geo' in settingsObj)
+    }
+    if (formData.type !== 14 && 'allow_inference_geo' in settingsObj) {
       delete settingsObj.allow_inference_geo
+    }
   }
 
   // Anthropic (type 14): claude_beta_query, allow_inference_geo, allow_speed
@@ -585,6 +650,34 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
   settingsObj.disable_task_polling_sleep =
     formData.disable_task_polling_sleep === true
 
+  const dataPolicy: Record<string, string> = {}
+  if (formData.data_provider?.trim()) {
+    dataPolicy.provider = formData.data_provider.trim()
+  }
+  if (formData.data_region?.trim()) {
+    dataPolicy.region = formData.data_region.trim()
+  }
+  if (formData.data_retention?.trim()) {
+    dataPolicy.retention = formData.data_retention.trim()
+  }
+  if (formData.data_training && formData.data_training !== 'provider_default') {
+    dataPolicy.training = formData.data_training
+  }
+  if (formData.retry_isolation && formData.retry_isolation !== 'auto') {
+    dataPolicy.retry_isolation = formData.retry_isolation
+  }
+  if (
+    formData.retry_isolation === 'policy_group' &&
+    formData.retry_policy_group?.trim()
+  ) {
+    dataPolicy.retry_policy_group = formData.retry_policy_group.trim()
+  }
+  if (Object.keys(dataPolicy).length > 0) {
+    settingsObj.data_policy = dataPolicy
+  } else if ('data_policy' in settingsObj) {
+    delete settingsObj.data_policy
+  }
+
   // Upstream model update settings (for model-fetchable channel types)
   if (MODEL_FETCHABLE_TYPES.has(formData.type)) {
     settingsObj.upstream_model_update_check_enabled =
@@ -592,14 +685,14 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.upstream_model_update_auto_sync_enabled =
       settingsObj.upstream_model_update_check_enabled === true &&
       formData.upstream_model_update_auto_sync_enabled === true
-    settingsObj.upstream_model_update_ignored_models = Array.from(
-      new Set(
+    settingsObj.upstream_model_update_ignored_models = [
+      ...new Set(
         String(formData.upstream_model_update_ignored_models || '')
           .split(',')
           .map((model) => model.trim())
           .filter(Boolean)
-      )
-    )
+      ),
+    ]
     if (
       !Array.isArray(settingsObj.upstream_model_update_last_detected_models) ||
       settingsObj.upstream_model_update_check_enabled !== true

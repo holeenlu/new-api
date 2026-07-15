@@ -235,7 +235,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "read_response_body_failed", statusCode), nullBytes, err
 	}
 	CloseResponseBodyGracefully(resp)
-	logger.LogDebug(c, "midjourney response body: %s", responseBody)
+	logger.LogDebug(c, "upstream response body omitted from logs (%d bytes)", len(responseBody))
 	if len(responseBody) == 0 {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "empty_response_body", statusCode), responseBody, nil
 	} else {

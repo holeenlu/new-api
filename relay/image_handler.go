@@ -14,7 +14,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -46,8 +45,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	var requestBody io.Reader
 
-	if !relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) &&
-		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled) {
+	if relaycommon.IsRequestPassThroughEnabled(info) {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -77,8 +75,8 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 				}
 			}
 
-			logger.LogDebug(c, "image request body: %s", jsonData)
-			body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+			logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
+			body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 			if err != nil {
 				return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 			}
@@ -104,7 +102,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 				// replicate channel returns 201 Created when using Prefer: wait, treat it as success.
 				httpResp.StatusCode = http.StatusOK
 			} else {
-				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 				// reset status code 重置状态码
 				service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 				return newAPIError

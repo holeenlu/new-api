@@ -364,7 +364,30 @@ export type OperationsSettings = {
   'perf_metrics_setting.flush_interval': number
   'perf_metrics_setting.bucket_time': 'hour' | 'minute' | '5min'
   'perf_metrics_setting.retention_days': number
+  UpstreamLocationMode: UpstreamLocationMode
+  UpstreamSystemProxyEnabled: boolean
+  UpstreamHostPublicIP: string
+  UpstreamHostLocationCountry: string
+  UpstreamHostLocationRegion: string
+  UpstreamHostLocationCity: string
+  UpstreamHostLocationTimezone: string
+  UpstreamHostLocationLatitude: string
+  UpstreamHostLocationLongitude: string
+  UpstreamEgressPublicIP: string
+  UpstreamEgressLocationCountry: string
+  UpstreamEgressLocationRegion: string
+  UpstreamEgressLocationCity: string
+  UpstreamEgressLocationTimezone: string
+  UpstreamEgressLocationLatitude: string
+  UpstreamEgressLocationLongitude: string
 }
+
+export type UpstreamLocationMode =
+  | 'strip'
+  | 'auto'
+  | 'host'
+  | 'egress'
+  | 'client'
 
 export type SecuritySettings = {
   ModelRequestRateLimitEnabled: boolean

@@ -57,8 +57,8 @@ func EmbeddingHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		}
 	}
 
-	logger.LogDebug(c, "converted embedding request body: %s", jsonData)
-	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
+	logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
+	body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy != "")
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -76,7 +76,7 @@ func EmbeddingHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError

@@ -13,7 +13,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/relayconvert"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -66,13 +65,7 @@ func buildMessageDeltaPatchUsage(claudeResponse *dto.ClaudeResponse, claudeInfo 
 }
 
 func shouldSkipClaudeMessageDeltaUsagePatch(info *relaycommon.RelayInfo) bool {
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled {
-		return true
-	}
-	if info == nil {
-		return false
-	}
-	return info.ChannelSetting.PassThroughBodyEnabled
+	return relaycommon.IsRequestPassThroughEnabled(info)
 }
 
 func patchClaudeMessageDeltaUsageData(data string, usage *dto.ClaudeUsage) string {
@@ -253,7 +246,7 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	logger.LogDebug(c, "responseBody: %s", responseBody)
+	logger.LogDebug(c, "upstream response body omitted from logs (%d bytes)", len(responseBody))
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {
 		return nil, handleErr
