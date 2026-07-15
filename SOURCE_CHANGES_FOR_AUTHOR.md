@@ -395,7 +395,7 @@ setting/ratio_setting/model_ratio_test.go
 
 ```text
 bin/deploy-local.sh
-bin/deploy-104.128.92.169.sh
+bin/deploy-174.137.56.226.sh
 bin/deploy-192.168.11.12.sh
 ```
 
@@ -430,7 +430,7 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 
 ## 7. HTTPS、日志和重试数据治理
 
-- `104.128.92.169` 公网部署强制启用 `SESSION_COOKIE_SECURE=true`，可信入口默认为 `https://nextcode.buildtoconnect.com`；Caddy 将公网 IP 的 HTTP 请求永久重定向到该 HTTPS 域名并发送 HSTS；
+- `174.137.56.226` 公网部署强制启用 `SESSION_COOKIE_SECURE=true`，可信入口默认为 `https://nextcode.buildtoconnect.com`；Caddy 将公网 IP 的 HTTP 请求永久重定向到该 HTTPS 域名并发送 HSTS；
 - 本地和 `192.168.11.12` 内网部署不强制 Secure Cookie，继续支持 HTTP；
 - Redis、支付回调、任务轮询、常规成功响应和多数流处理日志已改为只记录状态码、字节数与非内容元数据；OAuth code/token、Webhook 签名和正文经过专门省略或脱敏；通用错误响应与 Ollama 异常 SSE 仍有正文泄露缺口，见 9.1；
 - 渠道编辑器新增“数据治理”，可填写真实供应商、数据区域、保留期、训练策略、重试隔离范围和策略组；
