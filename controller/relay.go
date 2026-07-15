@@ -95,6 +95,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				newAPIError.GetErrorCode(),
 				newAPIError.Error(),
 			))
+			if newAPIError.StatusCode == http.StatusGatewayTimeout &&
+				relaycommon.IsSubscriptionOAuthChannel(c.GetInt("channel_type")) {
+				c.Header("Retry-After", "2")
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:

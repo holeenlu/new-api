@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -115,8 +117,7 @@ func GetOptions(c *gin.Context) {
 }
 
 func upstreamLocationRuntimeOptions() []*model.Option {
-	host := common.UpstreamHostLocationSettings
-	egress := common.UpstreamEgressLocationSettings
+	host, egress := common.GetUpstreamLocationProfiles()
 	return []*model.Option{
 		{Key: "UpstreamSystemProxyEnabled", Value: strconv.FormatBool(common.UpstreamSystemProxyEnabled)},
 		{Key: "UpstreamHostPublicIP", Value: host.PublicIP},
@@ -141,6 +142,90 @@ func formatLocationCoordinate(value *float64) string {
 		return ""
 	}
 	return strconv.FormatFloat(*value, 'f', -1, 64)
+}
+
+type upstreamLocationRefreshRouteResult struct {
+	Attempted bool                            `json:"attempted"`
+	Updated   bool                            `json:"updated"`
+	Profile   upstreamLocationProfileResponse `json:"profile"`
+	Error     string                          `json:"error,omitempty"`
+}
+
+type upstreamLocationProfileResponse struct {
+	PublicIP  string `json:"public_ip"`
+	Country   string `json:"country"`
+	Region    string `json:"region"`
+	City      string `json:"city"`
+	Timezone  string `json:"timezone"`
+	Latitude  string `json:"latitude"`
+	Longitude string `json:"longitude"`
+}
+
+type upstreamLocationRefreshResponse struct {
+	Host   upstreamLocationRefreshRouteResult `json:"host"`
+	Egress upstreamLocationRefreshRouteResult `json:"egress"`
+}
+
+func newUpstreamLocationRefreshRouteResult(result common.UpstreamLocationDiscoveryRouteResult) upstreamLocationRefreshRouteResult {
+	routeResult := upstreamLocationRefreshRouteResult{
+		Attempted: result.Attempted,
+		Updated:   result.Updated,
+		Profile: upstreamLocationProfileResponse{
+			PublicIP:  result.Profile.PublicIP,
+			Country:   result.Profile.Country,
+			Region:    result.Profile.Region,
+			City:      result.Profile.City,
+			Timezone:  result.Profile.Timezone,
+			Latitude:  formatLocationCoordinate(result.Profile.Latitude),
+			Longitude: formatLocationCoordinate(result.Profile.Longitude),
+		},
+	}
+	if result.Err != nil {
+		routeResult.Error = result.Err.Error()
+	}
+	return routeResult
+}
+
+func RefreshUpstreamLocationProfiles(c *gin.Context) {
+	report, err := common.RefreshUpstreamLocationProfiles(c.Request.Context(), service.GetHttpClient())
+	if errors.Is(err, common.ErrUpstreamLocationRefreshInProgress) {
+		c.Header("Retry-After", "2")
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"message": "上游网络画像正在刷新，请稍后重试",
+		})
+		return
+	}
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	data := upstreamLocationRefreshResponse{
+		Host:   newUpstreamLocationRefreshRouteResult(report.Host),
+		Egress: newUpstreamLocationRefreshRouteResult(report.Egress),
+	}
+	if !report.Host.Updated && !report.Egress.Updated {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"success": false,
+			"message": "无法刷新上游网络画像；已保留上次成功的数据",
+			"data":    data,
+		})
+		return
+	}
+
+	recordManageAudit(c, "option.upstream_location.refresh", map[string]interface{}{
+		"host_updated":       report.Host.Updated,
+		"egress_attempted":   report.Egress.Attempted,
+		"egress_updated":     report.Egress.Updated,
+		"has_host_warning":   report.Host.Err != nil,
+		"has_egress_warning": report.Egress.Err != nil,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    data,
+	})
 }
 
 type OptionUpdateRequest struct {

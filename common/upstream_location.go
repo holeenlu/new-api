@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +31,27 @@ var defaultUpstreamLocationDiscoveryEndpoints = upstreamLocationDiscoveryEndpoin
 	PublicIPTraceURL:     "https://www.cloudflare.com/cdn-cgi/trace",
 	GeoLookupURLTemplate: "https://ipwho.is/{ip}",
 }
+
+var ErrUpstreamLocationRefreshInProgress = errors.New("upstream location profile refresh is already in progress")
+
+type UpstreamLocationDiscoveryRouteResult struct {
+	Attempted bool
+	Updated   bool
+	Profile   UpstreamLocationProfile
+	Err       error
+}
+
+type UpstreamLocationDiscoveryReport struct {
+	Host   UpstreamLocationDiscoveryRouteResult
+	Egress UpstreamLocationDiscoveryRouteResult
+}
+
+var (
+	upstreamLocationProfilesMutex  sync.RWMutex
+	upstreamLocationRefreshMutex   sync.Mutex
+	upstreamHostLocationBaseline   UpstreamLocationProfile
+	upstreamEgressLocationBaseline UpstreamLocationProfile
+)
 
 func initUpstreamLocationSettings() {
 	mode := strings.ToLower(strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_LOCATION_MODE", UpstreamLocationModeStrip)))
@@ -53,33 +76,49 @@ func initUpstreamLocationSettings() {
 		UpstreamLocationDiscoveryTimeout = 8
 	}
 
-	UpstreamHostLocationSettings = UpstreamLocationProfile{
+	hostProfile := UpstreamLocationProfile{
 		PublicIP: strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_HOST_PUBLIC_IP", "")),
 		Country:  strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_HOST_LOCATION_COUNTRY", "")),
 		Region:   strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_HOST_LOCATION_REGION", "")),
 		City:     strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_HOST_LOCATION_CITY", "")),
 		Timezone: strings.TrimSpace(GetEnvOrDefaultString("UPSTREAM_HOST_LOCATION_TIMEZONE", "")),
 	}
-	UpstreamHostLocationSettings.Latitude = parseLocationCoordinate("UPSTREAM_HOST_LOCATION_LATITUDE", "", -90, 90)
-	UpstreamHostLocationSettings.Longitude = parseLocationCoordinate("UPSTREAM_HOST_LOCATION_LONGITUDE", "", -180, 180)
+	hostProfile.Latitude = parseLocationCoordinate("UPSTREAM_HOST_LOCATION_LATITUDE", "", -90, 90)
+	hostProfile.Longitude = parseLocationCoordinate("UPSTREAM_HOST_LOCATION_LONGITUDE", "", -180, 180)
 
-	UpstreamEgressLocationSettings = UpstreamLocationProfile{
+	egressProfile := UpstreamLocationProfile{
 		PublicIP: locationEnvValue("UPSTREAM_EGRESS_PUBLIC_IP", ""),
 		Country:  locationEnvValue("UPSTREAM_EGRESS_LOCATION_COUNTRY", "RELAY_LOCATION_COUNTRY"),
 		Region:   locationEnvValue("UPSTREAM_EGRESS_LOCATION_REGION", "RELAY_LOCATION_REGION"),
 		City:     locationEnvValue("UPSTREAM_EGRESS_LOCATION_CITY", "RELAY_LOCATION_CITY"),
 		Timezone: locationEnvValue("UPSTREAM_EGRESS_LOCATION_TIMEZONE", "RELAY_LOCATION_TIMEZONE"),
 	}
-	UpstreamEgressLocationSettings.Latitude = parseLocationCoordinate(
+	egressProfile.Latitude = parseLocationCoordinate(
 		"UPSTREAM_EGRESS_LOCATION_LATITUDE", "RELAY_LOCATION_LATITUDE", -90, 90,
 	)
-	UpstreamEgressLocationSettings.Longitude = parseLocationCoordinate(
+	egressProfile.Longitude = parseLocationCoordinate(
 		"UPSTREAM_EGRESS_LOCATION_LONGITUDE", "RELAY_LOCATION_LONGITUDE", -180, 180,
 	)
+	setInitialUpstreamLocationProfiles(hostProfile, egressProfile)
 
 	if !UpstreamLocationDiscoveryEnabled {
 		warnMissingUpstreamLocationProfiles()
 	}
+}
+
+func setInitialUpstreamLocationProfiles(host UpstreamLocationProfile, egress UpstreamLocationProfile) {
+	upstreamLocationProfilesMutex.Lock()
+	defer upstreamLocationProfilesMutex.Unlock()
+	upstreamHostLocationBaseline = host
+	upstreamEgressLocationBaseline = egress
+	UpstreamHostLocationSettings = host
+	UpstreamEgressLocationSettings = egress
+}
+
+func GetUpstreamLocationProfiles() (UpstreamLocationProfile, UpstreamLocationProfile) {
+	upstreamLocationProfilesMutex.RLock()
+	defer upstreamLocationProfilesMutex.RUnlock()
+	return UpstreamHostLocationSettings, UpstreamEgressLocationSettings
 }
 
 func GetUpstreamLocationMode() string {
@@ -112,22 +151,54 @@ func DiscoverUpstreamLocationProfiles(routedClient *http.Client) {
 	if !UpstreamLocationDiscoveryEnabled {
 		return
 	}
+	upstreamLocationRefreshMutex.Lock()
+	defer upstreamLocationRefreshMutex.Unlock()
 
 	timeout := time.Duration(UpstreamLocationDiscoveryTimeout) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	report := discoverAndUpdateUpstreamLocationProfiles(ctx, routedClient)
+	logUpstreamLocationDiscoveryReport(report)
+	warnMissingUpstreamLocationProfiles()
+}
+
+// RefreshUpstreamLocationProfiles performs an operator-requested refresh even
+// when automatic startup discovery is disabled. Fixed discovery endpoints and
+// the server-configured routed client are used; callers cannot supply URLs.
+func RefreshUpstreamLocationProfiles(ctx context.Context, routedClient *http.Client) (UpstreamLocationDiscoveryReport, error) {
+	if !upstreamLocationRefreshMutex.TryLock() {
+		return UpstreamLocationDiscoveryReport{}, ErrUpstreamLocationRefreshInProgress
+	}
+	defer upstreamLocationRefreshMutex.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := time.Duration(UpstreamLocationDiscoveryTimeout) * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	report := discoverAndUpdateUpstreamLocationProfiles(ctx, routedClient)
+	logUpstreamLocationDiscoveryReport(report)
+	warnMissingUpstreamLocationProfiles()
+	return report, nil
+}
+
+func discoverAndUpdateUpstreamLocationProfiles(ctx context.Context, routedClient *http.Client) UpstreamLocationDiscoveryReport {
+	currentHost, currentEgress := GetUpstreamLocationProfiles()
+	report := UpstreamLocationDiscoveryReport{
+		Host:   UpstreamLocationDiscoveryRouteResult{Attempted: true, Profile: currentHost},
+		Egress: UpstreamLocationDiscoveryRouteResult{Profile: currentEgress},
+	}
 
 	directTransport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok || directTransport == nil {
-		log.Printf("WARNING: upstream location discovery cannot create a direct HTTP transport")
-		warnMissingUpstreamLocationProfiles()
-		return
+		report.Host.Err = errors.New("upstream location discovery cannot create a direct HTTP transport")
+		return report
 	}
 	directTransport = directTransport.Clone()
 	directTransport.Proxy = nil
 	directClient := &http.Client{
 		Transport: directTransport,
-		Timeout:   timeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -144,43 +215,60 @@ func DiscoverUpstreamLocationProfiles(routedClient *http.Client) {
 	}()
 
 	discoverEgress := UpstreamSystemProxyEnabled
+	report.Egress.Attempted = discoverEgress
 	var egressResultChannel chan discoveryResult
 	if discoverEgress {
 		egressResultChannel = make(chan discoveryResult, 1)
 		if routedClient == nil {
 			routedClient = http.DefaultClient
 		}
-		routedClientCopy := *routedClient
-		routedClientCopy.Timeout = timeout
 		go func() {
-			profile, err := discoverUpstreamLocationProfile(ctx, &routedClientCopy, defaultUpstreamLocationDiscoveryEndpoints)
+			profile, err := discoverUpstreamLocationProfile(ctx, routedClient, defaultUpstreamLocationDiscoveryEndpoints)
 			egressResultChannel <- discoveryResult{profile: profile, err: err}
 		}()
 	}
 
 	hostResult := <-hostResultChannel
-	if hostResult.profile.PublicIP != "" {
-		UpstreamHostLocationSettings = mergeUpstreamLocationProfile(UpstreamHostLocationSettings, hostResult.profile)
-	}
-	if hostResult.err != nil {
-		log.Printf("WARNING: direct upstream network profile discovery failed: %v", hostResult.err)
-	} else {
-		log.Printf("upstream host network profile discovered after ChatGPT and Claude connectivity checks")
-	}
+	report.Host.Profile = hostResult.profile
+	report.Host.Err = hostResult.err
+	report.Host.Updated = hostResult.profile.PublicIP != ""
 
 	if discoverEgress {
 		egressResult := <-egressResultChannel
-		if egressResult.profile.PublicIP != "" {
-			UpstreamEgressLocationSettings = mergeUpstreamLocationProfile(UpstreamEgressLocationSettings, egressResult.profile)
-		}
-		if egressResult.err != nil {
-			log.Printf("WARNING: proxy or VPN egress network profile discovery failed: %v", egressResult.err)
-		} else {
+		report.Egress.Profile = egressResult.profile
+		report.Egress.Err = egressResult.err
+		report.Egress.Updated = egressResult.profile.PublicIP != ""
+	}
+
+	upstreamLocationProfilesMutex.Lock()
+	if report.Host.Updated {
+		discoveredProfile := mergeUpstreamLocationProfile(report.Host.Profile, currentHost)
+		UpstreamHostLocationSettings = mergeUpstreamLocationProfile(upstreamHostLocationBaseline, discoveredProfile)
+	}
+	if report.Egress.Updated {
+		discoveredProfile := mergeUpstreamLocationProfile(report.Egress.Profile, currentEgress)
+		UpstreamEgressLocationSettings = mergeUpstreamLocationProfile(upstreamEgressLocationBaseline, discoveredProfile)
+	}
+	report.Host.Profile = UpstreamHostLocationSettings
+	report.Egress.Profile = UpstreamEgressLocationSettings
+	upstreamLocationProfilesMutex.Unlock()
+
+	return report
+}
+
+func logUpstreamLocationDiscoveryReport(report UpstreamLocationDiscoveryReport) {
+	if report.Host.Err != nil {
+		log.Printf("WARNING: direct upstream network profile discovery failed: %v", report.Host.Err)
+	} else if report.Host.Updated {
+		log.Printf("upstream host network profile discovered after ChatGPT and Claude connectivity checks")
+	}
+	if report.Egress.Attempted {
+		if report.Egress.Err != nil {
+			log.Printf("WARNING: proxy or VPN egress network profile discovery failed: %v", report.Egress.Err)
+		} else if report.Egress.Updated {
 			log.Printf("upstream proxy or VPN egress profile discovered after ChatGPT and Claude connectivity checks")
 		}
 	}
-
-	warnMissingUpstreamLocationProfiles()
 }
 
 func discoverUpstreamLocationProfile(ctx context.Context, client *http.Client, endpoints upstreamLocationDiscoveryEndpoints) (UpstreamLocationProfile, error) {
@@ -331,12 +419,13 @@ func hasSystemProxyEnvironment() bool {
 
 func warnMissingUpstreamLocationProfiles() {
 	mode := GetUpstreamLocationMode()
+	host, egress := GetUpstreamLocationProfiles()
 	if (mode == UpstreamLocationModeHost || mode == UpstreamLocationModeAuto) &&
-		!hasConfiguredLocation(UpstreamHostLocationSettings) {
+		!hasConfiguredLocation(host) {
 		log.Printf("WARNING: host location profile is unavailable; matching client location fields will be stripped")
 	}
 	if (mode == UpstreamLocationModeEgress || mode == UpstreamLocationModeAuto) &&
-		!hasConfiguredLocation(UpstreamEgressLocationSettings) {
+		!hasConfiguredLocation(egress) {
 		log.Printf("WARNING: proxy egress location profile is unavailable; matching client location fields will be stripped")
 	}
 }

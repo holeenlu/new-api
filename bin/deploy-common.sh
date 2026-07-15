@@ -156,6 +156,38 @@ deploy_env_ensure() {
   printf '%s=%s\n' "$key" "$value" >>"$env_file"
 }
 
+deploy_env_migrate_default() {
+  local env_file=$1
+  local key=$2
+  local old_default=$3
+  local new_default=$4
+  local existing
+  existing=$(deploy_env_get "$env_file" "$key")
+
+  if ! grep -Eq "^[[:space:]]*${key}=" "$env_file"; then
+    printf '%s=%s\n' "$key" "$new_default" >>"$env_file"
+    return
+  fi
+  [[ -n "$existing" ]] || deploy_die "$key is empty in $env_file"
+  if [[ "$existing" != "$old_default" ]]; then
+    return
+  fi
+
+  local migrated_file
+  migrated_file=$(mktemp "${env_file}.XXXXXX")
+  awk -v key="$key" -v value="$new_default" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      if (!found) print key "=" value
+      found = 1
+      next
+    }
+    { print }
+  ' "$env_file" >"$migrated_file"
+  chmod 600 "$migrated_file"
+  mv "$migrated_file" "$env_file"
+  deploy_log "Migrated $key from $old_default to $new_default"
+}
+
 deploy_prepare_env_file() {
   local env_file=$1
   if [[ ! -f "$env_file" ]]; then
@@ -202,7 +234,7 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 750
   deploy_env_ensure "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5
   deploy_env_ensure "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 750
-  deploy_env_ensure "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 30
+  deploy_env_migrate_default "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 120 30
   deploy_env_ensure "$env_file" CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED true
   deploy_env_ensure "$env_file" CODEX_OAUTH_CLIENT_ID app_EMoamEEZ73f0CkXaXp7hrann
   deploy_env_ensure "$env_file" CODEX_OAUTH_REDIRECT_URI http://localhost:1455/auth/callback

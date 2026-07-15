@@ -96,16 +96,17 @@ func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, 
 }
 
 func selectUpstreamLocationProfile(mode string, channelUsesProxy bool) (rootcommon.UpstreamLocationProfile, bool) {
+	hostProfile, egressProfile := rootcommon.GetUpstreamLocationProfiles()
 	switch mode {
 	case rootcommon.UpstreamLocationModeHost:
-		return rootcommon.UpstreamHostLocationSettings, true
+		return hostProfile, true
 	case rootcommon.UpstreamLocationModeEgress:
-		return rootcommon.UpstreamEgressLocationSettings, true
+		return egressProfile, true
 	case rootcommon.UpstreamLocationModeAuto:
 		if rootcommon.UpstreamSystemProxyEnabled || channelUsesProxy {
-			return rootcommon.UpstreamEgressLocationSettings, true
+			return egressProfile, true
 		}
-		return rootcommon.UpstreamHostLocationSettings, true
+		return hostProfile, true
 	default:
 		return rootcommon.UpstreamLocationProfile{}, false
 	}

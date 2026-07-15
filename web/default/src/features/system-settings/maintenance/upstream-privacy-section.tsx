@@ -17,6 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import { Refresh01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   MapPinIcon,
   NetworkIcon,
@@ -25,9 +28,11 @@ import {
 } from 'lucide-react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 import * as z from 'zod'
 
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
@@ -45,11 +50,16 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 
+import { refreshUpstreamLocationProfiles } from '../api'
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useResetForm } from '../hooks/use-reset-form'
 import { useUpdateOption } from '../hooks/use-update-option'
-import type { OperationsSettings, UpstreamLocationMode } from '../types'
+import type {
+  OperationsSettings,
+  UpstreamLocationMode,
+  UpstreamLocationProfileResponse,
+} from '../types'
 
 type UpstreamPrivacySectionProps = {
   settings: OperationsSettings
@@ -97,9 +107,37 @@ function coordinateSummary(profile: LocationProfile, fallback: string): string {
   )
 }
 
+function locationProfileFromResponse(
+  profile: UpstreamLocationProfileResponse
+): LocationProfile {
+  return {
+    publicIp: profile.public_ip,
+    country: profile.country,
+    region: profile.region,
+    city: profile.city,
+    timezone: profile.timezone,
+    latitude: profile.latitude,
+    longitude: profile.longitude,
+  }
+}
+
+function refreshErrorMessage(error: unknown): string | undefined {
+  if (error && typeof error === 'object' && 'response' in error) {
+    const response = error.response
+    if (response && typeof response === 'object' && 'data' in response) {
+      const data = response.data
+      if (data && typeof data === 'object' && 'message' in data) {
+        return typeof data.message === 'string' ? data.message : undefined
+      }
+    }
+  }
+  return error instanceof Error && error.message ? error.message : undefined
+}
+
 export function UpstreamPrivacySection(props: UpstreamPrivacySectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
+  const queryClient = useQueryClient()
   const defaultValues: UpstreamPrivacyFormValues = {
     UpstreamLocationMode: props.settings.UpstreamLocationMode,
   }
@@ -109,6 +147,26 @@ export function UpstreamPrivacySection(props: UpstreamPrivacySectionProps) {
   })
 
   useResetForm(form, defaultValues)
+
+  const refreshProfiles = useMutation({
+    mutationFn: refreshUpstreamLocationProfiles,
+    onSuccess: async (response) => {
+      await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+      const hasWarnings = Boolean(
+        response.data.host.error || response.data.egress.error
+      )
+      if (hasWarnings) {
+        toast.warning(t('Network profiles refreshed with warnings'))
+      } else {
+        toast.success(t('Network profiles refreshed'))
+      }
+    },
+    onError: (error: unknown) => {
+      toast.error(
+        refreshErrorMessage(error) || t('Failed to refresh network profiles')
+      )
+    },
+  })
 
   const onSubmit = async (data: UpstreamPrivacyFormValues) => {
     if (data.UpstreamLocationMode === props.settings.UpstreamLocationMode) {
@@ -120,24 +178,29 @@ export function UpstreamPrivacySection(props: UpstreamPrivacySectionProps) {
     })
   }
 
-  const hostProfile: LocationProfile = {
-    publicIp: props.settings.UpstreamHostPublicIP,
-    country: props.settings.UpstreamHostLocationCountry,
-    region: props.settings.UpstreamHostLocationRegion,
-    city: props.settings.UpstreamHostLocationCity,
-    timezone: props.settings.UpstreamHostLocationTimezone,
-    latitude: props.settings.UpstreamHostLocationLatitude,
-    longitude: props.settings.UpstreamHostLocationLongitude,
-  }
-  const egressProfile: LocationProfile = {
-    publicIp: props.settings.UpstreamEgressPublicIP,
-    country: props.settings.UpstreamEgressLocationCountry,
-    region: props.settings.UpstreamEgressLocationRegion,
-    city: props.settings.UpstreamEgressLocationCity,
-    timezone: props.settings.UpstreamEgressLocationTimezone,
-    latitude: props.settings.UpstreamEgressLocationLatitude,
-    longitude: props.settings.UpstreamEgressLocationLongitude,
-  }
+  const refreshedProfiles = refreshProfiles.data?.data
+  const hostProfile: LocationProfile = refreshedProfiles
+    ? locationProfileFromResponse(refreshedProfiles.host.profile)
+    : {
+        publicIp: props.settings.UpstreamHostPublicIP,
+        country: props.settings.UpstreamHostLocationCountry,
+        region: props.settings.UpstreamHostLocationRegion,
+        city: props.settings.UpstreamHostLocationCity,
+        timezone: props.settings.UpstreamHostLocationTimezone,
+        latitude: props.settings.UpstreamHostLocationLatitude,
+        longitude: props.settings.UpstreamHostLocationLongitude,
+      }
+  const egressProfile: LocationProfile = refreshedProfiles
+    ? locationProfileFromResponse(refreshedProfiles.egress.profile)
+    : {
+        publicIp: props.settings.UpstreamEgressPublicIP,
+        country: props.settings.UpstreamEgressLocationCountry,
+        region: props.settings.UpstreamEgressLocationRegion,
+        city: props.settings.UpstreamEgressLocationCity,
+        timezone: props.settings.UpstreamEgressLocationTimezone,
+        latitude: props.settings.UpstreamEgressLocationLatitude,
+        longitude: props.settings.UpstreamEgressLocationLongitude,
+      }
   const mode = form.watch('UpstreamLocationMode')
   let selectionText = t(
     'Proxied channels use the proxy egress profile; direct channels use the host profile'
@@ -252,7 +315,27 @@ export function UpstreamPrivacySection(props: UpstreamPrivacySectionProps) {
         </form>
       </Form>
 
-      <div className='grid gap-6 lg:grid-cols-2'>
+      <div className='flex justify-end'>
+        <Button
+          type='button'
+          variant='outline'
+          size='sm'
+          disabled={refreshProfiles.isPending}
+          onClick={() => refreshProfiles.mutate()}
+        >
+          <HugeiconsIcon
+            icon={Refresh01Icon}
+            data-icon='inline-start'
+            className={refreshProfiles.isPending ? 'animate-spin' : undefined}
+          />
+          {refreshProfiles.isPending ? t('Refreshing...') : t('Refresh')}
+        </Button>
+      </div>
+
+      <div
+        className='grid gap-6 lg:grid-cols-2'
+        aria-busy={refreshProfiles.isPending}
+      >
         {profiles.map((profile) => (
           <section key={profile.key} className='min-w-0'>
             <h3 className='mb-2 flex items-center gap-2 text-sm font-semibold'>

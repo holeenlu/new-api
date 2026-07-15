@@ -382,6 +382,32 @@ export type OperationsSettings = {
   UpstreamEgressLocationLongitude: string
 }
 
+export type UpstreamLocationProfileResponse = {
+  public_ip: string
+  country: string
+  region: string
+  city: string
+  timezone: string
+  latitude: string
+  longitude: string
+}
+
+export type UpstreamLocationRefreshRouteResult = {
+  attempted: boolean
+  updated: boolean
+  profile: UpstreamLocationProfileResponse
+  error?: string
+}
+
+export type UpstreamLocationRefreshResponse = {
+  success: boolean
+  message: string
+  data: {
+    host: UpstreamLocationRefreshRouteResult
+    egress: UpstreamLocationRefreshRouteResult
+  }
+}
+
 export type UpstreamLocationMode =
   | 'strip'
   | 'auto'

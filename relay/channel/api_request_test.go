@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +12,39 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type responseHeaderTimeoutError struct{}
+
+func (responseHeaderTimeoutError) Error() string   { return "timeout awaiting response headers" }
+func (responseHeaderTimeoutError) Timeout() bool   { return true }
+func (responseHeaderTimeoutError) Temporary() bool { return true }
+
+func TestIsSubscriptionOAuthResponseHeaderTimeout(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	timeoutErr := responseHeaderTimeoutError{}
+	require.True(t, isSubscriptionOAuthResponseHeaderTimeout(timeoutErr, req, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+	}))
+	require.True(t, isSubscriptionOAuthResponseHeaderTimeout(timeoutErr, req, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeClaudeCode},
+	}))
+	require.False(t, isSubscriptionOAuthResponseHeaderTimeout(timeoutErr, req, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI},
+	}))
+	require.False(t, isSubscriptionOAuthResponseHeaderTimeout(errors.New("connection refused"), req, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+	}))
+
+	canceledReq := req.Clone(context.Background())
+	canceledCtx, cancel := context.WithCancel(canceledReq.Context())
+	cancel()
+	canceledReq = canceledReq.WithContext(canceledCtx)
+	require.False(t, isSubscriptionOAuthResponseHeaderTimeout(timeoutErr, canceledReq, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+	}))
+}
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()

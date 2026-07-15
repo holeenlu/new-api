@@ -43,7 +43,11 @@ const en = {
   'Host network profile': 'Host network profile',
   Location: 'Location',
   'Location forwarding mode': 'Location forwarding mode',
+  'Network profiles refreshed': 'Network profiles refreshed',
+  'Network profiles refreshed with warnings':
+    'Network profiles refreshed with warnings',
   'Not configured': 'Not configured',
+  'Failed to refresh network profiles': 'Failed to refresh network profiles',
   'Proxied channels use the proxy egress profile; direct channels use the host profile':
     'Proxied channels use the proxy egress profile; direct channels use the host profile',
   'Strip client location': 'Strip client location',
@@ -74,7 +78,11 @@ const newKeys = {
     'Host network profile': '宿主网络画像',
     Location: '位置',
     'Location forwarding mode': '位置转发模式',
+    'Network profiles refreshed': '网络画像刷新成功',
+    'Network profiles refreshed with warnings':
+      '网络画像已刷新，但部分路径探测失败',
     'Not configured': '未配置',
+    'Failed to refresh network profiles': '无法刷新网络画像',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       '使用代理的渠道采用代理出口画像，直连渠道采用宿主画像',
     'Strip client location': '删除客户端位置',
@@ -102,7 +110,11 @@ const newKeys = {
     'Host network profile': '主機網路設定',
     Location: '位置',
     'Location forwarding mode': '位置轉送模式',
+    'Network profiles refreshed': '網路設定已重新整理',
+    'Network profiles refreshed with warnings':
+      '網路設定已重新整理，但部分路徑偵測失敗',
     'Not configured': '未設定',
+    'Failed to refresh network profiles': '無法重新整理網路設定',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       '使用代理的渠道採用代理出口設定，直接連線渠道採用主機設定',
     'Strip client location': '移除用戶端位置',
@@ -131,7 +143,12 @@ const newKeys = {
     'Host network profile': 'Profil réseau de l’hôte',
     Location: 'Emplacement',
     'Location forwarding mode': 'Mode de transmission de l’emplacement',
+    'Network profiles refreshed': 'Profils réseau actualisés',
+    'Network profiles refreshed with warnings':
+      'Profils réseau actualisés avec des avertissements',
     'Not configured': 'Non configuré',
+    'Failed to refresh network profiles':
+      'Impossible d’actualiser les profils réseau',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       'Les canaux avec proxy utilisent le profil de sortie du proxy ; les canaux directs utilisent le profil de l’hôte',
     'Strip client location': 'Supprimer l’emplacement du client',
@@ -160,7 +177,12 @@ const newKeys = {
     'Host network profile': 'ホストネットワークプロファイル',
     Location: '場所',
     'Location forwarding mode': '位置転送モード',
+    'Network profiles refreshed': 'ネットワークプロファイルを更新しました',
+    'Network profiles refreshed with warnings':
+      '警告付きでネットワークプロファイルを更新しました',
     'Not configured': '未設定',
+    'Failed to refresh network profiles':
+      'ネットワークプロファイルを更新できませんでした',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       'プロキシ経由のチャネルはプロキシ出口プロファイルを、直接接続のチャネルはホストプロファイルを使用します',
     'Strip client location': 'クライアント位置を削除',
@@ -190,7 +212,11 @@ const newKeys = {
     'Host network profile': 'Сетевой профиль хоста',
     Location: 'Местоположение',
     'Location forwarding mode': 'Режим передачи местоположения',
+    'Network profiles refreshed': 'Сетевые профили обновлены',
+    'Network profiles refreshed with warnings':
+      'Сетевые профили обновлены с предупреждениями',
     'Not configured': 'Не настроено',
+    'Failed to refresh network profiles': 'Не удалось обновить сетевые профили',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       'Каналы с прокси используют профиль выхода прокси, а прямые каналы — профиль хоста',
     'Strip client location': 'Удалять местоположение клиента',
@@ -219,7 +245,11 @@ const newKeys = {
     'Host network profile': 'Hồ sơ mạng máy chủ',
     Location: 'Vị trí',
     'Location forwarding mode': 'Chế độ chuyển tiếp vị trí',
+    'Network profiles refreshed': 'Đã làm mới hồ sơ mạng',
+    'Network profiles refreshed with warnings':
+      'Đã làm mới hồ sơ mạng kèm cảnh báo',
     'Not configured': 'Chưa cấu hình',
+    'Failed to refresh network profiles': 'Không thể làm mới hồ sơ mạng',
     'Proxied channels use the proxy egress profile; direct channels use the host profile':
       'Kênh qua proxy dùng hồ sơ đầu ra proxy; kênh trực tiếp dùng hồ sơ máy chủ',
     'Strip client location': 'Loại bỏ vị trí máy khách',

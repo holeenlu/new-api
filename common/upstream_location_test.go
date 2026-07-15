@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -148,6 +149,69 @@ func TestMergeUpstreamLocationProfilePreservesExplicitConfiguration(t *testing.T
 	require.Equal(t, "America/Los_Angeles", profile.Timezone)
 }
 
+func TestRefreshUpstreamLocationProfilesReplacesDiscoveredValuesAndPreservesExplicitBaseline(t *testing.T) {
+	restoreUpstreamLocationSettings(t)
+	t.Setenv("UPSTREAM_LOCATION_DISCOVERY_ENABLED", "false")
+	t.Setenv("UPSTREAM_HOST_LOCATION_COUNTRY", "CA")
+	initUpstreamLocationSettings()
+
+	var version atomic.Int32
+	version.Store(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chatgpt", "/claude":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/trace":
+			switch version.Load() {
+			case 1:
+				_, _ = fmt.Fprint(w, "ip=8.8.8.8\nloc=US\n")
+			case 2:
+				_, _ = fmt.Fprint(w, "ip=1.1.1.1\nloc=AU\n")
+			default:
+				_, _ = fmt.Fprint(w, "ip=9.9.9.9\nloc=CH\n")
+			}
+		case "/geo/8.8.8.8":
+			_, _ = fmt.Fprint(w, `{"ip":"8.8.8.8","success":true,"country_code":"US","city":"Mountain View","timezone":{"id":"America/Los_Angeles"}}`)
+		case "/geo/1.1.1.1":
+			_, _ = fmt.Fprint(w, `{"ip":"1.1.1.1","success":true,"country_code":"AU","city":"Sydney","timezone":{"id":"Australia/Sydney"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	restoreEndpoints := defaultUpstreamLocationDiscoveryEndpoints
+	defaultUpstreamLocationDiscoveryEndpoints = upstreamLocationDiscoveryEndpoints{
+		ProbeURLs:            []string{server.URL + "/chatgpt", server.URL + "/claude"},
+		PublicIPTraceURL:     server.URL + "/trace",
+		GeoLookupURLTemplate: server.URL + "/geo/{ip}",
+	}
+	t.Cleanup(func() { defaultUpstreamLocationDiscoveryEndpoints = restoreEndpoints })
+
+	first, err := RefreshUpstreamLocationProfiles(context.Background(), server.Client())
+	require.NoError(t, err)
+	require.True(t, first.Host.Updated)
+	require.Equal(t, "8.8.8.8", first.Host.Profile.PublicIP)
+	require.Equal(t, "CA", first.Host.Profile.Country)
+	require.Equal(t, "Mountain View", first.Host.Profile.City)
+
+	version.Store(2)
+	second, err := RefreshUpstreamLocationProfiles(context.Background(), server.Client())
+	require.NoError(t, err)
+	require.True(t, second.Host.Updated)
+	require.Equal(t, "1.1.1.1", second.Host.Profile.PublicIP)
+	require.Equal(t, "CA", second.Host.Profile.Country)
+	require.Equal(t, "Sydney", second.Host.Profile.City)
+
+	version.Store(3)
+	third, err := RefreshUpstreamLocationProfiles(context.Background(), server.Client())
+	require.NoError(t, err)
+	require.True(t, third.Host.Updated)
+	require.Error(t, third.Host.Err)
+	require.Equal(t, "9.9.9.9", third.Host.Profile.PublicIP)
+	require.Equal(t, "CA", third.Host.Profile.Country)
+	require.Equal(t, "Sydney", third.Host.Profile.City)
+}
+
 func TestSetUpstreamLocationModeValidatesAndUpdatesAtomically(t *testing.T) {
 	restoreUpstreamLocationSettings(t)
 
@@ -169,12 +233,18 @@ func restoreUpstreamLocationSettings(t *testing.T) {
 	originalDiscoveryTimeout := UpstreamLocationDiscoveryTimeout
 	originalHostLocation := UpstreamHostLocationSettings
 	originalLocation := UpstreamEgressLocationSettings
+	originalHostBaseline := upstreamHostLocationBaseline
+	originalEgressBaseline := upstreamEgressLocationBaseline
 	t.Cleanup(func() {
 		require.NoError(t, SetUpstreamLocationMode(originalMode))
 		UpstreamSystemProxyEnabled = originalSystemProxyEnabled
 		UpstreamLocationDiscoveryEnabled = originalDiscoveryEnabled
 		UpstreamLocationDiscoveryTimeout = originalDiscoveryTimeout
+		upstreamLocationProfilesMutex.Lock()
+		upstreamHostLocationBaseline = originalHostBaseline
+		upstreamEgressLocationBaseline = originalEgressBaseline
 		UpstreamHostLocationSettings = originalHostLocation
 		UpstreamEgressLocationSettings = originalLocation
+		upstreamLocationProfilesMutex.Unlock()
 	})
 }

@@ -1,6 +1,48 @@
 # New API 源码修改需求与实现说明
 
-本文档整理当前工作区中针对 **ChatGPT/Codex 订阅渠道** 与 **Claude Code OAuth 渠道** 的全部功能修改，供提交给项目作者审阅。
+本文档整理当前工作区相对 `origin/main` 的全部功能修改，覆盖 **ChatGPT/Codex 订阅渠道**、**Claude Code OAuth 渠道**、管理权限、模型计费、部署、日志治理、重试隔离和上游位置隐私，供项目作者审阅、部署验收和后续追溯。
+
+## 0. 审计范围与 10:34 后续汇总
+
+### 0.1 审计基线
+
+- 对比基线：`origin/main`（`a63364d1`）；
+- 当前已提交版本：`03f9937e`，本地 `main` 比 `origin/main` 领先 9 个提交；
+- 完整差异：178 个文件，约 `+8859/-553`；
+- 10:34 总结之后的主要提交：
+  - `25d86240`（12:23）：58 个文件，约 `+1224/-175`；
+  - `03f9937e`（17:32）：105 个文件，约 `+4121/-287`；
+- 当前还存在一组未提交改动：保持订阅 OAuth 首响应头超时默认值为 30 秒，并将 Transport 超时映射为 `504`、增加 `Retry-After: 2`。该组改动已纳入本次审计，但不属于 `03f9937e`。
+
+### 0.2 10:34 之后新增或完成的内容
+
+1. 完成普通管理员与 Root/同级管理员令牌的角色隔离，并恢复批量删除事务原子性；
+2. 修正渠道模型抓取覆盖 `model_mapping`、可视化价格保存绕过 Schema、完成倍率锁定范围过大等问题；
+3. 恢复 `CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED` 与数据库渠道开关的双重判断；
+4. Codex OAuth client ID、redirect URI、scope 和模型限制改为配置项，测试元数据改为按请求生成；
+5. Codex/Claude Code 共用受保护 OAuth Header 规则，补充 401、403、模型不支持和临时故障分类；
+6. Codex 与 Claude Code 即使开启全局请求透传，也强制使用转换后的请求体，并限制参数/Header 覆盖；
+7. 引入渠道数据政策、重试隔离边界和响应披露 Header，默认不跨渠道发送相同提示；
+8. 引入客户端 IP/位置清理、宿主/代理出口画像、启动探测和 Root 控制面板位置模式设置；
+9. 清理 Redis、支付回调、任务轮询、模型响应等多处正文或凭据日志；
+10. 统一本地、104、192 的 Compose、镜像构建、传输校验、健康检查和缓存清理脚本；
+11. 扩展 Codex `gpt-5.6-*` Responses Lite 请求兼容、动态会话元数据、工具兼容判断和标准模式回退；
+12. 增补多语言文案、后端回归测试和前端构建/类型检查覆盖。
+
+### 0.3 此前审计问题的闭环状态
+
+| 此前问题 | 当前状态 |
+|---|---|
+| 管理员越权读取 Root API Key | 已修复：仅 Root 或高于目标角色者可管理特权令牌 |
+| 获取模型覆盖 `model_mapping` | 已修复：只更新模型列表，保留已有映射 |
+| 批量删除令牌非原子 | 已修复：整批鉴权后事务删除 |
+| 所有硬编码完成倍率被解锁 | 已修复：只允许 GPT-5.4 及后续目标模型自定义 |
+| Codex 模型抓取可能无限挂起 | 已修复：继承 Context，并应用订阅 OAuth 超时 |
+| 超时代码/Compose 默认值不一致 | 已统一为 30 秒；部署脚本会把此前生成的 120 秒默认值迁回 30 秒，同时保留管理员自定义值 |
+| 可视化价格保存绕过 Schema | 已修复：编辑器提交快照后仍经过 `form.handleSubmit()` |
+| 104 镜像不一致仍报告完成 | 已修复：归档、镜像版本和运行容器镜像均强校验 |
+| 上游模型巡检环境变量开关失效 | 已修复：环境变量与数据库渠道开关双重判断 |
+| 修改说明过期 | 本文档已按当前代码重新汇总；仍存在的偏差列在第 9 节 |
 
 ## 1. ChatGPT/Codex 订阅渠道
 
@@ -263,7 +305,7 @@ x-app: cli
 - 允许渠道亲和生成的安全 Header 透传，但过滤认证和身份 Header；
 - 调试日志只记录请求体大小，不输出订阅 OAuth 请求正文；
 - 每个渠道默认最多 5 个并发请求，相邻请求启动间隔默认 750ms；
-- 等待上游首个响应头默认最多 30 秒；
+- 等待上游首个响应头默认最多 30 秒；Transport 超时返回 `504` 和 `Retry-After`，便于客户端与真正的应用内部 `500` 区分；
 - 本地并发保护触发时返回可重试的 503，以便切换到备用订阅渠道；
 - 上游 5xx、504、524 可进入重试判断，但默认只允许当前多 Key 渠道换 Key 重试；只有管理员显式配置相同供应商端点或相同数据策略组后，才允许跨渠道重试；
 - 定时推理测试和上游价格同步跳过订阅 OAuth 渠道。
@@ -309,12 +351,23 @@ web/default/src/i18n/locales/vi.json
 relay/channel/claude/adaptor_test.go
 relay/channel/codex/adaptor_test.go
 relay/channel/codex/constants_test.go
+relay/channel/codex/models_test.go
+relay/channel/api_request_test.go
+relay/common/location_privacy_test.go
+relay/common/outbound_body_test.go
+relay/common/request_passthrough_test.go
 controller/channel_upstream_update_test.go
+controller/option_batch_test.go
+controller/option_location_test.go
 controller/ratio_sync_test.go
 controller/relay_retry_test.go
 controller/token_test.go
+common/credential_redaction_test.go
+common/upstream_location_test.go
+model/option_location_test.go
 service/channel_oauth_policy_test.go
 service/http_client_test.go
+service/retry_data_policy_test.go
 setting/ratio_setting/model_ratio_test.go
 ```
 
@@ -324,11 +377,17 @@ setting/ratio_setting/model_ratio_test.go
 - 删除旧 `x-api-key`；
 - Codex 客户端请求头转发；
 - Codex Bearer 和 account ID 设置；
-- Codex 固定模型列表和账号模型获取；
+- Codex 显式模型限制和账号动态模型获取；
 - 订阅 OAuth 安全字段、Header、超时与重试分类；
 - 上游价格/模型巡检排除和任务启用条件；
 - 管理员与 Root 的令牌权限边界及批量删除原子性；
-- 硬编码完成倍率锁定与 GPT-5.4 可配置行为。
+- 硬编码完成倍率锁定与 GPT-5.4 可配置行为；
+- Codex Responses Lite 元数据、工具兼容、普通模式回退和非流式拒绝；
+- 全局/渠道请求透传对 Codex、Claude Code 的强制禁用；
+- 客户端网络 Header 禁止透传和 OAuth 身份 Header 防覆盖；
+- 宿主/代理出口画像发现、位置模式热更新和隐私过滤；
+- 默认渠道隔离、供应商隔离、策略组隔离和响应披露 Header；
+- 批量模型价格配置事务写入和位置模式运行时选项。
 
 ## 6. 部署和验证
 
@@ -347,10 +406,10 @@ bin/deploy-192.168.11.12.sh
 - `bin/deploy-remote.sh` 统一 104、192 的远程构建发布流程，两个服务器脚本只声明目标地址、目录、端口和额外服务；
 - 本地和 192 服务监听 3000，104 由 Caddy 对外提供 `nextcode.buildtoconnect.com`；
 - 本地、104、192 服务时区统一为 UTC，与 Codex / Claude Code 上游时间戳和配额窗口保持一致；
-- Compose 默认设置 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT=30`；
+- Compose 默认设置 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT=30`；部署脚本仅将旧默认值 `120` 自动迁移为 `30`，保留管理员自定义值；
 - Docker 构建支持 GOPROXY 主备切换；
 - 运行镜像只保留静态服务二进制、CA、时区数据库和健康检查所需工具，不携带 Go 编译器；
-- 每次构建版本包含 Git describe 结果和 UTC 构建时间，可区分同一 tag 上的不同补丁；
+- 当前默认 `APP_VERSION` 只取最近 Git tag；镜像归档 SHA-256 和镜像 ID 可以确认实际部署产物，但 `/api/status` 版本号不能区分同一 tag 上的不同补丁；
 - 镜像传输前后强制比较压缩包 SHA-256，服务器内部再比较已加载镜像与运行容器的镜像 ID，不一致立即失败；
 - 构建后默认将 Buildx 缓存控制在 20GB 内，并清理带有 new-api 镜像标签的无引用旧镜像；
 - 部署脚本等待容器健康，并再次请求 `/api/status`。
@@ -373,7 +432,7 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 
 - `104.128.92.169` 公网部署强制启用 `SESSION_COOKIE_SECURE=true`，可信入口默认为 `https://nextcode.buildtoconnect.com`；Caddy 将公网 IP 的 HTTP 请求永久重定向到该 HTTPS 域名并发送 HSTS；
 - 本地和 `192.168.11.12` 内网部署不强制 Secure Cookie，继续支持 HTTP；
-- 请求正文、上游响应正文、SSE 事件、OAuth code/token、Webhook 签名和正文不写入运行日志，诊断日志仅保留状态码、字节数和非内容元数据；
+- Redis、支付回调、任务轮询、常规成功响应和多数流处理日志已改为只记录状态码、字节数与非内容元数据；OAuth code/token、Webhook 签名和正文经过专门省略或脱敏；通用错误响应与 Ollama 异常 SSE 仍有正文泄露缺口，见 9.1；
 - 渠道编辑器新增“数据治理”，可填写真实供应商、数据区域、保留期、训练策略、重试隔离范围和策略组；
 - 默认 `channel` 隔离不把提示词发送到其他渠道；当前渠道为多 Key 时才可在该渠道内换 Key；
 - `provider` 隔离要求渠道类型、规范化上游端点、显式供应商、区域、保留期和训练策略全部一致；
@@ -385,7 +444,7 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 
 ## 8. 上游位置与客户端 IP 隐私
 
-- 所有 JSON 模型请求在最终出站边界执行位置隐私策略，参数覆盖和渠道正文直通不能绕过；
+- JSON 模型请求在最终出站边界执行位置隐私策略，常见协议位置字段、参数覆盖和渠道正文直通均纳入过滤；当前敏感字段预扫描仍可能漏掉大小写变体或未列入 marker 的顶层字段，见 9.2；
 - `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
 - `UPSTREAM_LOCATION_MODE=auto` 根据真实网络路径选择画像：渠道配置代理或 `UPSTREAM_SYSTEM_PROXY_ENABLED=true` 时使用 VPN/代理出口画像，否则使用宿主网络出口画像；两套画像可分别由 `UPSTREAM_EGRESS_LOCATION_*` 和 `UPSTREAM_HOST_LOCATION_*` 显式配置；
 - `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径和已启用的系统代理/VPN 路径检查 ChatGPT、Claude 连通性；两者均可建立 HTTP 连接后，通过 Cloudflare trace 获取该路径的实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度。显式环境变量始终优先，探测只补充空字段；探测失败不会放行客户端位置；
@@ -399,23 +458,45 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 - 自动探测只发送无凭证的连通性请求，不携带客户端请求、OAuth Token 或模型数据；公网出口 IP 会被 Cloudflare 和 `ipwho.is` 看到。对第三方 IP 地理定位服务有合规限制时，可设置 `UPSTREAM_LOCATION_DISCOVERY_ENABLED=false` 并完全使用显式画像；
 - 三套部署入口共用 `docker-compose.deploy.yml` 的隐私环境变量，部署脚本会为已有或新建 `.env` 补齐 `UPSTREAM_LOCATION_MODE=strip`、`UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 和 8 秒总探测超时。安全默认仍为删除客户端位置，探测画像不会自动改变转发模式。
 
-## 9. 已知限制和建议
+## 9. 当前审计发现与已知限制
 
-### 9.1 Anthropic OAuth 组织权限
+### 9.1 [P1] 通用上游错误和 Ollama 异常流仍会记录完整响应内容
 
-如果上游返回：
+- `service/error.go` 的 `RelayErrorHandler` 忽略原有 `showBodyWhenFail` 参数，无条件读取并拼接完整响应体；
+- `controller/relay.go` 将该错误写入运行日志和持久化错误日志，并将未掩码的错误返回客户端；
+- `service/error_test.go` 当前测试明确要求完整正文出现在错误与日志中；
+- `relay/channel/ollama/stream.go` 在 JSON 解码失败时记录完整 SSE 行。
 
-```text
-OAuth authentication is currently not allowed for this organization.
-```
+这与“禁止正文/响应/SSE 内容日志”的治理目标直接冲突，也会绕过仅按字节数记录的其他日志清理。应只保留状态码、供应商错误码、请求 ID、Content-Type 和受限长度的非正文摘要；原始响应正文不得进入运行日志或数据库日志。
 
-表示 Token 已被上游识别，但所属 Anthropic 组织不允许 OAuth API 访问。该错误不是网关请求头错误，无法由本项目绕过。建议对该错误增加专门提示，而不是统一显示为 `unknown_error`。
+### 9.2 [P1] 位置隐私过滤的 marker 快路径存在漏检
 
-### 9.2 建议作者审阅
+`relay/common/location_privacy.go` 在解析 JSON 前先用大小写敏感的固定 marker 列表判断是否可能含敏感数据。`remote_addr`、`cf_connecting_ip` 等已被清理函数识别的顶层字段未全部进入 marker 列表，大小写变体也可能绕过预扫描，导致请求体原样发送上游。
 
-1. Codex OAuth client ID、redirect URI 和 scope 是否应由配置项管理；
-2. Codex 渠道测试使用的固定 session/turn 元数据是否应改为每次动态生成；
-3. Codex 模型列表是否应由上游能力或管理员配置，而不是硬编码；
-4. Claude Code OAuth 请求头生成逻辑是否应与模型抓取逻辑共用同一个 helper；
-5. OAuth Token、refresh token 和 callback URL 在日志中必须避免明文输出；
-6. 对 OAuth 403、401、模型不支持等上游错误增加明确的错误分类和前端提示。
+应让预扫描与规范化后的敏感键集合保持同一数据源，或在开启隐私保护时始终解析 JSON；补充顶层字段、大小写、连字符、下划线和嵌套数组回归测试。
+
+### 9.3 [P1] 订阅 OAuth 兼容实现不能等同于官方公开 API 合规
+
+Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth client ID、`originator` 和 `x-openai-internal-*` Header；Claude Code 路径使用 `claude-cli`、Claude Code 专用 beta Header 和固定 CLI identity system prompt。这些均属于客户端兼容或内部接口行为，不是代码库内能够证明已获供应商授权的公开 API 合同。
+
+部署前仍需取得 OpenAI/Anthropic 对账号共享、中转、自动化、转售、内部端点和订阅 OAuth Token 使用方式的明确授权。否则即使技术请求成功，也仍存在 401/403、组织禁用、接口变更和账号限制风险。
+
+### 9.4 [P2] 单项系统配置忽略数据库写入错误
+
+`model/option.go` 的 `UpdateOption` 没有检查 `FirstOrCreate` 和 `Save` 的错误，却继续更新运行时 `OptionMap` 并向控制器返回成功。新开放的 `UpstreamLocationMode` 因此可能在页面上显示保存成功，但数据库实际没有持久化，重启后恢复旧值。应检查两个数据库操作，最好使用事务，并只在提交成功后更新运行时状态。
+
+### 9.5 [P2] 随机多 Key 渠道重试可能再次选择同一个 Key
+
+重试边界只记录已尝试的渠道 ID；多 Key 渠道被允许再次入选。轮询模式通常会切到下一个 Key，但随机模式没有记录本请求已使用的 Key 索引，可能再次把同一提示发送给同一账号，既不能实现有效故障转移，也可能产生重复执行或重复计费。应在请求级边界记录 `(channel_id, key_index)`，在所有可用 Key 尝试完之前排除已用 Key。
+
+### 9.6 [P2] 构建版本号不能区分同一 tag 的补丁
+
+`bin/deploy-common.sh` 的 `deploy_build_version` 只返回最近 release tag。镜像归档与运行镜像校验本身是严格的，但多个补丁仍会在 `/api/status` 显示同一版本。应把短 commit、dirty 标记或 UTC 构建号加入 `APP_VERSION`，并继续保留镜像 ID 强校验。
+
+### 9.7 [P2] 批量模型价格保存缺少语义校验
+
+`controller/option.go` 的批量接口只验证 JSON 是否可解析为数值/字符串 map，没有验证倍率和价格的合法范围，也没有对 `billing_expr` 执行编译与 smoke test。负数最终会在预扣环节失败关闭，不会形成负扣费，但无效表达式或配置仍可持久化并使相关模型请求持续失败。应在事务写入前复用计费表达式和倍率的后端校验。
+
+### 9.8 Anthropic OAuth 组织权限
+
+如果上游返回 `OAuth authentication is currently not allowed for this organization.`，表示 Token 已被识别，但所属 Anthropic 组织不允许 OAuth API 访问。该限制无法由网关 Header 或重试逻辑绕过。

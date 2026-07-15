@@ -564,6 +564,22 @@ func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
 func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	return doRequest(c, req, info)
 }
+
+func isSubscriptionOAuthResponseHeaderTimeout(err error, req *http.Request, info *common.RelayInfo) bool {
+	if err == nil || req == nil || info == nil {
+		return false
+	}
+	if info.ChannelType != rootconstant.ChannelTypeCodex && info.ChannelType != rootconstant.ChannelTypeClaudeCode {
+		return false
+	}
+	// A canceled/deadline-exceeded client request is not an upstream header timeout.
+	if req.Context().Err() != nil {
+		return false
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	stripSensitiveClientNetworkHeaders(req.Header)
 	var client *http.Client
@@ -609,6 +625,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
+		if isSubscriptionOAuthResponseHeaderTimeout(err, req, info) {
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
+		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if resp == nil {

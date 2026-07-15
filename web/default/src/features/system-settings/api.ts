@@ -29,6 +29,7 @@ import type {
   UpdateOptionRequest,
   UpdateOptionResponse,
   UpstreamChannelsResponse,
+  UpstreamLocationRefreshResponse,
   UpstreamRatiosResponse,
 } from './types'
 
@@ -39,6 +40,15 @@ export async function getSystemOptions() {
 
 export async function updateSystemOption(request: UpdateOptionRequest) {
   const res = await api.put<UpdateOptionResponse>('/api/option/', request)
+  return res.data
+}
+
+export async function refreshUpstreamLocationProfiles() {
+  const res = await api.post<UpstreamLocationRefreshResponse>(
+    '/api/option/upstream-location/refresh',
+    null,
+    { skipErrorHandler: true }
+  )
   return res.data
 }
 
