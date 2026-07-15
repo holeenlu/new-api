@@ -445,7 +445,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
-			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+			showBodyWhenFail := !relaycommon.IsSubscriptionOAuthChannel(channel.Type)
+			err := service.RelayErrorHandler(c.Request.Context(), httpResp, showBodyWhenFail)
 			err = service.ApplyChannelErrorPolicy(channel.Type, err)
 			common.SysError(fmt.Sprintf(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -516,7 +517,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		Group:            info.UsingGroup,
 		Other:            other,
 	})
-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
+		common.SysLog(fmt.Sprintf("testing subscription OAuth channel #%d succeeded, response_bytes=%d", channel.Id, len(respBody)))
+	} else {
+		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
 	return testResult{
 		context:     c,
 		localErr:    nil,

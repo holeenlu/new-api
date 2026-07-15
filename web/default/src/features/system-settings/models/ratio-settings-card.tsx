@@ -27,7 +27,7 @@ import * as z from 'zod'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-import { resetModelRatios, updateSystemOption } from '../api'
+import { resetModelRatios, updateModelPricingOptions } from '../api'
 import { SettingsPageTitleStatusPortal } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
@@ -344,15 +344,14 @@ export function RatioSettingsCard({
 
       setIsSavingModelRatios(true)
       try {
+        const options: Record<string, string> = {}
         for (const key of updates) {
           const apiKey = apiKeyMap[key as string] || (key as string)
-          const result = await updateSystemOption({
-            key: apiKey,
-            value: normalized[key],
-          })
-          if (!result.success) {
-            throw new Error(result.message || t('Failed to update setting'))
-          }
+          options[apiKey] = String(normalized[key])
+        }
+        const result = await updateModelPricingOptions({ options })
+        if (!result.success) {
+          throw new Error(result.message || t('Failed to update setting'))
         }
 
         modelNormalizedDefaults.current = normalized

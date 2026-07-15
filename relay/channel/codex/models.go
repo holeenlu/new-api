@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 )
 
 const (
@@ -86,7 +88,18 @@ func FetchUpstreamModels(ctx context.Context, client *http.Client, baseURL strin
 		if len(detail) > 512 {
 			detail = detail[:512]
 		}
-		return nil, fmt.Errorf("codex upstream model request failed: status=%d: %s", resp.StatusCode, detail)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			return nil, types.NewErrorWithStatusCode(errors.New("OAuth credential is invalid or expired"), types.ErrorCodeOAuthUnauthorized, resp.StatusCode)
+		case http.StatusForbidden:
+			return nil, types.NewErrorWithStatusCode(errors.New("OAuth account is not permitted to discover models"), types.ErrorCodeOAuthForbidden, resp.StatusCode)
+		default:
+			return nil, types.NewErrorWithStatusCode(
+				fmt.Errorf("codex upstream model request failed: status=%d: %s", resp.StatusCode, common.RedactSensitiveCredentials(detail)),
+				types.ErrorCodeBadResponseStatusCode,
+				resp.StatusCode,
+			)
+		}
 	}
 
 	var payload upstreamModelsResponse

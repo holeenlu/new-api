@@ -25,6 +25,8 @@ import (
 	"github.com/QuantumNous/new-api/oauth"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/router"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -305,6 +307,8 @@ func InitResources() error {
 
 	// 加载环境变量
 	common.InitEnv()
+	claude.InitOAuthRuntimeSettings()
+	codex.InitOAuthRuntimeSettings()
 
 	logger.SetupLogger()
 

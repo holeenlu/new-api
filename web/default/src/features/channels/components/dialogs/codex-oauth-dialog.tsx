@@ -11,6 +11,7 @@ import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { tryPrettyJson } from '@/lib/utils'
 
 import { completeCodexOAuth, startCodexOAuth } from '../../api'
+import { getChannelErrorMessage } from '../../lib/channel-error-messages'
 
 type CodexOAuthDialogProps = {
   open: boolean
@@ -51,7 +52,9 @@ export function CodexOAuthDialog(props: CodexOAuthDialogProps) {
       setAuthorizeUrl(url)
       window.open(url, '_blank', 'noopener,noreferrer')
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('OAuth start failed'))
+      toast.error(
+        error instanceof Error ? error.message : t('OAuth start failed')
+      )
     } finally {
       setIsStarting(false)
     }
@@ -63,7 +66,12 @@ export function CodexOAuthDialog(props: CodexOAuthDialogProps) {
       const response = await completeCodexOAuth(callbackUrl.trim())
       const key = response.data?.key
       if (!response.success || !key) {
-        throw new Error(response.message || t('OAuth failed'))
+        throw new Error(
+          getChannelErrorMessage(
+            response.error_code,
+            response.message || t('OAuth failed')
+          )
+        )
       }
       props.onKeyGenerated(tryPrettyJson(key))
       toast.success(t('Credential generated'))
@@ -80,13 +88,20 @@ export function CodexOAuthDialog(props: CodexOAuthDialogProps) {
       open={props.open}
       onOpenChange={props.onOpenChange}
       title={t('Codex Authorization')}
-      description={t('Sign in to ChatGPT and generate a Codex OAuth credential.')}
+      description={t(
+        'Sign in to ChatGPT and generate a Codex OAuth credential.'
+      )}
       contentClassName='sm:max-w-2xl'
       contentHeight='auto'
       bodyClassName='space-y-4'
       footer={
         <>
-          <Button type='button' variant='outline' onClick={() => props.onOpenChange(false)} disabled={isStarting || isCompleting}>
+          <Button
+            type='button'
+            variant='outline'
+            onClick={() => props.onOpenChange(false)}
+            disabled={isStarting || isCompleting}
+          >
             {t('Cancel')}
           </Button>
           <Button onClick={handleComplete} disabled={!canComplete}>
@@ -98,22 +113,48 @@ export function CodexOAuthDialog(props: CodexOAuthDialogProps) {
     >
       <Alert>
         <AlertDescription>
-          {t('After signing in, copy the full localhost callback URL from the browser address bar and paste it here.')}
+          {t(
+            'After signing in, copy the full callback URL from the browser address bar and paste it here.'
+          )}
         </AlertDescription>
       </Alert>
       <div className='flex flex-wrap gap-2'>
         <Button type='button' onClick={handleStart} disabled={isStarting}>
-          {isStarting ? <Loader2 className='mr-2 h-4 w-4 animate-spin' /> : <ExternalLink className='mr-2 h-4 w-4' />}
+          {isStarting ? (
+            <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+          ) : (
+            <ExternalLink className='mr-2 h-4 w-4' />
+          )}
           {t('Open authorization page')}
         </Button>
-        <Button type='button' variant='outline' disabled={!authorizeUrl || isStarting} onClick={() => copyToClipboard(authorizeUrl)}>
-          {copiedText === authorizeUrl ? <Check className='mr-2 h-4 w-4' /> : <Copy className='mr-2 h-4 w-4' />}
+        <Button
+          type='button'
+          variant='outline'
+          disabled={!authorizeUrl || isStarting}
+          onClick={() => copyToClipboard(authorizeUrl)}
+        >
+          {copiedText === authorizeUrl ? (
+            <Check className='mr-2 h-4 w-4' />
+          ) : (
+            <Copy className='mr-2 h-4 w-4' />
+          )}
           {t('Copy authorization link')}
         </Button>
       </div>
       <div className='space-y-2'>
-        <label className='text-sm font-medium' htmlFor='codex-oauth-callback'>{t('Callback URL')}</label>
-        <Input id='codex-oauth-callback' value={callbackUrl} onChange={(event) => setCallbackUrl(event.target.value)} placeholder={t('Paste the full callback URL (includes code and state)')} autoComplete='off' spellCheck={false} />
+        <label className='text-sm font-medium' htmlFor='codex-oauth-callback'>
+          {t('Callback URL')}
+        </label>
+        <Input
+          id='codex-oauth-callback'
+          value={callbackUrl}
+          onChange={(event) => setCallbackUrl(event.target.value)}
+          placeholder={t(
+            'Paste the full callback URL (includes code and state)'
+          )}
+          autoComplete='off'
+          spellCheck={false}
+        />
       </div>
     </Dialog>
   )

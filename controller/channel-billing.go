@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -137,23 +137,27 @@ func GetClaudeAuthHeader(token string) http.Header {
 	return h
 }
 
-// GetClaudeCodeOAuthHeader builds the headers required by Claude Code OAuth tokens.
-func GetClaudeCodeOAuthHeader(token string) http.Header {
-	h := http.Header{}
-	h.Add("anthropic-version", "2023-06-01")
-	_ = claude.SetupClaudeCodeOAuthHeader(&h, token)
-	return h
+func GetResponseBody(method, url string, channel *model.Channel, headers http.Header) ([]byte, error) {
+	return GetResponseBodyWithContext(context.Background(), method, url, channel, headers, 0)
 }
 
-func GetResponseBody(method, url string, channel *model.Channel, headers http.Header) ([]byte, error) {
-	req, err := http.NewRequest(method, url, nil)
+func GetResponseBodyWithContext(ctx context.Context, method, url string, channel *model.Channel, headers http.Header, timeout time.Duration) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	for k := range headers {
 		req.Header.Add(k, headers.Get(k))
 	}
-	client, err := service.NewProxyHttpClient(channel.GetSetting().Proxy)
+	client, err := service.GetHttpClientWithResponseHeaderTimeout(channel.GetSetting().Proxy, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -161,14 +165,11 @@ func GetResponseBody(method, url string, channel *model.Channel, headers http.He
 	if err != nil {
 		return nil, err
 	}
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status code: %d", res.StatusCode)
 	}
 	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	err = res.Body.Close()
 	if err != nil {
 		return nil, err
 	}

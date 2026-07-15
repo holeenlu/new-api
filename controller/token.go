@@ -353,46 +353,58 @@ type TokenBatch struct {
 	Ids []int `json:"ids"`
 }
 
+func normalizeTokenBatchIDs(ids []int) ([]int, error) {
+	normalized := make([]int, 0, len(ids))
+	seen := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("无效的令牌 ID")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized, nil
+}
+
+func getManageableTokensByIDs(c *gin.Context, ids []int) ([]model.TokenWithOwnerRole, error) {
+	tokens, err := model.GetTokensWithOwnerRolesByIds(ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(tokens) != len(ids) {
+		return nil, fmt.Errorf("令牌不存在")
+	}
+
+	userID := c.GetInt("id")
+	actorRole := c.GetInt("role")
+	for _, token := range tokens {
+		if token.UserId == userID {
+			continue
+		}
+		if actorRole < common.RoleAdminUser || !canManageOtherPrivilegedUserToken(actorRole, token.OwnerRole) {
+			return nil, fmt.Errorf("无权访问该令牌")
+		}
+	}
+	return tokens, nil
+}
+
 func DeleteTokenBatch(c *gin.Context) {
 	tokenBatch := TokenBatch{}
 	if err := c.ShouldBindJSON(&tokenBatch); err != nil || len(tokenBatch.Ids) == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	ids := make([]int, 0, len(tokenBatch.Ids))
-	seen := make(map[int]struct{}, len(tokenBatch.Ids))
-	for _, id := range tokenBatch.Ids {
-		if id <= 0 {
-			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
-			return
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-
-	tokens, err := model.GetTokensWithOwnerRolesByIds(ids)
+	ids, err := normalizeTokenBatchIDs(tokenBatch.Ids)
 	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	if _, err = getManageableTokensByIDs(c, ids); err != nil {
 		common.ApiError(c, err)
 		return
-	}
-	if len(tokens) != len(ids) {
-		common.ApiError(c, fmt.Errorf("令牌不存在"))
-		return
-	}
-
-	userId := c.GetInt("id")
-	actorRole := c.GetInt("role")
-	for _, token := range tokens {
-		if token.UserId == userId {
-			continue
-		}
-		if actorRole < common.RoleAdminUser || !canManageOtherPrivilegedUserToken(actorRole, token.OwnerRole) {
-			common.ApiError(c, fmt.Errorf("无权访问该令牌"))
-			return
-		}
 	}
 
 	count, err := model.BatchDeleteTokensByIds(ids)
@@ -417,14 +429,19 @@ func GetTokenKeysBatch(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgBatchTooMany, map[string]any{"Max": 100})
 		return
 	}
-	keysMap := make(map[int]string)
-	for _, id := range tokenBatch.Ids {
-		t, err := getManageableToken(c, id)
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		keysMap[t.Id] = t.GetFullKey()
+	ids, err := normalizeTokenBatchIDs(tokenBatch.Ids)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	tokens, err := getManageableTokensByIDs(c, ids)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	keysMap := make(map[int]string, len(tokens))
+	for _, token := range tokens {
+		keysMap[token.Id] = token.GetFullKey()
 	}
 	common.ApiSuccess(c, gin.H{"keys": keysMap})
 }

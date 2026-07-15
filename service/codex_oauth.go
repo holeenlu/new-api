@@ -13,17 +13,64 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 )
 
 const (
-	codexOAuthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
-	codexOAuthAuthorizeURL = "https://auth.openai.com/oauth/authorize"
-	codexOAuthTokenURL     = "https://auth.openai.com/oauth/token"
-	codexOAuthRedirectURI  = "http://localhost:1455/auth/callback"
-	codexOAuthScope        = "openid profile email offline_access"
-	codexJWTClaimPath      = "https://api.openai.com/auth"
-	defaultHTTPTimeout     = 20 * time.Second
+	defaultCodexOAuthClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+	defaultCodexOAuthRedirectURI = "http://localhost:1455/auth/callback"
+	defaultCodexOAuthScope       = "openid profile email offline_access"
+	codexOAuthAuthorizeURL       = "https://auth.openai.com/oauth/authorize"
+	codexOAuthTokenURL           = "https://auth.openai.com/oauth/token"
+	codexJWTClaimPath            = "https://api.openai.com/auth"
+	defaultHTTPTimeout           = 20 * time.Second
 )
+
+type codexOAuthConfig struct {
+	ClientID    string
+	RedirectURI string
+	Scope       string
+}
+
+type CodexOAuthUpstreamError struct {
+	StatusCode int
+	Code       types.ErrorCode
+	Message    string
+}
+
+func (e *CodexOAuthUpstreamError) Error() string {
+	return e.Message
+}
+
+func loadCodexOAuthConfig() (codexOAuthConfig, error) {
+	config := codexOAuthConfig{
+		ClientID:    strings.TrimSpace(common.GetEnvOrDefaultString("CODEX_OAUTH_CLIENT_ID", defaultCodexOAuthClientID)),
+		RedirectURI: strings.TrimSpace(common.GetEnvOrDefaultString("CODEX_OAUTH_REDIRECT_URI", defaultCodexOAuthRedirectURI)),
+		Scope:       strings.Join(strings.Fields(common.GetEnvOrDefaultString("CODEX_OAUTH_SCOPE", defaultCodexOAuthScope)), " "),
+	}
+	if config.ClientID == "" {
+		return codexOAuthConfig{}, errors.New("CODEX_OAUTH_CLIENT_ID must not be empty")
+	}
+	redirectURL, err := url.ParseRequestURI(config.RedirectURI)
+	if err != nil || redirectURL.Host == "" || (redirectURL.Scheme != "http" && redirectURL.Scheme != "https") {
+		return codexOAuthConfig{}, errors.New("CODEX_OAUTH_REDIRECT_URI must be an absolute HTTP or HTTPS URL")
+	}
+	if config.Scope == "" {
+		return codexOAuthConfig{}, errors.New("CODEX_OAUTH_SCOPE must not be empty")
+	}
+	return config, nil
+}
+
+func newCodexOAuthUpstreamError(statusCode int, operation string) error {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeOAuthUnauthorized, Message: "OAuth credential is invalid or expired"}
+	case http.StatusForbidden:
+		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeOAuthForbidden, Message: "OAuth account is not permitted to access this resource"}
+	default:
+		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeBadResponseStatusCode, Message: fmt.Sprintf("codex oauth %s failed: status=%d", operation, statusCode)}
+	}
+}
 
 type CodexOAuthTokenResult struct {
 	AccessToken  string
@@ -42,14 +89,22 @@ func RefreshCodexOAuthToken(ctx context.Context, refreshToken string) (*CodexOAu
 }
 
 func RefreshCodexOAuthTokenWithProxy(ctx context.Context, refreshToken string, proxyURL string) (*CodexOAuthTokenResult, error) {
+	config, err := loadCodexOAuthConfig()
+	if err != nil {
+		return nil, err
+	}
 	client, err := getCodexOAuthHTTPClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
-	return refreshCodexOAuthToken(ctx, client, codexOAuthTokenURL, codexOAuthClientID, refreshToken)
+	return refreshCodexOAuthToken(ctx, client, codexOAuthTokenURL, config.ClientID, refreshToken)
 }
 
 func CreateCodexOAuthAuthorizationFlow() (*CodexOAuthAuthorizationFlow, error) {
+	config, err := loadCodexOAuthConfig()
+	if err != nil {
+		return nil, err
+	}
 	stateBytes := make([]byte, 16)
 	if _, err := rand.Read(stateBytes); err != nil {
 		return nil, err
@@ -68,9 +123,9 @@ func CreateCodexOAuthAuthorizationFlow() (*CodexOAuthAuthorizationFlow, error) {
 	state := fmt.Sprintf("%x", stateBytes)
 	q := u.Query()
 	q.Set("response_type", "code")
-	q.Set("client_id", codexOAuthClientID)
-	q.Set("redirect_uri", codexOAuthRedirectURI)
-	q.Set("scope", codexOAuthScope)
+	q.Set("client_id", config.ClientID)
+	q.Set("redirect_uri", config.RedirectURI)
+	q.Set("scope", config.Scope)
 	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(challengeSum[:]))
 	q.Set("code_challenge_method", "S256")
 	q.Set("state", state)
@@ -88,16 +143,20 @@ func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier s
 	if code == "" || verifier == "" {
 		return nil, errors.New("authorization code and code_verifier are required")
 	}
+	config, err := loadCodexOAuthConfig()
+	if err != nil {
+		return nil, err
+	}
 	client, err := getCodexOAuthHTTPClient("")
 	if err != nil {
 		return nil, err
 	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
-	form.Set("client_id", codexOAuthClientID)
+	form.Set("client_id", config.ClientID)
 	form.Set("code", code)
 	form.Set("code_verifier", verifier)
-	form.Set("redirect_uri", codexOAuthRedirectURI)
+	form.Set("redirect_uri", config.RedirectURI)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
@@ -109,6 +168,9 @@ func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier s
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, newCodexOAuthUpstreamError(resp.StatusCode, "code exchange")
+	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
@@ -117,8 +179,8 @@ func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier s
 	if err := common.DecodeJson(resp.Body, &payload); err != nil {
 		return nil, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
-		return nil, fmt.Errorf("codex oauth code exchange failed: status=%d", resp.StatusCode)
+	if strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
+		return nil, errors.New("codex oauth code exchange response missing fields")
 	}
 	return &CodexOAuthTokenResult{AccessToken: strings.TrimSpace(payload.AccessToken), RefreshToken: strings.TrimSpace(payload.RefreshToken), ExpiresAt: time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)}, nil
 }
@@ -152,6 +214,9 @@ func refreshCodexOAuthToken(
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, newCodexOAuthUpstreamError(resp.StatusCode, "refresh")
+	}
 
 	var payload struct {
 		AccessToken  string `json:"access_token"`
@@ -162,10 +227,6 @@ func refreshCodexOAuthToken(
 	if err := common.DecodeJson(resp.Body, &payload); err != nil {
 		return nil, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("codex oauth refresh failed: status=%d", resp.StatusCode)
-	}
-
 	if strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
 		return nil, errors.New("codex oauth refresh response missing fields")
 	}

@@ -83,6 +83,7 @@ ssh_bash() {
   ssh_remote "$DEPLOY_TARGET" "$remote_command"
 }
 
+deploy_ensure_docker_cli
 deploy_require_commands docker ssh scp tar gzip curl git date awk
 docker info >/dev/null 2>&1 || deploy_die "Docker daemon is unavailable"
 docker buildx version >/dev/null 2>&1 || deploy_die "docker buildx is unavailable"
@@ -198,6 +199,7 @@ if [[ "$container_image_id" != "$loaded_image_id" ]]; then
   exit 1
 fi
 echo "Deployed image: ${container_image_id#sha256:}"
+deploy_prune_project_images
 REMOTE_DEPLOY
 
 deploy_log "Waiting for container health"

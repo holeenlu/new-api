@@ -59,6 +59,9 @@ const (
 	ErrorCodeChannelAwsClientError        ErrorCode = "channel:aws_client_error"
 	ErrorCodeChannelInvalidKey            ErrorCode = "channel:invalid_key"
 	ErrorCodeChannelResponseTimeExceeded  ErrorCode = "channel:response_time_exceeded"
+	ErrorCodeOAuthUnauthorized            ErrorCode = "oauth_unauthorized"
+	ErrorCodeOAuthForbidden               ErrorCode = "oauth_forbidden"
+	ErrorCodeModelNotSupported            ErrorCode = "model_not_supported"
 
 	// client request error
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"

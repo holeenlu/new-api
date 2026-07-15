@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 )
@@ -20,6 +21,21 @@ const codexOAuthSessionVerifierKey = "codex_oauth_verifier"
 
 type codexOAuthCompleteRequest struct {
 	Input string `json:"input"`
+}
+
+func respondCodexOAuthError(c *gin.Context, err error, fallbackMessage string) {
+	response := gin.H{"success": false, "message": fallbackMessage}
+	var upstreamErr *service.CodexOAuthUpstreamError
+	if errors.As(err, &upstreamErr) {
+		response["message"] = upstreamErr.Message
+		response["error_code"] = upstreamErr.Code
+	} else if err != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			response["error_code"] = apiErr.GetErrorCode()
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func StartCodexOAuth(c *gin.Context) {
@@ -66,7 +82,7 @@ func CompleteCodexOAuth(c *gin.Context) {
 	defer cancel()
 	result, err := service.ExchangeCodexAuthorizationCode(ctx, code, verifier)
 	if err != nil {
-		common.ApiError(c, err)
+		respondCodexOAuthError(c, err, "OAuth authorization failed")
 		return
 	}
 	accountID, ok := service.ExtractCodexAccountIDFromJWT(result.AccessToken)

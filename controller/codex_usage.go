@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -160,7 +161,16 @@ func fetchCodexChannelWhamData(
 		"data":            payload,
 	}
 	if !ok {
-		resp["message"] = fmt.Sprintf("upstream status: %d", statusCode)
+		switch statusCode {
+		case http.StatusUnauthorized:
+			resp["error_code"] = types.ErrorCodeOAuthUnauthorized
+			resp["message"] = "OAuth credential is invalid or expired"
+		case http.StatusForbidden:
+			resp["error_code"] = types.ErrorCodeOAuthForbidden
+			resp["message"] = "OAuth account is not permitted to access this resource"
+		default:
+			resp["message"] = fmt.Sprintf("upstream status: %d", statusCode)
+		}
 	}
 	c.JSON(http.StatusOK, resp)
 }

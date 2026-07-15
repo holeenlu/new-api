@@ -374,7 +374,11 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 		return nil, err
 	}
 
-	body, err := GetResponseBody(http.MethodGet, url, channel, headers)
+	timeout := time.Duration(0)
+	if channel.Type == constant.ChannelTypeClaudeCode {
+		timeout = time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
+	}
+	body, err := GetResponseBodyWithContext(ctx, http.MethodGet, url, channel, headers, timeout)
 	if err != nil {
 		return nil, err
 	}

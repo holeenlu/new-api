@@ -65,6 +65,7 @@ import {
   resetCodexUsage,
   type CodexResetCreditsResponse,
 } from '../../api'
+import { getChannelErrorMessage } from '../../lib/channel-error-messages'
 
 type CodexRateLimitWindow = {
   used_percent?: number
@@ -130,6 +131,7 @@ type CodexUsagePayload = {
 export type CodexUsageDialogData = {
   success: boolean
   message?: string
+  error_code?: string
   upstream_status?: number
   data?: Record<string, unknown>
 }
@@ -949,7 +951,10 @@ export function CodexUsageDialog({
 
   const errorMessage =
     response?.success === false
-      ? response?.message?.trim() || t('Failed to fetch usage')
+      ? getChannelErrorMessage(
+          response.error_code,
+          response?.message?.trim() || t('Failed to fetch usage')
+        )
       : ''
 
   const loadResetCredits = useCallback(
@@ -968,7 +973,10 @@ export function CodexUsageDialog({
         const res = await getCodexResetCredits(channelId)
         if (!res.success) {
           throw new Error(
-            res.message || t('Failed to fetch reset credit details')
+            getChannelErrorMessage(
+              res.error_code,
+              res.message || t('Failed to fetch reset credit details')
+            )
           )
         }
         setResetCreditsResponse(res)
@@ -1018,7 +1026,12 @@ export function CodexUsageDialog({
     try {
       const res = await resetCodexUsage(channelId)
       if (!res.success) {
-        throw new Error(res.message || t('Failed to reset usage'))
+        throw new Error(
+          getChannelErrorMessage(
+            res.error_code,
+            res.message || t('Failed to reset usage')
+          )
+        )
       }
 
       const resetPayload = res.data as

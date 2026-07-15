@@ -46,12 +46,12 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { toIntlLocale } from '@/i18n/languages'
 import {
   formatCurrencyFromUSD,
   formatQuotaWithCurrency,
   getCurrencyLabel,
 } from '@/lib/currency'
-import { toIntlLocale } from '@/i18n/languages'
 import { formatTimestampToDate } from '@/lib/format'
 import { truncateText } from '@/lib/utils'
 
@@ -74,6 +74,7 @@ import {
   isTagAggregateRow,
   type TagRow,
 } from '../lib'
+import { getChannelErrorMessage } from '../lib/channel-error-messages'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
@@ -397,7 +398,12 @@ function BalanceCell({ channel }: { channel: Channel }) {
       try {
         const res = await getCodexUsage(channel.id)
         if (!res.success) {
-          throw new Error(res.message || t('Failed to fetch usage'))
+          throw new Error(
+            getChannelErrorMessage(
+              res.error_code,
+              res.message || t('Failed to fetch usage')
+            )
+          )
         }
         setCodexUsageResponse(res)
         setCodexUsageOpen(true)
@@ -490,7 +496,12 @@ function BalanceCell({ channel }: { channel: Channel }) {
           try {
             const res = await getCodexUsage(channel.id)
             if (!res.success) {
-              throw new Error(res.message || t('Failed to fetch usage'))
+              throw new Error(
+                getChannelErrorMessage(
+                  res.error_code,
+                  res.message || t('Failed to fetch usage')
+                )
+              )
             }
             setCodexUsageResponse(res)
           } catch (error) {

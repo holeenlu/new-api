@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type Adaptor struct {
@@ -39,22 +40,65 @@ var codexClientHeaders = []string{
 }
 
 const (
-	CodexOAuthUserAgent            = codexModelsUserAgent
-	CodexOAuthOriginator           = "codex_cli_rs"
-	codexChannelTestSessionID      = "019f4cb7-4452-79b2-92c0-f105ef46cc15"
-	codexChannelTestTurnID         = "019f4cb7-44a0-79d0-9824-ceb1437e84b8"
-	codexChannelTestInstallationID = "f6c6d912-945f-4584-bcf8-2cac04e84a1c"
-	codexChannelTestTurnMetadata   = `{"installation_id":"f6c6d912-945f-4584-bcf8-2cac04e84a1c","session_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","thread_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15","turn_id":"019f4cb7-44a0-79d0-9824-ceb1437e84b8","window_id":"019f4cb7-4452-79b2-92c0-f105ef46cc15:0","request_kind":"turn","thread_source":"user","sandbox":"seatbelt","turn_started_at_unix_ms":1783698506913}`
+	CodexOAuthUserAgent  = codexModelsUserAgent
+	CodexOAuthOriginator = "codex_cli_rs"
+	codexTestMetadataKey = "codex_channel_test_metadata"
 )
 
+type codexChannelTestMetadata struct {
+	SessionID      string
+	TurnID         string
+	InstallationID string
+	WindowID       string
+	TurnMetadata   string
+}
+
+func getOrCreateCodexChannelTestMetadata(c *gin.Context) (*codexChannelTestMetadata, error) {
+	if c != nil {
+		if existing, ok := c.Get(codexTestMetadataKey); ok {
+			if metadata, valid := existing.(*codexChannelTestMetadata); valid {
+				return metadata, nil
+			}
+		}
+	}
+	sessionID := uuid.NewString()
+	metadata := &codexChannelTestMetadata{
+		SessionID:      sessionID,
+		TurnID:         uuid.NewString(),
+		InstallationID: uuid.NewString(),
+		WindowID:       sessionID + ":0",
+	}
+	turnMetadata, err := common.Marshal(map[string]any{
+		"installation_id":         metadata.InstallationID,
+		"session_id":              metadata.SessionID,
+		"thread_id":               metadata.SessionID,
+		"turn_id":                 metadata.TurnID,
+		"window_id":               metadata.WindowID,
+		"request_kind":            "turn",
+		"thread_source":           "user",
+		"sandbox":                 "seatbelt",
+		"turn_started_at_unix_ms": time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	metadata.TurnMetadata = string(turnMetadata)
+	if c != nil {
+		c.Set(codexTestMetadataKey, metadata)
+	}
+	return metadata, nil
+}
+
 var (
-	CodexOAuthMaxConcurrency     = common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 5)
-	CodexOAuthMinRequestInterval = time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
+	CodexOAuthMaxConcurrency     = 5
+	CodexOAuthMinRequestInterval = 750 * time.Millisecond
 	codexOAuthSlots              sync.Map
 	codexOAuthPacing             sync.Map
 )
 
-func init() {
+func InitOAuthRuntimeSettings() {
+	CodexOAuthMaxConcurrency = common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 5)
+	CodexOAuthMinRequestInterval = time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
 	if CodexOAuthMaxConcurrency < 1 {
 		CodexOAuthMaxConcurrency = 1
 	} else if CodexOAuthMaxConcurrency > 8 {
@@ -211,13 +255,17 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		request.Instructions = json.RawMessage(`""`)
 	}
 	if info != nil && info.IsChannelTest && isCodexLiteModel(info) {
+		metadata, err := getOrCreateCodexChannelTestMetadata(c)
+		if err != nil {
+			return nil, err
+		}
 		clientMetadata := map[string]any{
-			"session_id":              codexChannelTestSessionID,
-			"thread_id":               codexChannelTestSessionID,
-			"turn_id":                 codexChannelTestTurnID,
-			"x-codex-installation-id": codexChannelTestInstallationID,
-			"x-codex-turn-metadata":   codexChannelTestTurnMetadata,
-			"x-codex-window-id":       codexChannelTestSessionID + ":0",
+			"session_id":              metadata.SessionID,
+			"thread_id":               metadata.SessionID,
+			"turn_id":                 metadata.TurnID,
+			"x-codex-installation-id": metadata.InstallationID,
+			"x-codex-turn-metadata":   metadata.TurnMetadata,
+			"x-codex-window-id":       metadata.WindowID,
 		}
 		clientMetadataJSON, err := common.Marshal(clientMetadata)
 		if err != nil {
@@ -249,7 +297,7 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("codex OAuth channel concurrency limit reached; retry later"),
 			types.ErrorCodeDoRequestFailed,
-			http.StatusTooManyRequests,
+			http.StatusServiceUnavailable,
 		)
 	}
 	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
@@ -286,7 +334,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 }
 
 func (a *Adaptor) GetModelList() []string {
-	return ModelList
+	return ConfiguredModelList()
 }
 
 func (a *Adaptor) GetChannelName() string {
@@ -312,13 +360,17 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 		}
 	}
 	if info.IsChannelTest && isCodexLiteModel(info) {
+		metadata, err := getOrCreateCodexChannelTestMetadata(c)
+		if err != nil {
+			return err
+		}
 		req.Set("originator", "Codex Desktop")
 		req.Set("x-openai-internal-codex-responses-lite", "true")
 		req.Set("x-codex-beta-features", "remote_compaction_v2")
-		req.Set("session-id", codexChannelTestSessionID)
-		req.Set("thread-id", codexChannelTestSessionID)
-		req.Set("x-codex-turn-metadata", codexChannelTestTurnMetadata)
-		req.Set("x-codex-window-id", codexChannelTestSessionID+":0")
+		req.Set("session-id", metadata.SessionID)
+		req.Set("thread-id", metadata.SessionID)
+		req.Set("x-codex-turn-metadata", metadata.TurnMetadata)
+		req.Set("x-codex-window-id", metadata.WindowID)
 	}
 
 	key := strings.TrimSpace(info.ApiKey)

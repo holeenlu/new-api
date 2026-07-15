@@ -16,6 +16,7 @@ GOPROXY=${GOPROXY:-$DEPLOY_DEFAULT_GOPROXY}
 GOPROXY_FALLBACK=${GOPROXY_FALLBACK:-$DEPLOY_DEFAULT_GOPROXY_FALLBACK}
 export NEW_API_IMAGE=$IMAGE
 
+deploy_ensure_docker_cli
 deploy_require_commands docker curl git date od sed grep tail tr awk
 docker info >/dev/null 2>&1 || deploy_die "Docker daemon is unavailable"
 docker buildx version >/dev/null 2>&1 || deploy_die "docker buildx is unavailable"
@@ -48,6 +49,7 @@ deploy_log "Recreating new-api"
 RUNNING_IMAGE_ID=$(docker inspect -f '{{.Image}}' new-api)
 [[ "$RUNNING_IMAGE_ID" == "$EXPECTED_IMAGE_ID" ]] || \
   deploy_die "new-api container image mismatch: expected=$EXPECTED_IMAGE_ID actual=$RUNNING_IMAGE_ID"
+deploy_prune_project_images
 
 deploy_log "Waiting for endpoint: $HEALTH_URL"
 for ((attempt = 1; attempt <= 45; attempt++)); do

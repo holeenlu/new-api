@@ -1,13 +1,17 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +26,30 @@ func TestNormalizeModelNames(t *testing.T) {
 	})
 
 	require.Equal(t, []string{"gpt-4o", "gpt-4.1"}, result)
+}
+
+func TestGetResponseBodyWithContextHonorsCancellation(t *testing.T) {
+	service.InitHttpClient()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := GetResponseBodyWithContext(ctx, http.MethodGet, server.URL, &model.Channel{}, http.Header{}, 0)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, requests.Load())
+}
+
+func TestBuildFetchModelsHeadersRejectsInvalidClaudeCodeToken(t *testing.T) {
+	headers, err := buildFetchModelsHeaders(&model.Channel{Type: constant.ChannelTypeClaudeCode}, "invalid-token")
+
+	require.Error(t, err)
+	require.Nil(t, headers)
 }
 
 func TestMergeModelNames(t *testing.T) {
@@ -86,6 +114,7 @@ func TestCollectPendingApplyUpstreamModelChanges(t *testing.T) {
 }
 
 func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
+	t.Setenv("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", "true")
 	db := setupModelListControllerTestDB(t)
 
 	disabledChannel := &model.Channel{
@@ -119,6 +148,21 @@ func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
 		UpstreamModelUpdateCheckEnabled: false,
 	})
 	require.NoError(t, db.Model(enabledChannel).Update("settings", enabledChannel.OtherSettings).Error)
+	require.False(t, modelUpdateHandler{}.Enabled())
+}
+
+func TestModelUpdateScheduleHonorsEnvironmentKillSwitch(t *testing.T) {
+	t.Setenv("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", "false")
+	db := setupModelListControllerTestDB(t)
+	channel := &model.Channel{
+		Name:   "enabled-channel",
+		Key:    "key",
+		Status: common.ChannelStatusEnabled,
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: true,
+	})
+	require.NoError(t, db.Create(channel).Error)
 	require.False(t, modelUpdateHandler{}.Enabled())
 }
 

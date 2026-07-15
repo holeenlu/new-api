@@ -257,6 +257,7 @@ x-app: cli
 - 调试日志只记录请求体大小，不输出订阅 OAuth 请求正文；
 - 每个渠道默认最多 5 个并发请求，相邻请求启动间隔默认 750ms；
 - 等待上游首个响应头默认最多 30 秒；
+- 本地并发保护触发时返回可重试的 503，以便切换到备用订阅渠道；
 - 上游 5xx、504、524 可进入渠道重试和故障转移，确定性的客户端错误不重试；
 - 定时推理测试和上游价格同步跳过订阅 OAuth 渠道。
 
@@ -344,7 +345,18 @@ bin/deploy-192.168.11.12.sh
 - 运行镜像只保留静态服务二进制、CA、时区数据库和健康检查所需工具，不携带 Go 编译器；
 - 每次构建版本包含 Git describe 结果和 UTC 构建时间，可区分同一 tag 上的不同补丁；
 - 镜像传输前后强制比较压缩包 SHA-256，服务器内部再比较已加载镜像与运行容器的镜像 ID，不一致立即失败；
+- 构建后默认将 Buildx 缓存控制在 20GB 内，并清理带有 new-api 镜像标签的无引用旧镜像；
 - 部署脚本等待容器健康，并再次请求 `/api/status`。
+
+部署缓存清理可通过 `DEPLOY_PRUNE_BUILD_CACHE`、`DEPLOY_BUILDX_CACHE_MAX_USED_SPACE`
+和 `DEPLOY_PRUNE_PROJECT_IMAGES` 调整。上游模型巡检总开关为
+`CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED`；部署脚本会在目标 `.env` 中补齐该配置，
+设置为 `false` 后即使渠道自身启用了巡检也不会执行。
+
+Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIRECT_URI`
+和 `CODEX_OAUTH_SCOPE` 管理；`CODEX_MODEL_LIST` 可提供管理员预设模型，留空时应在
+渠道编辑器中从上游账户动态获取模型。渠道测试会为每次请求生成独立的 session、turn
+和 installation 元数据，OAuth 凭证及回调地址在日志输出前统一脱敏。
 
 本地服务地址为 `http://127.0.0.1:3000`，192 服务地址为
 `http://192.168.11.12:3000`；104 服务器保留宿主机本地诊断映射

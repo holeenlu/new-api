@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -115,6 +116,62 @@ func GetOptions(c *gin.Context) {
 type OptionUpdateRequest struct {
 	Key   string `json:"key"`
 	Value any    `json:"value"`
+}
+
+type modelPricingOptionsUpdateRequest struct {
+	Options map[string]string `json:"options"`
+}
+
+func validateModelPricingOption(key, value string) error {
+	switch key {
+	case "ModelPrice", "ModelRatio", "CacheRatio", "CreateCacheRatio", "CompletionRatio", "ImageRatio", "AudioRatio", "AudioCompletionRatio":
+		var ratios map[string]float64
+		if err := common.UnmarshalJsonStr(value, &ratios); err != nil {
+			return fmt.Errorf("%s 必须是数值映射: %w", key, err)
+		}
+	case "billing_setting.billing_mode", "billing_setting.billing_expr":
+		var values map[string]string
+		if err := common.UnmarshalJsonStr(value, &values); err != nil {
+			return fmt.Errorf("%s 必须是字符串映射: %w", key, err)
+		}
+	case "ExposeRatioEnabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("ExposeRatioEnabled 必须是布尔值")
+		}
+	default:
+		return fmt.Errorf("不支持批量修改配置项 %s", key)
+	}
+	return nil
+}
+
+func UpdateModelPricingOptions(c *gin.Context) {
+	var request modelPricingOptionsUpdateRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || len(request.Options) == 0 {
+		common.ApiErrorMsg(c, "无效的参数")
+		return
+	}
+	if len(request.Options) > 11 {
+		common.ApiErrorMsg(c, "模型价格配置项数量超过限制")
+		return
+	}
+
+	keys := make([]string, 0, len(request.Options))
+	for key, value := range request.Options {
+		if err := validateModelPricingOption(key, value); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+		keys = append(keys, key)
+	}
+	if err := model.UpdateOptionsBulk(request.Options); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	sort.Strings(keys)
+	recordManageAudit(c, "option.model_pricing.update", map[string]interface{}{
+		"keys": keys,
+	})
+	common.ApiSuccess(c, nil)
 }
 
 func UpdateOption(c *gin.Context) {

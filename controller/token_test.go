@@ -617,3 +617,45 @@ func TestBatchDeleteTokensDoesNotPartiallyDeleteOnAuthorizationFailure(t *testin
 	_, err = model.GetTokenById(rootToken.Id)
 	require.NoError(t, err)
 }
+
+func TestBatchTokenKeysUsesRoleHierarchyForWholeBatch(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	rootToken := seedToken(t, db, 1, "root-token", "root1234token5678")
+	adminToken := seedToken(t, db, 2, "admin-token", "admin1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/batch/keys", TokenBatch{Ids: []int{rootToken.Id, adminToken.Id, adminToken.Id}}, 1)
+	ctx.Set("role", common.RoleRootUser)
+	GetTokenKeysBatch(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var data struct {
+		Keys map[int]string `json:"keys"`
+	}
+	require.NoError(t, common.Unmarshal(response.Data, &data))
+	require.Equal(t, map[int]string{
+		rootToken.Id:  rootToken.GetFullKey(),
+		adminToken.Id: adminToken.GetFullKey(),
+	}, data.Keys)
+}
+
+func TestBatchTokenKeysRejectsRootTokenForAdminWithoutLeakingKeys(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 2, Username: "root", Password: "password", Role: common.RoleRootUser, AffCode: "root-aff"}).Error)
+	adminToken := seedToken(t, db, 1, "admin-token", "admin1234token5678")
+	rootToken := seedToken(t, db, 2, "root-token", "root1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/batch/keys", TokenBatch{Ids: []int{adminToken.Id, rootToken.Id}}, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	GetTokenKeysBatch(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.False(t, response.Success)
+	require.NotContains(t, recorder.Body.String(), adminToken.Key)
+	require.NotContains(t, recorder.Body.String(), rootToken.Key)
+}

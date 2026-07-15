@@ -42,6 +42,7 @@ import {
 } from '../api'
 import { CHANNEL_STATUS, ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
 import type { ChannelTestResponse, CopyChannelParams } from '../types'
+import { getChannelErrorMessage } from './channel-error-messages'
 
 // ============================================================================
 // Query Keys
@@ -315,7 +316,10 @@ export async function handleTestChannel(
       }
       onTestComplete?.(true, responseTime)
     } else {
-      const errorMsg = response.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
+      const errorMsg = getChannelErrorMessage(
+        response.error_code,
+        response.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
+      )
       if (!options?.silent) {
         toast.error(i18next.t('{{target}} test failed', { target }), {
           description: response.error_code

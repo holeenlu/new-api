@@ -166,6 +166,7 @@ import {
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
 } from '../../lib'
+import { getChannelErrorMessage } from '../../lib/channel-error-messages'
 import {
   collectInvalidStatusCodeEntries,
   collectNewDisallowedStatusCodeRedirects,
@@ -1054,7 +1055,12 @@ export function ChannelMutateDrawer({
       configured: extraSettingsConfigured,
     },
   ]
-  if (currentType === 1 || currentType === 14 || currentType === 57 || currentType === 59) {
+  if (
+    currentType === 1 ||
+    currentType === 14 ||
+    currentType === 57 ||
+    currentType === 59
+  ) {
     advancedNavChildren.push({
       id: ADVANCED_SETTINGS_SECTION_IDS.fieldPassthrough,
       title: t('Field passthrough controls'),
@@ -1361,7 +1367,12 @@ export function ChannelMutateDrawer({
     try {
       const res = await refreshCodexCredential(channelId)
       if (!res.success) {
-        throw new Error(res.message || t('Failed to refresh credential'))
+        throw new Error(
+          getChannelErrorMessage(
+            res.error_code,
+            res.message || t('Failed to refresh credential')
+          )
+        )
       }
       toast.success(t('Credential refreshed'))
       queryClient.invalidateQueries({
@@ -1406,16 +1417,27 @@ export function ChannelMutateDrawer({
 
     setIsFetchingAndFillingModels(true)
     try {
-      const response = isEditing
-        ? await fetchUpstreamModels(channelId!)
-        : await fetchModels({
-            type,
-            key: form.getValues('key'),
-            base_url: form.getValues('base_url') || '',
-          })
+      let response
+      if (isEditing) {
+        if (!channelId) {
+          throw new Error(t('Channel ID is required'))
+        }
+        response = await fetchUpstreamModels(channelId)
+      } else {
+        response = await fetchModels({
+          type,
+          key: form.getValues('key'),
+          base_url: form.getValues('base_url') || '',
+        })
+      }
 
       if (!response.success) {
-        throw new Error(response.message || t('Failed to fetch models'))
+        throw new Error(
+          getChannelErrorMessage(
+            response.error_code,
+            response.message || t('Failed to fetch models')
+          )
+        )
       }
 
       const models = formatModelsArray(
@@ -3048,7 +3070,9 @@ export function ChannelMutateDrawer({
                                         type='button'
                                         variant='outline'
                                         size='sm'
-                                        onClick={() => setCodexOAuthDialogOpen(true)}
+                                        onClick={() =>
+                                          setCodexOAuthDialogOpen(true)
+                                        }
                                         disabled={sensitiveLocked}
                                       >
                                         <Link2 className='mr-2 h-4 w-4' />
@@ -3091,7 +3115,9 @@ export function ChannelMutateDrawer({
                                 open={codexOAuthDialogOpen}
                                 onOpenChange={setCodexOAuthDialogOpen}
                                 onKeyGenerated={(key) => {
-                                  form.setValue('key', key, { shouldDirty: true })
+                                  form.setValue('key', key, {
+                                    shouldDirty: true,
+                                  })
                                 }}
                               />
 

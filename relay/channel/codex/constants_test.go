@@ -6,9 +6,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestModelList(t *testing.T) {
-	require.Contains(t, ModelList, "gpt-5.5")
-	require.Contains(t, ModelList, "gpt-5.6-sol")
-	require.Contains(t, ModelList, "gpt-5.6-terra")
-	require.Contains(t, ModelList, "gpt-5.6-luna")
+func TestConfiguredModelList(t *testing.T) {
+	t.Setenv("CODEX_MODEL_LIST", "gpt-custom-a, gpt-custom-b,gpt-custom-a")
+
+	require.Equal(t, []string{"gpt-custom-a", "gpt-custom-b"}, ConfiguredModelList())
+}
+
+func TestConfiguredModelListDefaultsToUpstreamDiscovery(t *testing.T) {
+	t.Setenv("CODEX_MODEL_LIST", "")
+
+	require.Empty(t, ConfiguredModelList())
 }

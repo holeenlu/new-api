@@ -51,6 +51,7 @@ const channelActionConfig = (
 export type CodexUsageResponse = {
   success: boolean
   message?: string
+  error_code?: string
   upstream_status?: number
   data?: Record<string, unknown>
 }
@@ -58,12 +59,14 @@ export type CodexUsageResponse = {
 export type CodexOAuthStartResponse = {
   success: boolean
   message?: string
+  error_code?: string
   data?: { authorize_url?: string }
 }
 
 export type CodexOAuthCompleteResponse = {
   success: boolean
   message?: string
+  error_code?: string
   data?: { key?: string }
 }
 
@@ -74,6 +77,7 @@ export type CodexUsageResetResponse = CodexUsageResponse
 export type CodexCredentialRefreshResponse = {
   success: boolean
   message?: string
+  error_code?: string
   data?: {
     expires_at?: string
     last_refresh?: string

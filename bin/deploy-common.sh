@@ -16,6 +16,16 @@ deploy_die() {
   exit 1
 }
 
+deploy_ensure_docker_cli() {
+  if command -v docker >/dev/null 2>&1; then
+    return
+  fi
+  local docker_desktop_bin=/Applications/Docker.app/Contents/Resources/bin
+  if [[ -x "$docker_desktop_bin/docker" ]]; then
+    export PATH="$docker_desktop_bin:$PATH"
+  fi
+}
+
 deploy_require_commands() {
   local command
   for command in "$@"; do
@@ -62,6 +72,32 @@ deploy_build_image() {
 
   deploy_log "Building image=$image platform=${platform:-native} version=$app_version"
   "${args[@]}" "$root_dir"
+  deploy_prune_build_cache
+}
+
+deploy_prune_build_cache() {
+  local enabled=${DEPLOY_PRUNE_BUILD_CACHE:-true}
+  local max_used_space=${DEPLOY_BUILDX_CACHE_MAX_USED_SPACE:-20GB}
+  if [[ "$enabled" != "true" && "$enabled" != "1" ]]; then
+    return 0
+  fi
+
+  deploy_log "Pruning Buildx cache to keep at most $max_used_space"
+  if ! docker buildx prune --force --max-used-space "$max_used_space"; then
+    deploy_log "Warning: Buildx cache cleanup failed; deployment will continue"
+  fi
+}
+
+deploy_prune_project_images() {
+  local enabled=${DEPLOY_PRUNE_PROJECT_IMAGES:-true}
+  if [[ "$enabled" != "true" && "$enabled" != "1" ]]; then
+    return 0
+  fi
+
+  deploy_log "Pruning unused new-api images"
+  if ! docker image prune --force --filter "label=org.opencontainers.image.title=new-api"; then
+    deploy_log "Warning: unused new-api image cleanup failed; deployment will continue"
+  fi
 }
 
 deploy_assert_image_platform() {
@@ -167,4 +203,8 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5
   deploy_env_ensure "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 750
   deploy_env_ensure "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 30
+  deploy_env_ensure "$env_file" CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED true
+  deploy_env_ensure "$env_file" CODEX_OAUTH_CLIENT_ID app_EMoamEEZ73f0CkXaXp7hrann
+  deploy_env_ensure "$env_file" CODEX_OAUTH_REDIRECT_URI http://localhost:1455/auth/callback
+  deploy_env_ensure "$env_file" CODEX_OAUTH_SCOPE "openid profile email offline_access"
 }

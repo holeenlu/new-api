@@ -1,7 +1,9 @@
 package service
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -79,11 +81,51 @@ func ApplyChannelErrorPolicy(channelType int, err *types.NewAPIError) *types.New
 	if err == nil || (channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex) {
 		return err
 	}
+	err = classifySubscriptionOAuthError(err)
 	if IsSubscriptionOAuthTransientError(channelType, err) {
 		return err
 	}
 	types.ErrOptionWithSkipRetry()(err)
 	return err
+}
+
+func classifySubscriptionOAuthError(err *types.NewAPIError) *types.NewAPIError {
+	if err == nil {
+		return nil
+	}
+	lowerMessage := strings.ToLower(err.Error())
+	modelMentioned := strings.Contains(lowerMessage, "model")
+	modelUnavailable := strings.Contains(lowerMessage, "not supported") ||
+		strings.Contains(lowerMessage, "unsupported") ||
+		strings.Contains(lowerMessage, "not found") ||
+		strings.Contains(lowerMessage, "does not exist") ||
+		strings.Contains(lowerMessage, "not available") ||
+		strings.Contains(lowerMessage, "no access")
+	if modelMentioned && modelUnavailable &&
+		(err.StatusCode == http.StatusBadRequest || err.StatusCode == http.StatusForbidden ||
+			err.StatusCode == http.StatusNotFound || err.StatusCode == http.StatusUnprocessableEntity) {
+		return types.NewErrorWithStatusCode(
+			errors.New("selected model is not supported by this OAuth account"),
+			types.ErrorCodeModelNotSupported,
+			err.StatusCode,
+		)
+	}
+	switch err.StatusCode {
+	case http.StatusUnauthorized:
+		return types.NewErrorWithStatusCode(
+			errors.New("OAuth credential is invalid or expired"),
+			types.ErrorCodeOAuthUnauthorized,
+			err.StatusCode,
+		)
+	case http.StatusForbidden:
+		return types.NewErrorWithStatusCode(
+			errors.New("OAuth account is not permitted to access this resource"),
+			types.ErrorCodeOAuthForbidden,
+			err.StatusCode,
+		)
+	default:
+		return err
+	}
 }
 
 func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {

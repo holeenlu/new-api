@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -200,7 +202,11 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 	case constant.ChannelTypeAnthropic:
 		headers = GetClaudeAuthHeader(key)
 	case constant.ChannelTypeClaudeCode:
-		headers = GetClaudeCodeOAuthHeader(key)
+		var err error
+		headers, err = claude.BuildClaudeCodeOAuthHeaders(key)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		headers = GetAuthHeader(key)
 	}
@@ -241,10 +247,15 @@ func FetchUpstreamModels(c *gin.Context) {
 
 	ids, err := fetchChannelUpstreamModelIDs(c.Request.Context(), channel)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
+		response := gin.H{
 			"success": false,
 			"message": fmt.Sprintf("获取模型列表失败: %s", err.Error()),
-		})
+		}
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			response["error_code"] = apiErr.GetErrorCode()
+		}
+		c.JSON(http.StatusOK, response)
 		return
 	}
 
@@ -568,7 +579,7 @@ func RefreshCodexChannelCredential(c *gin.Context) {
 	oauthKey, ch, err := service.RefreshCodexChannelCredential(ctx, channelId, service.CodexCredentialRefreshOptions{ResetCaches: true})
 	if err != nil {
 		common.SysError("failed to refresh codex channel credential: " + err.Error())
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": "刷新凭证失败，请稍后重试"})
+		respondCodexOAuthError(c, err, "刷新凭证失败，请稍后重试")
 		return
 	}
 
@@ -1256,10 +1267,15 @@ func FetchModels(c *gin.Context) {
 	if req.Type == constant.ChannelTypeCodex {
 		models, err := fetchCodexUpstreamModelIDs(c.Request.Context(), baseURL, key, "")
 		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
+			response := gin.H{
 				"success": false,
 				"message": fmt.Sprintf("获取 Codex 上游模型失败: %s", err.Error()),
-			})
+			}
+			var apiErr *types.NewAPIError
+			if errors.As(err, &apiErr) {
+				response["error_code"] = apiErr.GetErrorCode()
+			}
+			c.JSON(http.StatusOK, response)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
@@ -1269,10 +1285,24 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
-	client := &http.Client{}
+	timeout := time.Duration(0)
+	if req.Type == constant.ChannelTypeClaudeCode {
+		timeout = time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
+	}
+	requestCtx := c.Request.Context()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		requestCtx, cancel = context.WithTimeout(requestCtx, timeout)
+		defer cancel()
+	}
+	client, err := service.GetHttpClientWithResponseHeaderTimeout("", timeout)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	url := fmt.Sprintf("%s/v1/models", baseURL)
 
-	request, err := http.NewRequest("GET", url, nil)
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, url, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1285,7 +1315,11 @@ func FetchModels(c *gin.Context) {
 	case constant.ChannelTypeAnthropic:
 		request.Header = GetClaudeAuthHeader(key)
 	case constant.ChannelTypeClaudeCode:
-		request.Header = GetClaudeCodeOAuthHeader(key)
+		request.Header, err = claude.BuildClaudeCodeOAuthHeaders(key)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	default:
 		request.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -1298,6 +1332,7 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
+	defer response.Body.Close()
 	//check status code
 	if response.StatusCode != http.StatusOK {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -1306,8 +1341,6 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
-	defer response.Body.Close()
-
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`

@@ -33,13 +33,15 @@ const (
 )
 
 var (
-	ClaudeCodeOAuthMaxConcurrency     = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 5)
-	ClaudeCodeOAuthMinRequestInterval = time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
+	ClaudeCodeOAuthMaxConcurrency     = 5
+	ClaudeCodeOAuthMinRequestInterval = 750 * time.Millisecond
 	claudeCodeOAuthSlots              sync.Map
 	claudeCodeOAuthPacing             sync.Map
 )
 
-func init() {
+func InitOAuthRuntimeSettings() {
+	ClaudeCodeOAuthMaxConcurrency = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 5)
+	ClaudeCodeOAuthMinRequestInterval = time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
 	if ClaudeCodeOAuthMaxConcurrency < 1 {
 		ClaudeCodeOAuthMaxConcurrency = 1
 	} else if ClaudeCodeOAuthMaxConcurrency > 8 {
@@ -220,8 +222,18 @@ func CommonClaudeHeadersOperation(c *gin.Context, req *http.Header, info *relayc
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, req)
 	if info != nil && info.ChannelType == constant.ChannelTypeClaudeCode {
-		req.Set("anthropic-version", "2023-06-01")
-		return SetupClaudeCodeOAuthHeader(req, info.ApiKey)
+		headers, err := BuildClaudeCodeOAuthHeaders(info.ApiKey)
+		if err != nil {
+			return err
+		}
+		req.Del("x-api-key")
+		for name, values := range headers {
+			req.Del(name)
+			for _, value := range values {
+				req.Add(name, value)
+			}
+		}
+		return nil
 	}
 	req.Set("x-api-key", info.ApiKey)
 	anthropicVersion := c.Request.Header.Get("anthropic-version")
@@ -233,17 +245,18 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 	return nil
 }
 
-func SetupClaudeCodeOAuthHeader(req *http.Header, key string) error {
+func BuildClaudeCodeOAuthHeaders(key string) (http.Header, error) {
 	token, err := ParseClaudeCodeOAuthToken(key)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req.Del("x-api-key")
-	req.Set("Authorization", "Bearer "+token)
-	req.Set("anthropic-beta", ClaudeCodeOAuthBeta)
-	req.Set("user-agent", ClaudeCodeOAuthUserAgent)
-	req.Set("x-app", "cli")
-	return nil
+	headers := make(http.Header)
+	headers.Set("anthropic-version", "2023-06-01")
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set("anthropic-beta", ClaudeCodeOAuthBeta)
+	headers.Set("user-agent", ClaudeCodeOAuthUserAgent)
+	headers.Set("x-app", "cli")
+	return headers, nil
 }
 
 func ParseClaudeCodeOAuthToken(key string) (string, error) {
@@ -310,8 +323,7 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("claude code channel concurrency limit reached; retry later"),
 			types.ErrorCodeDoRequestFailed,
-			http.StatusTooManyRequests,
-			types.ErrOptionWithSkipRetry(),
+			http.StatusServiceUnavailable,
 		)
 	}
 	if err := waitForClaudeCodeOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {

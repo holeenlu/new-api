@@ -30,6 +30,7 @@ import { formatTimestampToDate } from '@/lib/format'
 
 import { getCodexUsage, updateChannelBalance } from '../../api'
 import { channelsQueryKeys } from '../../lib'
+import { getChannelErrorMessage } from '../../lib/channel-error-messages'
 import { useChannels } from '../channels-provider'
 import {
   CodexUsageDialog,
@@ -65,7 +66,12 @@ export function BalanceQueryDialog({
     try {
       const res = await getCodexUsage(row.id)
       if (!res.success) {
-        throw new Error(res.message || t('Failed to fetch usage'))
+        throw new Error(
+          getChannelErrorMessage(
+            res.error_code,
+            res.message || t('Failed to fetch usage')
+          )
+        )
       }
       setCodexUsageResponse(res)
     } catch (error: unknown) {

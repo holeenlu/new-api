@@ -200,6 +200,7 @@ export interface ChannelBalanceResponse {
 export interface FetchModelsResponse {
   success: boolean
   message?: string
+  error_code?: string
   data?: string[]
 }
 

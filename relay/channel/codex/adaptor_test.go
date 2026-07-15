@@ -9,11 +9,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCodexChannelTestMetadataIsStablePerRequestAndUniqueAcrossRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	firstContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	firstContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	secondContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	secondContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		IsChannelTest: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ApiKey:            `{"access_token":"access-token","account_id":"account-id"}`,
+			UpstreamModelName: "gpt-5.6-sol",
+		},
+	}
+
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(firstContext, info, dto.OpenAIResponsesRequest{})
+	require.NoError(t, err)
+	request := converted.(dto.OpenAIResponsesRequest)
+	var clientMetadata map[string]any
+	require.NoError(t, common.Unmarshal(request.ClientMetadata, &clientMetadata))
+
+	headers := make(http.Header)
+	require.NoError(t, (&Adaptor{}).SetupRequestHeader(firstContext, &headers, info))
+	require.Equal(t, clientMetadata["session_id"], headers.Get("session-id"))
+	require.Equal(t, clientMetadata["thread_id"], headers.Get("thread-id"))
+	require.Equal(t, clientMetadata["x-codex-window-id"], headers.Get("x-codex-window-id"))
+
+	firstMetadata, err := getOrCreateCodexChannelTestMetadata(firstContext)
+	require.NoError(t, err)
+	secondMetadata, err := getOrCreateCodexChannelTestMetadata(secondContext)
+	require.NoError(t, err)
+	require.NotEqual(t, firstMetadata.SessionID, secondMetadata.SessionID)
+	require.NotEqual(t, firstMetadata.TurnID, secondMetadata.TurnID)
+	require.NotEqual(t, firstMetadata.InstallationID, secondMetadata.InstallationID)
+}
 
 func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -74,6 +112,44 @@ func TestCodexOAuthConcurrencySlots(t *testing.T) {
 	require.True(t, ok)
 	releaseSecond()
 	releaseThird()
+}
+
+func TestInitOAuthRuntimeSettingsReadsLoadedEnvironment(t *testing.T) {
+	originalMaxConcurrency := CodexOAuthMaxConcurrency
+	originalInterval := CodexOAuthMinRequestInterval
+	t.Cleanup(func() {
+		CodexOAuthMaxConcurrency = originalMaxConcurrency
+		CodexOAuthMinRequestInterval = originalInterval
+	})
+	t.Setenv("CODEX_OAUTH_MAX_CONCURRENCY", "7")
+	t.Setenv("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", "125")
+
+	InitOAuthRuntimeSettings()
+
+	require.Equal(t, 7, CodexOAuthMaxConcurrency)
+	require.Equal(t, 125*time.Millisecond, CodexOAuthMinRequestInterval)
+}
+
+func TestCodexLocalConcurrencyLimitRemainsRetryable(t *testing.T) {
+	originalMaxConcurrency := CodexOAuthMaxConcurrency
+	CodexOAuthMaxConcurrency = 1
+	t.Cleanup(func() { CodexOAuthMaxConcurrency = originalMaxConcurrency })
+
+	channelID := 910004
+	release, ok := acquireCodexOAuthSlot(channelID)
+	require.True(t, ok)
+	defer release()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	_, err := (&Adaptor{}).DoRequest(c, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channelID},
+	}, http.NoBody)
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	require.False(t, types.IsSkipRetryError(apiErr))
 }
 
 func TestCodexOAuthResponseBodyReleasesSlotOnce(t *testing.T) {
