@@ -16,6 +16,8 @@ import (
 
 type CodexCredentialRefreshOptions struct {
 	ResetCaches bool
+	// ExpectedAccessToken prevents a stale 401 response from rotating a credential that another request already refreshed.
+	ExpectedAccessToken string
 }
 
 type CodexOAuthKey = dto.CodexOAuthCredential
@@ -60,6 +62,9 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 	}
 	if strings.TrimSpace(oauthKey.RefreshToken) == "" {
 		return nil, nil, fmt.Errorf("codex channel: refresh_token is required to refresh credential")
+	}
+	if expected := strings.TrimSpace(opts.ExpectedAccessToken); expected != "" && oauthKey.AccessToken != expected {
+		return oauthKey, ch, nil
 	}
 
 	refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

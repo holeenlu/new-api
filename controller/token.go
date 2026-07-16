@@ -32,7 +32,7 @@ func buildMaskedTokenResponses(tokens []*model.Token) []*model.Token {
 }
 
 func canManageOtherPrivilegedUserToken(actorRole int, ownerRole int) bool {
-	return ownerRole >= common.RoleAdminUser && canManageTargetRole(actorRole, ownerRole)
+	return actorRole >= common.RoleAdminUser && ownerRole >= common.RoleAdminUser
 }
 
 func getManageableToken(c *gin.Context, tokenId int) (*model.Token, error) {
@@ -60,7 +60,7 @@ func GetAllTokens(c *gin.Context) {
 	var tokens []*model.Token
 	var total int64
 	var err error
-	if c.GetInt("role") == common.RoleRootUser {
+	if c.GetInt("role") >= common.RoleAdminUser {
 		tokens, err = model.GetAllPrivilegedTokens(pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 		total, _ = model.CountPrivilegedTokens()
 	} else {
@@ -86,7 +86,7 @@ func SearchTokens(c *gin.Context) {
 	var tokens []*model.Token
 	var total int64
 	var err error
-	if c.GetInt("role") == common.RoleRootUser {
+	if c.GetInt("role") >= common.RoleAdminUser {
 		tokens, total, err = model.SearchPrivilegedTokens(keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	} else {
 		tokens, total, err = model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())

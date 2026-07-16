@@ -19,39 +19,7 @@ func FetchCodexWhamUsage(
 	accessToken string,
 	accountID string,
 ) (statusCode int, body []byte, err error) {
-	if client == nil {
-		return 0, nil, fmt.Errorf("nil http client")
-	}
-	bu := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if bu == "" {
-		return 0, nil, fmt.Errorf("empty baseURL")
-	}
-	at := strings.TrimSpace(accessToken)
-	aid := strings.TrimSpace(accountID)
-	if at == "" {
-		return 0, nil, fmt.Errorf("empty accessToken")
-	}
-	if aid == "" {
-		return 0, nil, fmt.Errorf("empty accountID")
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, bu+"/backend-api/wham/usage", nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	setCodexWhamRequestHeaders(req, at, aid)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, nil, err
-	}
-	return resp.StatusCode, body, nil
+	return doCodexWhamRequest(ctx, client, http.MethodGet, baseURL, "/backend-api/wham/usage", accessToken, accountID, nil)
 }
 
 func FetchCodexWhamRateLimitResetCredits(
@@ -61,39 +29,7 @@ func FetchCodexWhamRateLimitResetCredits(
 	accessToken string,
 	accountID string,
 ) (statusCode int, body []byte, err error) {
-	if client == nil {
-		return 0, nil, fmt.Errorf("nil http client")
-	}
-	bu := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if bu == "" {
-		return 0, nil, fmt.Errorf("empty baseURL")
-	}
-	at := strings.TrimSpace(accessToken)
-	aid := strings.TrimSpace(accountID)
-	if at == "" {
-		return 0, nil, fmt.Errorf("empty accessToken")
-	}
-	if aid == "" {
-		return 0, nil, fmt.Errorf("empty accountID")
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, bu+"/backend-api/wham/rate-limit-reset-credits", nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	setCodexWhamRequestHeaders(req, at, aid)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, nil, err
-	}
-	return resp.StatusCode, body, nil
+	return doCodexWhamRequest(ctx, client, http.MethodGet, baseURL, "/backend-api/wham/rate-limit-reset-credits", accessToken, accountID, nil)
 }
 
 func ConsumeCodexWhamRateLimitResetCredit(
@@ -103,22 +39,6 @@ func ConsumeCodexWhamRateLimitResetCredit(
 	accessToken string,
 	accountID string,
 ) (statusCode int, body []byte, err error) {
-	if client == nil {
-		return 0, nil, fmt.Errorf("nil http client")
-	}
-	bu := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if bu == "" {
-		return 0, nil, fmt.Errorf("empty baseURL")
-	}
-	at := strings.TrimSpace(accessToken)
-	aid := strings.TrimSpace(accountID)
-	if at == "" {
-		return 0, nil, fmt.Errorf("empty accessToken")
-	}
-	if aid == "" {
-		return 0, nil, fmt.Errorf("empty accountID")
-	}
-
 	requestBody, err := common.Marshal(map[string]string{
 		"redeem_request_id": uuid.NewString(),
 	})
@@ -126,17 +46,54 @@ func ConsumeCodexWhamRateLimitResetCredit(
 		return 0, nil, err
 	}
 
-	req, err := http.NewRequestWithContext(
+	return doCodexWhamRequest(
 		ctx,
+		client,
 		http.MethodPost,
-		bu+"/backend-api/wham/rate-limit-reset-credits/consume",
+		baseURL,
+		"/backend-api/wham/rate-limit-reset-credits/consume",
+		accessToken,
+		accountID,
 		bytes.NewReader(requestBody),
 	)
+}
+
+const maxCodexWhamResponseBytes = 1 << 20
+
+func doCodexWhamRequest(
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	baseURL string,
+	path string,
+	accessToken string,
+	accountID string,
+	requestBody io.Reader,
+) (statusCode int, body []byte, err error) {
+	if client == nil {
+		return 0, nil, fmt.Errorf("nil http client")
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return 0, nil, fmt.Errorf("empty baseURL")
+	}
+	accessToken = strings.TrimSpace(accessToken)
+	accountID = strings.TrimSpace(accountID)
+	if accessToken == "" {
+		return 0, nil, fmt.Errorf("empty accessToken")
+	}
+	if accountID == "" {
+		return 0, nil, fmt.Errorf("empty accountID")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, requestBody)
 	if err != nil {
 		return 0, nil, err
 	}
-	setCodexWhamRequestHeaders(req, at, aid)
-	req.Header.Set("Content-Type", "application/json")
+	setCodexWhamRequestHeaders(req, accessToken, accountID)
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -144,9 +101,12 @@ func ConsumeCodexWhamRateLimitResetCredit(
 	}
 	defer resp.Body.Close()
 
-	body, err = io.ReadAll(resp.Body)
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxCodexWhamResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, err
+	}
+	if len(body) > maxCodexWhamResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf("codex usage response exceeds %d bytes", maxCodexWhamResponseBytes)
 	}
 	return resp.StatusCode, body, nil
 }

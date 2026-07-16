@@ -85,6 +85,41 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 
 const maxUpstreamErrorResponseBytes = 1 << 20
 
+func sanitizeUpstreamErrorMessage(message string) string {
+	message = common.RedactSensitiveCredentials(strings.TrimSpace(message))
+	runes := []rune(message)
+	if len(runes) > common.LocalLogContentLimit {
+		return fmt.Sprintf("%s... [truncated]", string(runes[:common.LocalLogContentLimit]))
+	}
+	return message
+}
+
+func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncated bool, message string) error {
+	parts := []string{fmt.Sprintf("bad response status code %d", resp.StatusCode)}
+	if message = sanitizeUpstreamErrorMessage(message); message != "" {
+		parts = append(parts, "message: "+message)
+	}
+	if contentType := strings.TrimSpace(resp.Header.Get("Content-Type")); contentType != "" {
+		parts = append(parts, "content_type: "+sanitizeUpstreamErrorMessage(contentType))
+	}
+	responseBytes := len(responseBody)
+	if resp.ContentLength > 0 {
+		responseBytes = int(resp.ContentLength)
+	}
+	if truncated && resp.ContentLength <= 0 {
+		parts = append(parts, fmt.Sprintf("response_bytes: >=%d", responseBytes+1))
+	} else {
+		parts = append(parts, fmt.Sprintf("response_bytes: %d", responseBytes))
+	}
+	for _, headerName := range []string{common.UpstreamRequestIdKey, "x-request-id", "request-id", "x-amzn-requestid"} {
+		if requestID := sanitizeUpstreamErrorMessage(resp.Header.Get(headerName)); requestID != "" {
+			parts = append(parts, "upstream_request_id: "+requestID)
+			break
+		}
+	}
+	return errors.New(strings.Join(parts, ", "))
+}
+
 func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
@@ -99,44 +134,10 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 		responseBody = responseBody[:maxUpstreamErrorResponseBytes]
 	}
 
-	sanitizeMessage := func(message string) string {
-		message = common.RedactSensitiveCredentials(strings.TrimSpace(message))
-		runes := []rune(message)
-		if len(runes) > common.LocalLogContentLimit {
-			message = fmt.Sprintf("%s... [truncated]", string(runes[:common.LocalLogContentLimit]))
-		}
-		return message
-	}
-	buildSummary := func(message string) error {
-		parts := []string{fmt.Sprintf("bad response status code %d", resp.StatusCode)}
-		if message = sanitizeMessage(message); message != "" {
-			parts = append(parts, "message: "+message)
-		}
-		if contentType := strings.TrimSpace(resp.Header.Get("Content-Type")); contentType != "" {
-			parts = append(parts, "content_type: "+sanitizeMessage(contentType))
-		}
-		responseBytes := len(responseBody)
-		if resp.ContentLength > 0 {
-			responseBytes = int(resp.ContentLength)
-		}
-		if truncated && resp.ContentLength <= 0 {
-			parts = append(parts, fmt.Sprintf("response_bytes: >=%d", responseBytes+1))
-		} else {
-			parts = append(parts, fmt.Sprintf("response_bytes: %d", responseBytes))
-		}
-		for _, headerName := range []string{common.UpstreamRequestIdKey, "x-request-id", "request-id", "x-amzn-requestid"} {
-			if requestID := sanitizeMessage(resp.Header.Get(headerName)); requestID != "" {
-				parts = append(parts, "upstream_request_id: "+requestID)
-				break
-			}
-		}
-		return errors.New(strings.Join(parts, ", "))
-	}
-
 	var errResponse dto.GeneralErrorResponse
 	err = common.Unmarshal(responseBody, &errResponse)
 	if err != nil {
-		newApiErr.Err = buildSummary("")
+		newApiErr.Err = buildUpstreamErrorSummary(resp, responseBody, truncated, "")
 		logger.LogError(ctx, newApiErr.Error())
 		return
 	}
@@ -145,15 +146,15 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 		// General format error (OpenAI, Anthropic, Gemini, etc.)
 		oaiError := errResponse.TryToOpenAIError()
 		if oaiError != nil {
-			oaiError.Message = sanitizeMessage(oaiError.Message)
+			oaiError.Message = sanitizeUpstreamErrorMessage(oaiError.Message)
 			newApiErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
-			newApiErr.Err = buildSummary(oaiError.Message)
+			newApiErr.Err = buildUpstreamErrorSummary(resp, responseBody, truncated, oaiError.Message)
 			return
 		}
 	}
-	message := sanitizeMessage(errResponse.ToMessage())
+	message := sanitizeUpstreamErrorMessage(errResponse.ToMessage())
 	newApiErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
-	newApiErr.Err = buildSummary(message)
+	newApiErr.Err = buildUpstreamErrorSummary(resp, responseBody, truncated, message)
 	return
 }
 

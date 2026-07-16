@@ -50,8 +50,9 @@ POST /api/channel/codex/oauth/complete
 
 授权、刷新、模型发现、用量查询和请求转发共用同一份 Codex credential DTO。刷新响应没有返回新的
 `refresh_token` 时保留原 refresh token；同一渠道的自动刷新、手动刷新和用量查询刷新按渠道 ID
-串行执行，避免 refresh token 轮换竞争。用量查询只在上游真实返回 `401` 时刷新，`403` 作为账号或
-组织权限问题直接返回，不再无效刷新。
+串行执行，避免 refresh token 轮换竞争；等待锁期间如果其他请求已经完成刷新，则直接复用新的凭证，
+不再连续旋转 refresh token。用量查询只在上游真实返回 `401` 时刷新，`403` 作为账号或组织权限问题
+直接返回，不再无效刷新。
 
 生成的 credential 结构包含：
 
@@ -224,6 +225,7 @@ remaining = 100 - used_percent
 用量、重置次数和用量重置请求不再使用固定的 15 秒总超时，而是复用
 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT`（默认 30 秒），并额外保留 5 秒用于读取和处理响应体。
 这避免网络已完成 TLS 握手、但 ChatGPT 在 15 秒后才返回响应头时被本地提前取消。
+三个 Wham 接口共用同一请求构造、认证 Header 和响应读取逻辑，响应体最大限制为 1 MB。
 
 ## 2. Claude Code 订阅渠道
 
@@ -320,8 +322,9 @@ x-app: cli
 
 ### 3.1 特权用户令牌管理
 
-- Root 可以列出、搜索和管理 Root/管理员所属令牌；
-- 普通管理员只能管理自己的令牌，不能读取或操作 Root、同级管理员的令牌；
+- 管理员和 Root 都可以列出、搜索和管理所有管理员及 Root 所属令牌；
+- 管理员和 Root 均可在权限校验后查看完整 Key、复制、编辑和删除彼此创建的令牌；
+- 普通用户令牌不进入特权令牌列表，管理员和 Root 也不能通过该能力越权管理普通用户令牌；
 - 批量删除先完成整批权限校验，再在事务内统一删除，失败时不会部分删除；
 - 列表与详情继续使用脱敏 Key，只有通过角色校验的显式取 Key 接口返回完整值。
 
@@ -379,6 +382,8 @@ service/channel_oauth_policy_test.go
 service/http_client_test.go
 service/retry_data_policy_test.go
 service/codex_oauth_test.go
+service/codex_credential_refresh_test.go
+service/codex_wham_usage_test.go
 service/error_test.go
 setting/ratio_setting/model_ratio_test.go
 relay/channel/codex/alpha_search_test.go
@@ -407,7 +412,8 @@ web/default/src/lib/localize-error-message.test.ts
 - 宿主/代理出口画像发现、位置模式热更新和隐私过滤；
 - 默认渠道隔离、供应商隔离、策略组隔离和响应披露 Header；
 - 批量模型价格配置事务写入和位置模式运行时选项；
-- OAuth refresh token 非轮换响应和授权错误分类；
+- OAuth refresh token 非轮换响应、并发刷新复用和授权错误分类；
+- Codex Wham 用量请求路径、认证 Header、重置请求体及响应大小限制；
 - 多 Key 随机与轮询重试排除本请求已使用 Key；
 - 上游错误正文不进入日志、数据库错误或客户端响应；
 - 前端传输错误、供应商错误和流终止原因统一显示为简体中文。

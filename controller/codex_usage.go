@@ -125,7 +125,10 @@ func fetchCodexChannelWhamData(
 		refreshedKey, refreshedChannel, refreshErr := service.RefreshCodexChannelCredential(
 			refreshCtx,
 			ch.Id,
-			service.CodexCredentialRefreshOptions{ResetCaches: true},
+			service.CodexCredentialRefreshOptions{
+				ResetCaches:         true,
+				ExpectedAccessToken: oauthKey.AccessToken,
+			},
 		)
 		refreshCancel()
 		if refreshErr != nil {
