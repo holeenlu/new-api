@@ -22,6 +22,14 @@ const KeyBodyStorage = "key_body_storage"
 
 var ErrRequestBodyTooLarge = errors.New("request body too large")
 
+func MaxRequestBodyBytes() int64 {
+	maxMB := constant.MaxRequestBodyMB
+	if maxMB <= 0 {
+		maxMB = 128
+	}
+	return int64(maxMB) << 20
+}
+
 func IsRequestBodyTooLargeError(err error) bool {
 	if err == nil {
 		return false
@@ -57,11 +65,8 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 		}
 	}
 
-	maxMB := constant.MaxRequestBodyMB
-	if maxMB <= 0 {
-		maxMB = 128 // 默认 128MB
-	}
-	maxBytes := int64(maxMB) << 20
+	maxBytes := MaxRequestBodyBytes()
+	maxMB := maxBytes >> 20
 
 	contentLength := c.Request.ContentLength
 

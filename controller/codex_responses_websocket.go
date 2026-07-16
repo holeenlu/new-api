@@ -44,6 +44,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(common.MaxRequestBodyBytes())
 	if strings.TrimSpace(c.GetHeader("Session-Id")) == "" {
 		sessionID := uuid.NewString()
 		c.Request.Header.Set("Session-Id", sessionID)

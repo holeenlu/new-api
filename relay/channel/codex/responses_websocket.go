@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -22,7 +23,6 @@ import (
 const (
 	codexResponsesWebSocketSessionKey = "codex_responses_websocket_session"
 	codexResponsesWebSocketBeta       = "responses_websockets=2026-02-06"
-	maxResponsesWebSocketRequestBytes = 16 << 20
 	maxResponsesWebSocketErrorBytes   = 64 << 10
 )
 
@@ -77,12 +77,18 @@ func (s *ResponsesWebSocketSession) doRequest(c *gin.Context, adaptor *Adaptor, 
 	if s == nil || c == nil || adaptor == nil || info == nil || requestBody == nil {
 		return nil, errors.New("codex responses websocket: invalid request")
 	}
-	body, err := io.ReadAll(io.LimitReader(requestBody, maxResponsesWebSocketRequestBytes+1))
+	requestLimit := common.MaxRequestBodyBytes()
+	body, err := io.ReadAll(io.LimitReader(requestBody, requestLimit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > maxResponsesWebSocketRequestBytes {
-		return nil, errors.New("codex responses websocket request is too large")
+	if int64(len(body)) > requestLimit {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("codex responses websocket request exceeds %d MB: %w", requestLimit>>20, common.ErrRequestBodyTooLarge),
+			types.ErrorCodeReadRequestBodyFailed,
+			http.StatusRequestEntityTooLarge,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	httpBody := append([]byte(nil), body...)
 	var payload map[string]any

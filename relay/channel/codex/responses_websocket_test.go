@@ -12,6 +12,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -143,4 +144,24 @@ func TestResponsesWebSocketSessionFallsBackToHTTPOnUpgradeRequired(t *testing.T)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, 1, websocketAttempts)
 	require.Equal(t, 2, httpAttempts)
+}
+
+func TestResponsesWebSocketSessionUsesConfiguredRequestBodyLimit(t *testing.T) {
+	originalLimit := constant.MaxRequestBodyMB
+	constant.MaxRequestBodyMB = 1
+	t.Cleanup(func() { constant.MaxRequestBodyMB = originalLimit })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	_, err := (&ResponsesWebSocketSession{}).doRequest(
+		c,
+		&Adaptor{},
+		&relaycommon.RelayInfo{},
+		strings.NewReader(strings.Repeat("x", (1<<20)+1)),
+	)
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusRequestEntityTooLarge, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeReadRequestBodyFailed, apiErr.GetErrorCode())
 }
