@@ -221,6 +221,9 @@ remaining = 100 - used_percent
 ```
 
 并对百分比进行边界限制，避免出现负数或超过 100 的显示。
+用量、重置次数和用量重置请求不再使用固定的 15 秒总超时，而是复用
+`SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT`（默认 30 秒），并额外保留 5 秒用于读取和处理响应体。
+这避免网络已完成 TLS 握手、但 ChatGPT 在 15 秒后才返回响应头时被本地提前取消。
 
 ## 2. Claude Code 订阅渠道
 
