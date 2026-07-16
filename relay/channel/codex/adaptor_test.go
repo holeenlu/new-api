@@ -122,41 +122,7 @@ func TestCodexResponsesLiteRejectsNonStreamRequest(t *testing.T) {
 	require.Contains(t, apiErr.Error(), "stream=true")
 }
 
-func TestCodexResponsesLiteToolValidation(t *testing.T) {
-	tests := []struct {
-		name           string
-		tools          string
-		wantCompatible bool
-		wantErr        bool
-	}{
-		{name: "empty", tools: `[]`, wantCompatible: true},
-		{name: "function", tools: `[{"type":"function","name":"lookup"}]`, wantCompatible: true},
-		{name: "custom", tools: `[{"type":"custom","name":"shell"}]`, wantCompatible: true},
-		{name: "client tool search", tools: `[{"type":"tool_search","execution":"client"}]`, wantCompatible: true},
-		{name: "namespace", tools: `[{"type":"namespace","name":"crm","tools":[{"type":"function","name":"lookup"}]}]`},
-		{name: "hosted tool search", tools: `[{"type":"tool_search"}]`},
-		{name: "server tool search", tools: `[{"type":"tool_search","execution":"server"}]`},
-		{name: "web search", tools: `[{"type":"web_search"}]`},
-		{name: "unknown", tools: `[{"type":"unknown"}]`},
-		{name: "malformed", tools: `{`, wantErr: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			compatible, err := codexResponsesLiteToolsCompatible(json.RawMessage(test.tools))
-			if test.wantErr {
-				require.Error(t, err)
-				var apiErr *types.NewAPIError
-				require.ErrorAs(t, err, &apiErr)
-				require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, test.wantCompatible, compatible)
-		})
-	}
-}
-
-func TestCodexResponsesNamespaceFallsBackToStandardMode(t *testing.T) {
+func TestCodexResponsesLiteFiltersHostedToolsAndKeepsClientTools(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -168,19 +134,26 @@ func TestCodexResponsesNamespaceFallsBackToStandardMode(t *testing.T) {
 			UpstreamModelName: "gpt-5.6-terra",
 		},
 	}
-	tools := json.RawMessage(`[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}]`)
+	tools := json.RawMessage(`[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"},{"type":"namespace","name":"collaboration"},{"type":"web_search"},{"type":"image_generation"}]`)
+	input := json.RawMessage(`[{"type":"additional_tools","tools":[{"type":"function","name":"keep"},{"type":"web_search"}]},{"role":"user","content":"hello"}]`)
 
-	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{Tools: tools})
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{
+		Tools:      tools,
+		Input:      input,
+		ToolChoice: json.RawMessage(`{"type":"image_generation"}`),
+	})
 	require.NoError(t, err)
 	got := converted.(dto.OpenAIResponsesRequest)
-	require.JSONEq(t, string(tools), string(got.Tools))
-	require.Nil(t, got.Reasoning)
-	require.Empty(t, got.ClientMetadata)
+	require.JSONEq(t, `[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"}]`, string(got.Tools))
+	require.JSONEq(t, `[{"type":"additional_tools","tools":[{"type":"function","name":"keep"}]},{"role":"user","content":"hello"}]`, string(got.Input))
+	require.JSONEq(t, `"auto"`, string(got.ToolChoice))
+	require.NotNil(t, got.Reasoning)
+	require.NotEmpty(t, got.ClientMetadata)
 
 	headers := make(http.Header)
 	require.NoError(t, (&Adaptor{}).SetupRequestHeader(c, &headers, info))
-	require.Empty(t, headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
-	require.Equal(t, CodexOAuthOriginator, headers.Get("Originator"))
+	require.Equal(t, "true", headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
+	require.Equal(t, "Codex Desktop", headers.Get("Originator"))
 }
 
 func TestCodexResponsesLiteIsNotEnabledForOtherModelsOrCompact(t *testing.T) {

@@ -276,6 +276,12 @@ func ListModels(c *gin.Context, modelType int) {
 	for _, modelName := range userModelNames {
 		userOpenAiModels = append(userOpenAiModels, buildOpenAIModel(modelName, ownerByModel))
 	}
+	if modelType == constant.ChannelTypeOpenAI {
+		if _, isCodexClient := c.Request.URL.Query()["client_version"]; isCodexClient {
+			c.JSON(http.StatusOK, buildCodexClientModelCatalog(userOpenAiModels))
+			return
+		}
+	}
 
 	switch modelType {
 	case constant.ChannelTypeAnthropic:
@@ -313,6 +319,39 @@ func ListModels(c *gin.Context, modelType int) {
 			"object":  "list",
 		})
 	}
+}
+
+func buildCodexClientModelCatalog(models []dto.OpenAIModels) gin.H {
+	catalog := make([]gin.H, 0, len(models))
+	for index, item := range models {
+		webSocketCapable := strings.EqualFold(strings.TrimSpace(item.OwnedBy), "codex")
+		entry := gin.H{
+			"slug":                    item.Id,
+			"display_name":            item.Id,
+			"description":             item.Id,
+			"default_reasoning_level": "medium",
+			"supported_reasoning_levels": []gin.H{
+				{"effort": "low", "description": "Fast responses with lighter reasoning"},
+				{"effort": "medium", "description": "Balances speed and reasoning depth"},
+				{"effort": "high", "description": "Greater reasoning depth for complex problems"},
+			},
+			"shell_type":                   "shell_command",
+			"visibility":                   "list",
+			"supported_in_api":             true,
+			"priority":                     1000 + index,
+			"prefer_websockets":            webSocketCapable,
+			"input_modalities":             []string{"text", "image"},
+			"context_window":               272000,
+			"max_context_window":           1000000,
+			"supports_parallel_tool_calls": false,
+			"supports_search_tool":         webSocketCapable,
+		}
+		if webSocketCapable {
+			entry["web_search_tool_type"] = "text_and_image"
+		}
+		catalog = append(catalog, entry)
+	}
+	return gin.H{"models": catalog}
 }
 
 func ChannelListModels(c *gin.Context) {

@@ -124,46 +124,6 @@ func shouldUseCodexResponsesLite(info *relaycommon.RelayInfo) bool {
 		isCodexLiteModel(info)
 }
 
-func codexResponsesLiteToolsCompatible(raw json.RawMessage) (bool, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
-		return true, nil
-	}
-
-	var tools []json.RawMessage
-	if err := common.Unmarshal(raw, &tools); err != nil {
-		return false, types.NewErrorWithStatusCode(
-			errors.New("Codex Responses Lite requires tools to be a JSON array"),
-			types.ErrorCodeInvalidRequest,
-			http.StatusBadRequest,
-			types.ErrOptionWithSkipRetry(),
-		)
-	}
-	for _, rawTool := range tools {
-		var tool struct {
-			Type      string `json:"type"`
-			Execution string `json:"execution"`
-		}
-		if err := common.Unmarshal(rawTool, &tool); err != nil {
-			return false, types.NewErrorWithStatusCode(
-				errors.New("Codex Responses Lite tool definitions must be JSON objects"),
-				types.ErrorCodeInvalidRequest,
-				http.StatusBadRequest,
-				types.ErrOptionWithSkipRetry(),
-			)
-		}
-		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
-		if toolType == "function" || toolType == "custom" {
-			continue
-		}
-		if toolType == "tool_search" && strings.EqualFold(strings.TrimSpace(tool.Execution), "client") {
-			continue
-		}
-		return false, nil
-	}
-	return true, nil
-}
-
 func setCodexResponsesLiteEnabled(c *gin.Context, enabled bool) {
 	if c != nil {
 		c.Set(codexLiteEnabledKey, enabled)
@@ -386,9 +346,8 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 				types.ErrOptionWithSkipRetry(),
 			)
 		}
-		var err error
-		useLite, err = codexResponsesLiteToolsCompatible(request.Tools)
-		if err != nil {
+		useLite = true
+		if err := filterCodexResponsesLiteRequest(&request); err != nil {
 			return nil, err
 		}
 	}
@@ -458,6 +417,13 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if session := responsesWebSocketSessionFromContext(c); session != nil {
+		return session.doRequest(c, a, info, requestBody)
+	}
+	return doCodexHTTPResponseRequest(c, a, info, requestBody)
+}
+
+func doCodexHTTPResponseRequest(c *gin.Context, a *Adaptor, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	release, acquired := acquireCodexOAuthSlot(info.ChannelId)
 	if !acquired {
 		c.Header("Retry-After", "1")

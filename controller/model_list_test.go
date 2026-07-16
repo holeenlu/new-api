@@ -181,6 +181,20 @@ func decodeUserModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 	return payload.Data
 }
 
+func TestBuildCodexClientModelCatalogDeclaresWebSocketCapability(t *testing.T) {
+	response := buildCodexClientModelCatalog([]dto.OpenAIModels{
+		{Id: "gpt-5.6-sol", OwnedBy: "codex"},
+		{Id: "gpt-5.5", OwnedBy: "openai"},
+	})
+	models, ok := response["models"].([]gin.H)
+	require.True(t, ok)
+	require.Len(t, models, 2)
+	require.Equal(t, true, models[0]["prefer_websockets"])
+	require.Equal(t, true, models[0]["supports_search_tool"])
+	require.Equal(t, false, models[1]["prefer_websockets"])
+	require.Equal(t, "gpt-5.6-sol", models[0]["slug"])
+}
+
 func TestGetUserModelsFiltersByRequestedGroup(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.Create(&model.User{

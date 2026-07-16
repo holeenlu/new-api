@@ -71,6 +71,7 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
 	relayV1Router.Use(middleware.TokenAuth())
 	relayV1Router.Use(middleware.ModelRequestRateLimit())
+	relayV1Router.GET("/responses", controller.CodexResponsesWebSocket)
 	{
 		// WebSocket 路由（统一到 Relay）
 		wsRouter := relayV1Router.Group("")
@@ -101,6 +102,7 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/responses", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIResponses)
 		})
+		httpRouter.POST("/alpha/search", controller.CodexAlphaSearch)
 		httpRouter.POST("/responses/compact", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
 		})
@@ -197,6 +199,16 @@ func SetRelayRouter(router *gin.Engine) {
 		relayGeminiRouter.POST("/models/*path", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
+	}
+
+	codexDirectRouter := router.Group("/backend-api/codex")
+	codexDirectRouter.Use(middleware.RouteTag("relay"))
+	codexDirectRouter.Use(middleware.SystemPerformanceCheck())
+	codexDirectRouter.Use(middleware.TokenAuth())
+	codexDirectRouter.Use(middleware.ModelRequestRateLimit())
+	codexDirectRouter.Use(middleware.Distribute())
+	{
+		codexDirectRouter.POST("/alpha/search", controller.CodexAlphaSearch)
 	}
 }
 

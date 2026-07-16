@@ -172,12 +172,36 @@ Lite 请求还必须满足：
 - `stream: true`；
 - `store: false`；
 - 工具仅允许 `function`、`custom`，以及 `execution: "client"` 的
-  `tool_search`。包含 `namespace`、托管 `tool_search` 或其他服务端工具时，
-  保留原始工具结构并自动回退到普通 Responses 模式，不会静默删除或改写工具。
+  `tool_search`。HTTP、SSE 和 WebSocket 请求会在最终出站前递归过滤
+  `namespace`、`web_search`、`image_generation`、托管 `tool_search` 等 Lite
+  不支持的 hosted 工具，同时保留客户端函数、自定义工具和客户端工具搜索。
 
 这些修改用于解决 Codex Lite 对请求头、流式响应和 reasoning context 的严格校验。
 
-### 1.5 Responses DTO 扩展
+### 1.5 Responses Lite 搜索与 WebSocket
+
+新增客户端入口：
+
+```text
+POST /v1/alpha/search
+POST /backend-api/codex/alpha/search
+GET /v1/responses  (WebSocket Upgrade)
+```
+
+- Alpha search 通过当前 API Key 的分组和模型规则选择 Codex OAuth 渠道，转发至
+  `/backend-api/codex/alpha/search`，恢复 Responses Lite 的 `web.run` 搜索；
+- 搜索请求移除仅用于本地路由的 `prompt_cache_key` 和
+  `prompt_cache_retention`，保留会话及 actor authorization Header；
+- Responses WebSocket 会话固定同一 OAuth 渠道和模型，使用上游
+  `responses_websockets=2026-02-06` 协议；
+- `/v1/models?client_version=...` 返回 Codex 客户端兼容目录，并仅为实际由 Codex
+  渠道承载的模型声明 `prefer_websockets: true` 和搜索能力；
+- `response.create` 和 `response.append` 均进入既有鉴权、模型限制、计费、隐私和
+  错误处理链；同一会话固定渠道，避免 OAuth 身份在会话中途漂移；
+- 上游 WebSocket 事件按客户端协议实时返回；上游明确返回 `426 Upgrade Required`
+  时自动回退 HTTP/SSE，不会因上游暂未开放 WebSocket 而中断请求。
+
+### 1.6 Responses DTO 扩展
 
 文件：`dto/openai_request.go`
 
@@ -193,7 +217,7 @@ ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 Context json.RawMessage `json:"context,omitempty"`
 ```
 
-### 1.6 渠道测试和模型同步
+### 1.7 渠道测试和模型同步
 
 文件：
 
@@ -207,7 +231,7 @@ Codex 渠道测试强制使用 stream 模式，定时自动测试会跳过订阅
 Context，并受到订阅 OAuth 超时限制，不再使用不可取消的 `context.Background()`。
 上游价格同步明确排除 Codex 与 Claude Code OAuth 渠道。
 
-### 1.7 Codex 使用量界面
+### 1.8 Codex 使用量界面
 
 文件：`web/default/src/features/channels/components/dialogs/codex-usage-dialog.tsx`
 
