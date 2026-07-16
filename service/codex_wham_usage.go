@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -73,9 +74,9 @@ func doCodexWhamRequest(
 	if client == nil {
 		return 0, nil, fmt.Errorf("nil http client")
 	}
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		return 0, nil, fmt.Errorf("empty baseURL")
+	baseURL, err = normalizeCodexWhamBaseURL(baseURL)
+	if err != nil {
+		return 0, nil, err
 	}
 	accessToken = strings.TrimSpace(accessToken)
 	accountID = strings.TrimSpace(accountID)
@@ -109,6 +110,35 @@ func doCodexWhamRequest(
 		return resp.StatusCode, nil, fmt.Errorf("codex usage response exceeds %d bytes", maxCodexWhamResponseBytes)
 	}
 	return resp.StatusCode, body, nil
+}
+
+func normalizeCodexWhamBaseURL(baseURL string) (string, error) {
+	baseURL = strings.TrimSpace(baseURL)
+	parsed, err := url.ParseRequestURI(baseURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("invalid Codex baseURL")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("Codex baseURL must not contain user info")
+	}
+
+	for _, marker := range []string{"/backend-api/codex", "/backend-api/wham", "/backend-api"} {
+		index := strings.Index(parsed.Path, marker)
+		if index < 0 {
+			continue
+		}
+		markerEnd := index + len(marker)
+		if markerEnd != len(parsed.Path) && parsed.Path[markerEnd] != '/' {
+			continue
+		}
+		parsed.Path = parsed.Path[:index]
+		break
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func setCodexWhamRequestHeaders(req *http.Request, accessToken string, accountID string) {

@@ -24,6 +24,8 @@ type CodexOAuthKey = dto.CodexOAuthCredential
 
 var codexChannelCredentialRefreshLocks sync.Map
 
+var errCodexCredentialChanged = errors.New("codex channel credential changed during refresh")
+
 func codexChannelCredentialRefreshLock(channelID int) *sync.Mutex {
 	lock, _ := codexChannelCredentialRefreshLocks.LoadOrStore(channelID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
@@ -99,7 +101,7 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 		return nil, nil, err
 	}
 
-	if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
+	if err := replaceCodexChannelCredential(ch.Id, ch.Key, string(encoded)); err != nil {
 		return nil, nil, err
 	}
 	ch.Key = string(encoded)
@@ -110,4 +112,17 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 	}
 
 	return oauthKey, ch, nil
+}
+
+func replaceCodexChannelCredential(channelID int, previousKey string, replacementKey string) error {
+	result := model.DB.Model(&model.Channel{}).
+		Where(&model.Channel{Id: channelID, Key: previousKey}).
+		Update("key", replacementKey)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errCodexCredentialChanged
+	}
+	return nil
 }

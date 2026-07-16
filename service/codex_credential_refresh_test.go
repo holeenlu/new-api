@@ -40,3 +40,20 @@ func TestRefreshCodexChannelCredentialSkipsRotationWhenCredentialAlreadyChanged(
 	assert.Equal(t, "new-access-token", credential.AccessToken)
 	assert.Equal(t, string(credentialJSON), channel.Key)
 }
+
+func TestReplaceCodexChannelCredentialDoesNotOverwriteConcurrentUpdate(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id:   2,
+		Type: constant.ChannelTypeCodex,
+		Key:  "credential-before-refresh",
+	}).Error)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 2).Update("key", "credential-from-reauthorization").Error)
+
+	err := replaceCodexChannelCredential(2, "credential-before-refresh", "credential-from-refresh")
+
+	require.ErrorIs(t, err, errCodexCredentialChanged)
+	channel, err := model.GetChannelById(2, true)
+	require.NoError(t, err)
+	assert.Equal(t, "credential-from-reauthorization", channel.Key)
+}

@@ -112,3 +112,31 @@ func TestCodexWhamRequestRejectsOversizedResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, statusCode)
 	assert.Nil(t, body)
 }
+
+func TestCodexWhamRequestNormalizesConfiguredCodexBaseURL(t *testing.T) {
+	paths := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(server.Close)
+
+	tests := []struct {
+		name         string
+		baseURL      string
+		expectedPath string
+	}{
+		{name: "origin", baseURL: server.URL, expectedPath: "/backend-api/wham/usage"},
+		{name: "codex API root", baseURL: server.URL + "/backend-api/codex", expectedPath: "/backend-api/wham/usage"},
+		{name: "responses endpoint", baseURL: server.URL + "/backend-api/codex/responses", expectedPath: "/backend-api/wham/usage"},
+		{name: "gateway prefix", baseURL: server.URL + "/gateway/backend-api/codex", expectedPath: "/gateway/backend-api/wham/usage"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := FetchCodexWhamUsage(context.Background(), server.Client(), test.baseURL, "access-token", "account-id")
+			require.NoError(t, err)
+			assert.Equal(t, test.expectedPath, <-paths)
+		})
+	}
+}
