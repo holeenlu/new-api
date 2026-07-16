@@ -77,13 +77,14 @@ deploy_build_image() {
 
 deploy_prune_build_cache() {
   local enabled=${DEPLOY_PRUNE_BUILD_CACHE:-true}
-  local max_used_space=${DEPLOY_BUILDX_CACHE_MAX_USED_SPACE:-20GB}
   if [[ "$enabled" != "true" && "$enabled" != "1" ]]; then
     return 0
   fi
 
-  deploy_log "Pruning Buildx cache to keep at most $max_used_space"
-  if ! docker buildx prune --force --max-used-space "$max_used_space"; then
+  # Docker Desktop may report all cache records as reclaimable while ignoring
+  # --max-used-space. Remove the Buildx cache deterministically after deploy.
+  deploy_log "Pruning all Buildx cache after deployment"
+  if ! docker buildx prune --all --force; then
     deploy_log "Warning: Buildx cache cleanup failed; deployment will continue"
   fi
 }

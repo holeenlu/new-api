@@ -36,6 +36,17 @@ func TestApplyChannelErrorPolicyLeavesSubscriptionOAuthServerErrorsRetryable(t *
 	}
 }
 
+func TestIsSubscriptionOAuthConcurrencyLimit(t *testing.T) {
+	err := types.NewErrorWithStatusCode(
+		errors.New("codex OAuth channel concurrency limit reached; retry later"),
+		types.ErrorCodeOAuthChannelConcurrencyLimit,
+		http.StatusServiceUnavailable,
+	)
+
+	require.True(t, IsSubscriptionOAuthConcurrencyLimit(constant.ChannelTypeCodex, err))
+	require.False(t, IsSubscriptionOAuthConcurrencyLimit(constant.ChannelTypeOpenAI, err))
+}
+
 func TestSubscriptionOAuthTransientErrorDoesNotDisableChannel(t *testing.T) {
 	for _, channelType := range []int{constant.ChannelTypeClaudeCode, constant.ChannelTypeCodex} {
 		err := types.NewErrorWithStatusCode(

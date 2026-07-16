@@ -35,11 +35,13 @@ type ResolvedChannelDataPolicy struct {
 }
 
 type RetryBoundary struct {
-	initialChannelID int
-	initialType      int
-	policy           ResolvedChannelDataPolicy
-	usedChannelIDs   map[int]struct{}
-	usedKeyIndexes   map[int]map[int]struct{}
+	initialChannelID                      int
+	initialType                           int
+	policy                                ResolvedChannelDataPolicy
+	initialUsesDefaultRetryIsolation      bool
+	allowDefaultSubscriptionOAuthFailover bool
+	usedChannelIDs                        map[int]struct{}
+	usedKeyIndexes                        map[int]map[int]struct{}
 }
 
 func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy {
@@ -108,12 +110,31 @@ func NewRetryBoundary(channel *model.Channel) *RetryBoundary {
 		return nil
 	}
 	return &RetryBoundary{
-		initialChannelID: channel.Id,
-		initialType:      channel.Type,
-		policy:           ResolveChannelDataPolicy(channel),
-		usedChannelIDs:   make(map[int]struct{}),
-		usedKeyIndexes:   make(map[int]map[int]struct{}),
+		initialChannelID:                 channel.Id,
+		initialType:                      channel.Type,
+		policy:                           ResolveChannelDataPolicy(channel),
+		initialUsesDefaultRetryIsolation: channelUsesDefaultRetryIsolation(channel),
+		usedChannelIDs:                   make(map[int]struct{}),
+		usedKeyIndexes:                   make(map[int]map[int]struct{}),
 	}
+}
+
+func channelUsesDefaultRetryIsolation(channel *model.Channel) bool {
+	if channel == nil {
+		return false
+	}
+	policy := channel.GetOtherSettings().DataPolicy
+	return policy == nil || policy.RetryIsolation == ""
+}
+
+func (b *RetryBoundary) AllowDefaultSubscriptionOAuthFailover() {
+	if b == nil || !b.initialUsesDefaultRetryIsolation {
+		return
+	}
+	if b.initialType != constant.ChannelTypeCodex && b.initialType != constant.ChannelTypeClaudeCode {
+		return
+	}
+	b.allowDefaultSubscriptionOAuthFailover = true
 }
 
 func (b *RetryBoundary) MarkAttempt(channel *model.Channel, multiKeyIndex ...int) {
@@ -174,6 +195,12 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 	if candidate.Provider != b.policy.Provider || candidate.Region != b.policy.Region ||
 		candidate.Retention != b.policy.Retention || candidate.Training != b.policy.Training {
 		return false
+	}
+	if b.allowDefaultSubscriptionOAuthFailover &&
+		channelUsesDefaultRetryIsolation(channel) &&
+		channel.Type == b.initialType &&
+		candidate.Endpoint == b.policy.Endpoint {
+		return true
 	}
 	switch b.policy.RetryIsolation {
 	case dto.RetryIsolationProvider:

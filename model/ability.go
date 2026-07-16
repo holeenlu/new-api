@@ -163,11 +163,9 @@ func GetChannel(group string, model string, retry int, requestPath string, filte
 		}
 		if len(priorities) > 0 {
 			sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
-			priorityIndex := retry
-			if priorityIndex >= len(priorities) {
-				priorityIndex = len(priorities) - 1
-			}
-			targetPriority := priorities[priorityIndex]
+			// Candidate filters exclude channels already tried by this request. Keep
+			// trying the highest remaining priority before falling back to a lower one.
+			targetPriority := priorities[0]
 			filtered = filtered[:0]
 			for _, ability := range abilities {
 				priority := int64(0)

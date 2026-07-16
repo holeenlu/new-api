@@ -16,6 +16,8 @@ services:
   new-api:
     image: calciumion/new-api:latest
     container_name: new-api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: always
     command: --log-dir /app/logs
     ports:
@@ -31,6 +33,9 @@ services:
 #      - LOG_SQL_CLICKHOUSE_TTL_DAYS=0 # OPTIONAL: ClickHouse log retention days. Unset or 0 disables automatic deletion; set to e.g. 30 to keep 30 days
       - REDIS_CONN_STRING=redis://:123456@redis:6379 # ⚠️ IMPORTANT: Change the password in production!
       - TZ=UTC
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,postgres,redis,new-api}
       - ERROR_LOG_ENABLED=true # 是否启用错误日志记录 (Whether to enable error log recording)
       - MAX_REQUEST_BODY_MB=${MAX_REQUEST_BODY_MB:-128}
       - BATCH_UPDATE_ENABLED=true  # 是否启用批量更新 (Whether to enable batch update)

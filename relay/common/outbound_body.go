@@ -1,6 +1,7 @@
 package common
 
 import (
+	"bufio"
 	"io"
 
 	"github.com/QuantumNous/new-api/common"
@@ -41,6 +42,13 @@ func newOutboundJSONBody(data []byte) (body io.Reader, size int64, closer io.Clo
 // NewPrivacyFilteredPassThroughJSONBody applies the same outbound privacy
 // policy to pass-through requests as converted requests.
 func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUsesProxy ...bool) (body io.Reader, size int64, closer io.Closer, err error) {
+	mayContainLocationData, err := storageMayContainLocationPrivacyData(storage)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if !mayContainLocationData {
+		return common.ReaderOnly(storage), storage.Size(), nil, nil
+	}
 	data, err := storage.Bytes()
 	if err != nil {
 		return nil, 0, nil, err
@@ -53,4 +61,92 @@ func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUs
 		return common.ReaderOnly(storage), storage.Size(), nil, nil
 	}
 	return newOutboundJSONBody(filtered)
+}
+
+const maxPrivacyCandidateKeyBytes = 1024
+
+func storageMayContainLocationPrivacyData(storage common.BodyStorage) (mayContain bool, err error) {
+	originalOffset, err := storage.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false, err
+	}
+	if _, err = storage.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	defer func() {
+		_, restoreErr := storage.Seek(originalOffset, io.SeekStart)
+		if err == nil && restoreErr != nil {
+			err = restoreErr
+		}
+	}()
+
+	reader := bufio.NewReaderSize(storage, 32*1024)
+	rawKey := make([]byte, 0, 64)
+	for {
+		current, readErr := reader.ReadByte()
+		if readErr != nil {
+			if readErr == io.EOF {
+				return false, nil
+			}
+			return false, readErr
+		}
+		if current != '"' {
+			continue
+		}
+
+		rawKey = append(rawKey[:0], '"')
+		overflow := false
+		escaped := false
+		for {
+			current, readErr = reader.ReadByte()
+			if readErr != nil {
+				if readErr == io.EOF {
+					return false, nil
+				}
+				return false, readErr
+			}
+			if !overflow {
+				if len(rawKey) < maxPrivacyCandidateKeyBytes {
+					rawKey = append(rawKey, current)
+				} else {
+					overflow = true
+				}
+			}
+			if escaped {
+				escaped = false
+				continue
+			}
+			if current == '\\' {
+				escaped = true
+				continue
+			}
+			if current == '"' {
+				break
+			}
+		}
+
+		for {
+			current, readErr = reader.ReadByte()
+			if readErr != nil {
+				if readErr == io.EOF {
+					return false, nil
+				}
+				return false, readErr
+			}
+			if current != ' ' && current != '\t' && current != '\r' && current != '\n' {
+				break
+			}
+		}
+		if current != ':' || overflow {
+			continue
+		}
+
+		var key string
+		if err := common.Unmarshal(rawKey, &key); err != nil {
+			continue
+		}
+		if isLocationPrivacyCandidateKey(key) {
+			return true, nil
+		}
+	}
 }

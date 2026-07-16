@@ -84,6 +84,12 @@ func IsSubscriptionOAuthTransientError(channelType int, err *types.NewAPIError) 
 	return err.StatusCode >= 500 && err.StatusCode <= 599
 }
 
+func IsSubscriptionOAuthConcurrencyLimit(channelType int, err *types.NewAPIError) bool {
+	return err != nil &&
+		(channelType == constant.ChannelTypeClaudeCode || channelType == constant.ChannelTypeCodex) &&
+		err.GetErrorCode() == types.ErrorCodeOAuthChannelConcurrencyLimit
+}
+
 // ApplyChannelErrorPolicy prevents subscription-backed channels from
 // amplifying client errors and rate-limit responses. Transient upstream 5xx
 // failures remain retryable so routing can fail over to another account.

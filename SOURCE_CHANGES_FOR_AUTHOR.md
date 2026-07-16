@@ -51,8 +51,9 @@ POST /api/channel/codex/oauth/complete
 授权、刷新、模型发现、用量查询和请求转发共用同一份 Codex credential DTO。刷新响应没有返回新的
 `refresh_token` 时保留原 refresh token；同一渠道的自动刷新、手动刷新和用量查询刷新按渠道 ID
 串行执行，避免 refresh token 轮换竞争；等待锁期间如果其他请求已经完成刷新，则直接复用新的凭证，
-不再连续旋转 refresh token。用量查询只在上游真实返回 `401` 时刷新，`403` 作为账号或组织权限问题
-直接返回，不再无效刷新。
+不再连续旋转 refresh token。刷新结果使用渠道 ID 和刷新前 Key 作为更新条件，只有凭证仍是本次读取的
+版本时才写回；管理员并发重新授权后，后台刷新不会覆盖新凭证。用量查询只在上游真实返回 `401` 时
+刷新，`403` 作为账号或组织权限问题直接返回，不再无效刷新。
 
 生成的 credential 结构包含：
 
@@ -225,7 +226,9 @@ remaining = 100 - used_percent
 用量、重置次数和用量重置请求不再使用固定的 15 秒总超时，而是复用
 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT`（默认 30 秒），并额外保留 5 秒用于读取和处理响应体。
 这避免网络已完成 TLS 握手、但 ChatGPT 在 15 秒后才返回响应头时被本地提前取消。
-三个 Wham 接口共用同一请求构造、认证 Header 和响应读取逻辑，响应体最大限制为 1 MB。
+三个 Wham 接口共用同一请求构造、认证 Header 和响应读取逻辑，响应体最大限制为 1 MB。渠道 Base URL
+会先规范化为 HTTP/HTTPS 源站或代理前缀，自动剥离已有的 `/backend-api`、`/backend-api/codex`、
+`/backend-api/wham` 及其资源路径，避免生成重复路径；带 URL userinfo 的地址会被拒绝。
 
 ## 2. Claude Code 订阅渠道
 
@@ -314,7 +317,11 @@ x-app: cli
 - 调试日志只记录请求体大小，不输出订阅 OAuth 请求正文；
 - 每个渠道默认最多 5 个并发请求，相邻请求启动间隔默认 750ms；
 - 等待上游首个响应头默认最多 30 秒；Transport 超时返回 `504` 和 `Retry-After`，便于客户端与真正的应用内部 `500` 区分；
-- 本地并发保护触发时返回可重试的 503，以便切换到备用订阅渠道；
+- 本地并发保护触发时返回专用、可重试的 `oauth_channel_concurrency_limit` 503。若 Codex 渠道未显式
+  设置“仅当前渠道”隔离，重试会限定在相同渠道类型、相同规范化上游端点且处理策略一致的未尝试
+  Codex 渠道；显式 `channel`、`provider` 或 `policy_group` 隔离配置始终优先，不会被该容量回退覆盖；
+- 重试候选已排除本请求尝试过的渠道时，先尝试当前最高优先级中仍可用的渠道，再降到下一优先级，
+  不会因为重试次数直接跳过同优先级备用渠道；
 - 上游 5xx、504、524 可进入重试判断，但默认只允许当前多 Key 渠道换 Key 重试；只有管理员显式配置相同供应商端点或相同数据策略组后，才允许跨渠道重试；
 - 定时推理测试和上游价格同步跳过订阅 OAuth 渠道。
 
@@ -433,6 +440,10 @@ bin/deploy-192.168.11.12.sh
 - `docker-compose.deploy.yml` 统一维护应用、PostgreSQL、Redis 和 OAuth 保护参数，三套目标 Compose 只保留端口、Caddy 等目标差异；
 - `bin/deploy-common.sh` 统一版本号、Buildx、镜像平台检查和 `.env` 初始化，远程脚本复用同一套环境初始化逻辑；
 - `bin/deploy-remote.sh` 统一 174、192 的远程构建发布流程，两个服务器脚本只声明目标地址、目录、端口和额外服务；
+- 远程源码同步使用 `.new-api-deploy-manifest` 记录脚本实际管理的文件；后续部署只清理旧清单中存在、
+  新清单中已移除的文件，并始终保护 `.env`、`data`、`logs`、`backups` 和 `caddy` 持久目录；
+- 不启用 Caddy 的目标会检查 `new-api-caddy` 的 Compose service 与 working-dir 标签，只有确认属于当前
+  部署目录时才删除该孤立容器；不会使用宽泛的 `--remove-orphans` 影响其他项目容器；
 - 公网服务器部署目标已从 `104.128.92.169` 迁移至 `174.137.56.226`：Caddy、Compose 文件、
   远程部署脚本与兼容入口均已改名并指向新地址；本地和 192 服务监听 3000，174 由 Caddy 对外
   提供 `nextcode.buildtoconnect.com`；
@@ -440,16 +451,23 @@ bin/deploy-192.168.11.12.sh
 - Compose 默认设置 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT=30`；部署脚本仅将旧默认值 `120` 自动迁移为 `30`，保留管理员自定义值；
 - Compose 与部署脚本默认补齐 `MAX_REQUEST_BODY_MB=128`；可在三套部署的 `.env` 中按 MB 调整，
   同时作用于普通 HTTP 请求和 Codex Responses WebSocket 请求；
+- 共享部署 Compose 将 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY` 显式传入应用容器；192 等需要
+  VPN/代理访问上游的服务器应在目标 `.env` 同时配置前两个变量。`UPSTREAM_SYSTEM_PROXY_ENABLED`
+  只影响位置画像选择；真正让 Go 上游客户端走代理的是 `HTTP_PROXY/HTTPS_PROXY`；
+- Compose 为 Linux 容器声明 `host.docker.internal:host-gateway`。代理若监听在宿主机本地端口，
+  `.env` 应使用 `http://host.docker.internal:<port>`，不能写成容器自身的 `127.0.0.1`；代理还必须
+  监听 Docker 网桥或 `0.0.0.0`，仅监听宿主机 loopback 时容器无法连接；
 - Docker 构建支持 GOPROXY 主备切换；
 - 运行镜像只保留静态服务二进制、CA、时区数据库和健康检查所需工具，不携带 Go 编译器；
 - `APP_VERSION` 按部署要求固定取最近 Git Release tag，源码补丁构建不会改变页面显示版本；镜像归档
   SHA-256 和镜像 ID 用于确认同一 Release 版本下的实际部署产物；
 - 镜像传输前后强制比较压缩包 SHA-256，服务器内部再比较已加载镜像与运行容器的镜像 ID，不一致立即失败；
-- 构建后默认将 Buildx 缓存控制在 20GB 内，并清理带有 new-api 镜像标签的无引用旧镜像；
+- Docker Desktop 对 `--max-used-space` 的执行不可靠时会留下大量内部 Buildx 缓存，因此构建后默认
+  使用 `docker buildx prune --all --force` 清空全部可回收缓存（包括 frontend 镜像）；如需以磁盘
+  空间换取下一次构建速度，可显式设置 `DEPLOY_PRUNE_BUILD_CACHE=false`；
 - 部署脚本等待容器健康，并再次请求 `/api/status`。
 
-部署缓存清理可通过 `DEPLOY_PRUNE_BUILD_CACHE`、`DEPLOY_BUILDX_CACHE_MAX_USED_SPACE`
-和 `DEPLOY_PRUNE_PROJECT_IMAGES` 调整。上游模型巡检总开关为
+部署缓存清理可通过 `DEPLOY_PRUNE_BUILD_CACHE` 和 `DEPLOY_PRUNE_PROJECT_IMAGES` 调整。上游模型巡检总开关为
 `CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED`；部署脚本会在目标 `.env` 中补齐该配置，
 设置为 `false` 后即使渠道自身启用了巡检也不会执行。
 
@@ -483,8 +501,9 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 ## 8. 上游位置与客户端 IP 隐私
 
 - JSON 模型请求在最终出站边界执行位置隐私策略，常见协议位置字段、参数覆盖和渠道正文直通均纳入
-  过滤；隐私过滤不再依赖大小写敏感 marker 快路径，每个 JSON 出站请求都会解析，并使用规范化键
-  匹配大小写、连字符、点号、下划线及嵌套数组中的敏感网络字段；
+  过滤；渠道正文直通先以固定内存流式扫描 JSON 对象键，仅在发现位置、网络或相关容器候选键时才
+  整体解析过滤。扫描支持大小写、连字符、点号、下划线、跨缓冲区和 `\uXXXX` 转义键；无候选键的
+  大请求直接复用原 `BodyStorage`，避免磁盘缓存正文重新读入堆内存并放大；
 - `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
 - `UPSTREAM_LOCATION_MODE=auto` 根据真实网络路径选择画像：渠道配置代理或 `UPSTREAM_SYSTEM_PROXY_ENABLED=true` 时使用 VPN/代理出口画像，否则使用宿主网络出口画像；两套画像可分别由 `UPSTREAM_EGRESS_LOCATION_*` 和 `UPSTREAM_HOST_LOCATION_*` 显式配置；
 - `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径和已启用的系统代理/VPN 路径检查 ChatGPT、Claude 连通性；两者均可建立 HTTP 连接后，通过 Cloudflare trace 获取该路径的实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度。显式环境变量始终优先，探测只补充空字段；探测失败不会放行客户端位置；
@@ -514,10 +533,11 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 - 保留脱敏和限长后的供应商结构化错误信息、状态码、Content-Type、响应字节数及上游 request ID；
 - Ollama SSE 解码失败仅记录行字节数。
 
-### 9.2 已解决：位置隐私 marker 快路径漏检
+### 9.2 已解决：位置隐私 marker 快路径漏检和大请求内存放大
 
-已删除大小写敏感的 marker 预扫描。所有 JSON 出站请求统一解析后过滤，测试覆盖顶层字段、大小写、
-连字符、点号、下划线、嵌套对象和嵌套数组。
+原大小写敏感 marker 预扫描已替换为常量内存 JSON 对象键扫描器。它会解码转义键并使用与完整过滤器
+相同的规范化候选键；只有命中候选键才调用 `BodyStorage.Bytes()` 和完整 JSON 解析。测试覆盖顶层字段、
+大小写、连字符、点号、下划线、跨 32KB 缓冲区、转义键、读取位置恢复及无隐私字段的大正文零复制路径。
 
 ### 9.3 订阅 OAuth 兼容实现不能等同于官方公开 API 合规
 

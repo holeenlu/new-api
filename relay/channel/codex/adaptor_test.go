@@ -273,6 +273,7 @@ func TestCodexLocalConcurrencyLimitRemainsRetryable(t *testing.T) {
 	var apiErr *types.NewAPIError
 	require.ErrorAs(t, err, &apiErr)
 	require.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeOAuthChannelConcurrencyLimit, apiErr.GetErrorCode())
 	require.False(t, types.IsSkipRetryError(apiErr))
 }
 

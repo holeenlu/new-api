@@ -22,7 +22,11 @@ EXTRA_SERVICES=${EXTRA_SERVICES:-}
 
 CONTROL_PATH="/tmp/new-api-deploy-ssh-${UID}-$$"
 IMAGE_ARCHIVE=$(mktemp "${TMPDIR:-/tmp}/new-api-image.XXXXXX")
+SOURCE_ARCHIVE=$(mktemp "${TMPDIR:-/tmp}/new-api-source.XXXXXX")
+SOURCE_MANIFEST=$(mktemp "${TMPDIR:-/tmp}/new-api-manifest.XXXXXX")
 REMOTE_ARCHIVE="/tmp/$(basename "$IMAGE_ARCHIVE")"
+REMOTE_SOURCE_ARCHIVE="/tmp/$(basename "$SOURCE_ARCHIVE")"
+REMOTE_SOURCE_MANIFEST="/tmp/$(basename "$SOURCE_MANIFEST")"
 ASKPASS_SCRIPT=""
 SSH_MASTER_ACTIVE=false
 SSH_OPTIONS=(
@@ -34,9 +38,10 @@ SSH_OPTIONS=(
 )
 
 cleanup() {
-  rm -f "$IMAGE_ARCHIVE" "$ASKPASS_SCRIPT"
+  rm -f "$IMAGE_ARCHIVE" "$SOURCE_ARCHIVE" "$SOURCE_MANIFEST" "$ASKPASS_SCRIPT"
   if [[ "$SSH_MASTER_ACTIVE" == true ]]; then
-    ssh_remote "$DEPLOY_TARGET" "rm -f '$REMOTE_ARCHIVE'" >/dev/null 2>&1 || true
+    ssh_remote "$DEPLOY_TARGET" \
+      "rm -f '$REMOTE_ARCHIVE' '$REMOTE_SOURCE_ARCHIVE' '$REMOTE_SOURCE_MANIFEST'" >/dev/null 2>&1 || true
     ssh_remote -O exit "$DEPLOY_TARGET" >/dev/null 2>&1 || true
   fi
   rm -f "$CONTROL_PATH"
@@ -84,7 +89,7 @@ ssh_bash() {
 }
 
 deploy_ensure_docker_cli
-deploy_require_commands docker ssh scp tar gzip curl git date awk
+deploy_require_commands docker ssh scp tar gzip curl git date awk sort
 docker info >/dev/null 2>&1 || deploy_die "Docker daemon is unavailable"
 docker buildx version >/dev/null 2>&1 || deploy_die "docker buildx is unavailable"
 for file in docker-compose.yml docker-compose.deploy.yml "$TARGET_COMPOSE"; do
@@ -109,6 +114,7 @@ deploy_log "Synchronizing deployment files to $REMOTE_DIR"
 COPYFILE_DISABLE=1 tar \
   --no-xattrs \
   --exclude='./.git' \
+  --exclude='./.new-api-deploy-manifest' \
   --exclude='./.DS_Store' \
   --exclude='._*' \
   --exclude='./.env' \
@@ -121,8 +127,120 @@ COPYFILE_DISABLE=1 tar \
   --exclude='./web/default/dist' \
   --exclude='./web/classic/node_modules' \
   --exclude='./web/classic/dist' \
-  -czf - -C "$ROOT_DIR" . \
-  | ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR' && cd '$REMOTE_DIR' && tar -xzf - && rm -f docker-compose.override.yml"
+  -czf "$SOURCE_ARCHIVE" -C "$ROOT_DIR" .
+tar -tzf "$SOURCE_ARCHIVE" \
+  | awk 'substr($0, length($0), 1) != "/" { sub(/^\.\//, ""); if (length($0) > 0) print }' \
+  | LC_ALL=C sort -u >"$SOURCE_MANIFEST"
+scp_remote "$SOURCE_ARCHIVE" "$DEPLOY_TARGET:$REMOTE_SOURCE_ARCHIVE"
+scp_remote "$SOURCE_MANIFEST" "$DEPLOY_TARGET:$REMOTE_SOURCE_MANIFEST"
+ssh_bash "$REMOTE_DIR" "$REMOTE_SOURCE_ARCHIVE" "$REMOTE_SOURCE_MANIFEST" <<'REMOTE_SYNC'
+set -Eeuo pipefail
+
+remote_dir=$1
+source_archive=$2
+next_manifest=$3
+deployed_manifest="$remote_dir/.new-api-deploy-manifest"
+
+mkdir -p "$remote_dir"
+cd "$remote_dir"
+
+validate_deploy_path() {
+  local path=$1
+  if [[ -z "$path" || "$path" == /* || "$path" == "." ]]; then
+    echo "Unsafe deployment manifest path: $path" >&2
+    return 1
+  fi
+  case "/$path/" in
+    *"/../"*|*"/./"*)
+      echo "Unsafe deployment manifest path: $path" >&2
+      return 1
+      ;;
+  esac
+}
+
+is_persistent_deploy_path() {
+  case "$1" in
+    .env|data|data/*|logs|logs/*|backups|backups/*|caddy|caddy/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+while IFS= read -r path || [[ -n "$path" ]]; do
+  validate_deploy_path "$path"
+  if is_persistent_deploy_path "$path"; then
+    echo "Persistent path unexpectedly present in deployment manifest: $path" >&2
+    exit 1
+  fi
+done <"$next_manifest"
+
+if [[ -f "$deployed_manifest" ]]; then
+  while IFS= read -r path || [[ -n "$path" ]]; do
+    validate_deploy_path "$path"
+  done <"$deployed_manifest"
+fi
+
+stale_manifest=$(mktemp "$remote_dir/.new-api-stale.XXXXXX")
+trap 'rm -f "$stale_manifest"' EXIT
+if [[ -f "$deployed_manifest" ]]; then
+  awk 'NR == FNR { current[$0] = 1; next } !($0 in current)' \
+    "$next_manifest" "$deployed_manifest" >"$stale_manifest"
+fi
+
+declare -a stale_directories=()
+while IFS= read -r path || [[ -n "$path" ]]; do
+  if is_persistent_deploy_path "$path"; then
+    continue
+  fi
+  if [[ ! -d "$path" || -L "$path" ]]; then
+    rm -f -- "$path"
+  fi
+  parent=${path%/*}
+  while [[ "$parent" != "$path" && -n "$parent" && "$parent" != "." ]]; do
+    if ! is_persistent_deploy_path "$parent"; then
+      stale_directories+=("$parent")
+    fi
+    path=$parent
+    parent=${path%/*}
+  done
+done <"$stale_manifest"
+
+# These files predate the managed manifest and are no longer valid deployment inputs.
+for path in \
+  bin/deploy-104.128.92.169.sh \
+  deploy-server-104.128.92.169.sh \
+  docker-compose.server-104.128.92.169.yml \
+  Caddyfile.104.128.92.169 \
+  docker-compose.override.yml; do
+  rm -f -- "$path"
+done
+
+while IFS= read -r path || [[ -n "$path" ]]; do
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    rmdir -- "$path" 2>/dev/null || {
+      echo "Cannot replace non-empty directory with deployed file: $path" >&2
+      exit 1
+    }
+  fi
+done <"$next_manifest"
+
+tar -xzf "$source_archive"
+manifest_temp="$deployed_manifest.tmp.$$"
+cp "$next_manifest" "$manifest_temp"
+mv -f "$manifest_temp" "$deployed_manifest"
+rm -f "$source_archive" "$next_manifest"
+
+for ((pass = 0; pass < 64 && ${#stale_directories[@]} > 0; pass++)); do
+  removed=false
+  for path in "${stale_directories[@]}"; do
+    if rmdir -- "$path" 2>/dev/null; then
+      removed=true
+    fi
+  done
+  [[ "$removed" == true ]] || break
+done
+REMOTE_SYNC
 
 deploy_log "Preparing remote environment"
 ssh_bash "$REMOTE_DIR" <<'REMOTE_ENV'
@@ -186,6 +304,28 @@ echo "Loaded image: ${loaded_image_id#sha256:} version=$loaded_version"
 cd "$remote_dir"
 export NEW_API_IMAGE=$remote_image
 compose=(docker compose --env-file .env -f docker-compose.yml -f docker-compose.deploy.yml -f "$target_compose")
+
+keep_caddy=false
+if [[ -n "$extra_services" ]]; then
+  read -r -a configured_services <<<"$extra_services"
+  for service in "${configured_services[@]}"; do
+    if [[ "$service" == "caddy" ]]; then
+      keep_caddy=true
+      break
+    fi
+  done
+fi
+if [[ "$keep_caddy" == false ]] && docker inspect new-api-caddy >/dev/null 2>&1; then
+  caddy_service=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' new-api-caddy)
+  caddy_working_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' new-api-caddy)
+  canonical_remote_dir=$(pwd -P)
+  if [[ "$caddy_service" == "caddy" && ( "$caddy_working_dir" == "$remote_dir" || "$caddy_working_dir" == "$canonical_remote_dir" ) ]]; then
+    docker rm -f new-api-caddy
+  else
+    echo "Preserving new-api-caddy because its Compose labels do not match this deployment" >&2
+  fi
+fi
+
 "${compose[@]}" up -d --no-build redis postgres
 "${compose[@]}" up -d --no-build --force-recreate new-api
 if [[ -n "$extra_services" ]]; then

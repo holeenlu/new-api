@@ -31,6 +31,34 @@ func TestRetryBoundaryDefaultsSubscriptionOAuthToCurrentChannel(t *testing.T) {
 	assert.False(t, boundary.Allows(alternate))
 }
 
+func TestRetryBoundaryAllowsDefaultCodexFailoverOnlyAfterConcurrencyLimit(t *testing.T) {
+	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
+	matching := retryPolicyChannel(2, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
+	differentEndpoint := retryPolicyChannel(3, constant.ChannelTypeCodex, "https://gateway.example", nil)
+	boundary := NewRetryBoundary(initial)
+	require.NotNil(t, boundary)
+
+	boundary.MarkAttempt(initial)
+	assert.False(t, boundary.Allows(matching))
+
+	boundary.AllowDefaultSubscriptionOAuthFailover()
+	assert.True(t, boundary.Allows(matching))
+	assert.False(t, boundary.Allows(differentEndpoint))
+}
+
+func TestRetryBoundaryDoesNotOverrideExplicitSubscriptionIsolation(t *testing.T) {
+	policy := &dto.ChannelDataPolicy{RetryIsolation: dto.RetryIsolationChannel}
+	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", policy)
+	alternate := retryPolicyChannel(2, constant.ChannelTypeCodex, "https://chatgpt.com", policy)
+	boundary := NewRetryBoundary(initial)
+	require.NotNil(t, boundary)
+
+	boundary.MarkAttempt(initial)
+	boundary.AllowDefaultSubscriptionOAuthFailover()
+
+	assert.False(t, boundary.Allows(alternate))
+}
+
 func TestRetryBoundaryAllowsAnotherKeyOnlyWithinCurrentChannel(t *testing.T) {
 	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
 	initial.ChannelInfo.IsMultiKey = true

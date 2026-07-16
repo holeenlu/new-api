@@ -245,6 +245,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		newAPIError = service.ApplyChannelErrorPolicy(channel.Type, newAPIError)
+		if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, newAPIError) && retryParam.Boundary != nil {
+			retryParam.Boundary.AllowDefaultSubscriptionOAuthFailover()
+		}
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)

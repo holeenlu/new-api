@@ -429,7 +429,7 @@ func doCodexHTTPResponseRequest(c *gin.Context, a *Adaptor, info *relaycommon.Re
 		c.Header("Retry-After", "1")
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("codex OAuth channel concurrency limit reached; retry later"),
-			types.ErrorCodeDoRequestFailed,
+			types.ErrorCodeOAuthChannelConcurrencyLimit,
 			http.StatusServiceUnavailable,
 		)
 	}
