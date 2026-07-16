@@ -34,12 +34,16 @@ func TestRetryBoundaryDefaultsSubscriptionOAuthToCurrentChannel(t *testing.T) {
 func TestRetryBoundaryAllowsAnotherKeyOnlyWithinCurrentChannel(t *testing.T) {
 	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
 	initial.ChannelInfo.IsMultiKey = true
+	initial.Key = "key-1\nkey-2"
 	alternate := retryPolicyChannel(2, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
 	boundary := NewRetryBoundary(initial)
 	require.NotNil(t, boundary)
 
-	boundary.MarkAttempt(initial)
+	boundary.MarkAttempt(initial, 0)
 	assert.True(t, boundary.Allows(initial))
+	assert.Equal(t, map[int]struct{}{0: {}}, boundary.UsedMultiKeyIndexes(initial.Id))
+	boundary.MarkAttempt(initial, 1)
+	assert.False(t, boundary.Allows(initial))
 	assert.False(t, boundary.Allows(alternate))
 }
 

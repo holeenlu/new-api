@@ -36,10 +36,18 @@ type CodexOAuthUpstreamError struct {
 	StatusCode int
 	Code       types.ErrorCode
 	Message    string
+	Cause      error
 }
 
 func (e *CodexOAuthUpstreamError) Error() string {
 	return e.Message
+}
+
+func (e *CodexOAuthUpstreamError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 func loadCodexOAuthConfig() (codexOAuthConfig, error) {
@@ -63,12 +71,50 @@ func loadCodexOAuthConfig() (codexOAuthConfig, error) {
 
 func newCodexOAuthUpstreamError(statusCode int, operation string) error {
 	switch statusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		message := "OAuth request was rejected"
+		if operation == "code exchange" {
+			message = "OAuth authorization code was rejected; start a new authorization and verify the redirect URI configuration"
+		} else if operation == "refresh" {
+			message = "OAuth credential refresh was rejected; reauthorize the account"
+		}
+		return &CodexOAuthUpstreamError{
+			StatusCode: statusCode,
+			Code:       types.ErrorCodeInvalidRequest,
+			Message:    message,
+		}
 	case http.StatusUnauthorized:
 		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeOAuthUnauthorized, Message: "OAuth credential is invalid or expired"}
 	case http.StatusForbidden:
 		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeOAuthForbidden, Message: "OAuth account is not permitted to access this resource"}
+	case http.StatusTooManyRequests:
+		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeBadResponseStatusCode, Message: "OAuth authorization is temporarily rate limited; retry after a short delay"}
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeBadResponseStatusCode, Message: "OAuth authorization service is temporarily unavailable; retry later"}
 	default:
 		return &CodexOAuthUpstreamError{StatusCode: statusCode, Code: types.ErrorCodeBadResponseStatusCode, Message: fmt.Sprintf("codex oauth %s failed: status=%d", operation, statusCode)}
+	}
+}
+
+func newCodexOAuthTransportError(err error, operation string) error {
+	message := "OAuth authorization could not reach auth.openai.com"
+	if errors.Is(err, context.DeadlineExceeded) {
+		message = "OAuth authorization timed out while contacting auth.openai.com"
+	} else if errors.Is(err, context.Canceled) {
+		message = "OAuth authorization request was cancelled"
+	}
+	return &CodexOAuthUpstreamError{
+		Code:    types.ErrorCodeDoRequestFailed,
+		Message: message + " during " + operation,
+		Cause:   err,
+	}
+}
+
+func newCodexOAuthInvalidResponseError(operation string, cause error) error {
+	return &CodexOAuthUpstreamError{
+		Code:    types.ErrorCodeBadResponseBody,
+		Message: "OAuth authorization returned an invalid success response during " + operation,
+		Cause:   cause,
 	}
 }
 
@@ -165,7 +211,7 @@ func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier s
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, newCodexOAuthTransportError(err, "code exchange")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -177,10 +223,10 @@ func ExchangeCodexAuthorizationCode(ctx context.Context, code string, verifier s
 		ExpiresIn    int    `json:"expires_in"`
 	}
 	if err := common.DecodeJson(resp.Body, &payload); err != nil {
-		return nil, err
+		return nil, newCodexOAuthInvalidResponseError("code exchange", err)
 	}
 	if strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
-		return nil, errors.New("codex oauth code exchange response missing fields")
+		return nil, newCodexOAuthInvalidResponseError("code exchange", errors.New("required token fields are missing"))
 	}
 	return &CodexOAuthTokenResult{AccessToken: strings.TrimSpace(payload.AccessToken), RefreshToken: strings.TrimSpace(payload.RefreshToken), ExpiresAt: time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)}, nil
 }
@@ -211,7 +257,7 @@ func refreshCodexOAuthToken(
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, newCodexOAuthTransportError(err, "credential refresh")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -225,15 +271,19 @@ func refreshCodexOAuthToken(
 	}
 
 	if err := common.DecodeJson(resp.Body, &payload); err != nil {
-		return nil, err
+		return nil, newCodexOAuthInvalidResponseError("credential refresh", err)
 	}
-	if strings.TrimSpace(payload.AccessToken) == "" || strings.TrimSpace(payload.RefreshToken) == "" || payload.ExpiresIn <= 0 {
-		return nil, errors.New("codex oauth refresh response missing fields")
+	if strings.TrimSpace(payload.AccessToken) == "" || payload.ExpiresIn <= 0 {
+		return nil, newCodexOAuthInvalidResponseError("credential refresh", errors.New("required token fields are missing"))
+	}
+	rotatedRefreshToken := strings.TrimSpace(payload.RefreshToken)
+	if rotatedRefreshToken == "" {
+		rotatedRefreshToken = rt
 	}
 
 	return &CodexOAuthTokenResult{
 		AccessToken:  strings.TrimSpace(payload.AccessToken),
-		RefreshToken: strings.TrimSpace(payload.RefreshToken),
+		RefreshToken: rotatedRefreshToken,
 		ExpiresAt:    time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second),
 	}, nil
 }

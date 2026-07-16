@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -244,10 +246,42 @@ func validateModelPricingOption(key, value string) error {
 		if err := common.UnmarshalJsonStr(value, &ratios); err != nil {
 			return fmt.Errorf("%s 必须是数值映射: %w", key, err)
 		}
-	case "billing_setting.billing_mode", "billing_setting.billing_expr":
+		for modelName, ratio := range ratios {
+			if strings.TrimSpace(modelName) == "" {
+				return fmt.Errorf("%s 不允许空模型名", key)
+			}
+			if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 {
+				return fmt.Errorf("%s[%s] 必须是有限的非负数", key, modelName)
+			}
+		}
+	case "billing_setting.billing_mode":
 		var values map[string]string
 		if err := common.UnmarshalJsonStr(value, &values); err != nil {
 			return fmt.Errorf("%s 必须是字符串映射: %w", key, err)
+		}
+		for modelName, mode := range values {
+			if strings.TrimSpace(modelName) == "" {
+				return fmt.Errorf("%s 不允许空模型名", key)
+			}
+			if mode != billing_setting.BillingModeRatio && mode != billing_setting.BillingModeTieredExpr {
+				return fmt.Errorf("%s[%s] 的计费模式 %q 无效", key, modelName, mode)
+			}
+		}
+	case "billing_setting.billing_expr":
+		var values map[string]string
+		if err := common.UnmarshalJsonStr(value, &values); err != nil {
+			return fmt.Errorf("%s 必须是字符串映射: %w", key, err)
+		}
+		for modelName, expr := range values {
+			if strings.TrimSpace(modelName) == "" {
+				return fmt.Errorf("%s 不允许空模型名", key)
+			}
+			if strings.TrimSpace(expr) == "" {
+				return fmt.Errorf("%s[%s] 不允许空表达式", key, modelName)
+			}
+			if err := billing_setting.SmokeTestExpr(expr); err != nil {
+				return fmt.Errorf("%s[%s] 校验失败: %w", key, modelName, err)
+			}
 		}
 	case "ExposeRatioEnabled":
 		if _, err := strconv.ParseBool(value); err != nil {
@@ -255,6 +289,46 @@ func validateModelPricingOption(key, value string) error {
 		}
 	default:
 		return fmt.Errorf("不支持批量修改配置项 %s", key)
+	}
+	return nil
+}
+
+func validateModelPricingOptionSet(options map[string]string, existingModes, existingExprs string) error {
+	for key, value := range options {
+		if err := validateModelPricingOption(key, value); err != nil {
+			return err
+		}
+	}
+
+	modeValue, hasModes := options["billing_setting.billing_mode"]
+	exprValue, hasExprs := options["billing_setting.billing_expr"]
+	if !hasModes && !hasExprs {
+		return nil
+	}
+	if !hasModes {
+		modeValue = existingModes
+	}
+	if !hasExprs {
+		exprValue = existingExprs
+	}
+	if strings.TrimSpace(modeValue) == "" {
+		modeValue = "{}"
+	}
+	if strings.TrimSpace(exprValue) == "" {
+		exprValue = "{}"
+	}
+	var modes map[string]string
+	var exprs map[string]string
+	if err := common.UnmarshalJsonStr(modeValue, &modes); err != nil {
+		return err
+	}
+	if err := common.UnmarshalJsonStr(exprValue, &exprs); err != nil {
+		return err
+	}
+	for modelName, mode := range modes {
+		if mode == billing_setting.BillingModeTieredExpr && strings.TrimSpace(exprs[modelName]) == "" {
+			return fmt.Errorf("模型 %s 启用了分层计费，但未配置计费表达式", modelName)
+		}
 	}
 	return nil
 }
@@ -270,12 +344,16 @@ func UpdateModelPricingOptions(c *gin.Context) {
 		return
 	}
 
+	common.OptionMapRWMutex.RLock()
+	existingModes := common.OptionMap["billing_setting.billing_mode"]
+	existingExprs := common.OptionMap["billing_setting.billing_expr"]
+	common.OptionMapRWMutex.RUnlock()
+	if err := validateModelPricingOptionSet(request.Options, existingModes, existingExprs); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
 	keys := make([]string, 0, len(request.Options))
-	for key, value := range request.Options {
-		if err := validateModelPricingOption(key, value); err != nil {
-			common.ApiErrorMsg(c, err.Error())
-			return
-		}
+	for key := range request.Options {
 		keys = append(keys, key)
 	}
 	if err := model.UpdateOptionsBulk(request.Options); err != nil {

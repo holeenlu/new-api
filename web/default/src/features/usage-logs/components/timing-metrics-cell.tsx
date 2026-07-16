@@ -31,6 +31,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { formatUseTime } from '@/lib/format'
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 import { cn } from '@/lib/utils'
 
 import { getFirstResponseTimeColor, getResponseTimeColor } from '../lib/format'
@@ -99,9 +100,7 @@ export function TimingMetricsCell(props: TimingMetricsCellProps) {
           <span className='text-muted-foreground shrink-0'>
             {t('First token')}
           </span>
-          <span
-            className={cn('tabular-nums', textColorMap[firstTokenVariant])}
-          >
+          <span className={cn('tabular-nums', textColorMap[firstTokenVariant])}>
             {firstTokenLabel}
           </span>
         </div>
@@ -116,9 +115,7 @@ export function TimingMetricsCell(props: TimingMetricsCellProps) {
             )}
           />
         )}
-        <span className='text-muted-foreground shrink-0'>
-          {t('Duration')}
-        </span>
+        <span className='text-muted-foreground shrink-0'>{t('Duration')}</span>
         <span className={cn('tabular-nums', textColorMap[totalTimeVariant])}>
           {totalTimeLabel}
         </span>
@@ -128,9 +125,7 @@ export function TimingMetricsCell(props: TimingMetricsCellProps) {
 
   if (indicator === 'dot') {
     return (
-      <div className={cn('flex items-stretch', props.className)}>
-        {labels}
-      </div>
+      <div className={cn('flex items-stretch', props.className)}>{labels}</div>
     )
   }
 
@@ -197,7 +192,12 @@ export function StreamTpsCell(props: StreamTpsCellProps) {
                   <p>
                     {t('Stream Status')}: {t('Error')}
                   </p>
-                  <p>{props.streamStatus?.end_reason || 'unknown'}</p>
+                  <p>
+                    {localizeErrorMessage(
+                      props.streamStatus?.end_reason,
+                      '未知'
+                    )}
+                  </p>
                   {(props.streamStatus?.error_count ?? 0) > 0 && (
                     <p>
                       {t('Soft Errors')}: {props.streamStatus?.error_count}

@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 )
 
@@ -16,16 +18,13 @@ type CodexCredentialRefreshOptions struct {
 	ResetCaches bool
 }
 
-type CodexOAuthKey struct {
-	IDToken      string `json:"id_token,omitempty"`
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
+type CodexOAuthKey = dto.CodexOAuthCredential
 
-	AccountID   string `json:"account_id,omitempty"`
-	LastRefresh string `json:"last_refresh,omitempty"`
-	Email       string `json:"email,omitempty"`
-	Type        string `json:"type,omitempty"`
-	Expired     string `json:"expired,omitempty"`
+var codexChannelCredentialRefreshLocks sync.Map
+
+func codexChannelCredentialRefreshLock(channelID int) *sync.Mutex {
+	lock, _ := codexChannelCredentialRefreshLocks.LoadOrStore(channelID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func parseCodexOAuthKey(raw string) (*CodexOAuthKey, error) {
@@ -40,6 +39,10 @@ func parseCodexOAuthKey(raw string) (*CodexOAuthKey, error) {
 }
 
 func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts CodexCredentialRefreshOptions) (*CodexOAuthKey, *model.Channel, error) {
+	refreshLock := codexChannelCredentialRefreshLock(channelID)
+	refreshLock.Lock()
+	defer refreshLock.Unlock()
+
 	ch, err := model.GetChannelById(channelID, true)
 	if err != nil {
 		return nil, nil, err
@@ -94,6 +97,7 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 	if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
 		return nil, nil, err
 	}
+	ch.Key = string(encoded)
 
 	if opts.ResetCaches {
 		model.InitChannelCache()

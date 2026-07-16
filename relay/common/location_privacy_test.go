@@ -110,6 +110,36 @@ func TestFilterUpstreamLocationDataClientAllowsLocationButStillRemovesIP(t *test
 	}`, string(out))
 }
 
+func TestFilterUpstreamLocationDataNormalizesSensitiveKeyVariants(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+
+	input := []byte(`{
+		"REMOTE_ADDR":"203.0.113.10",
+		"Cf-Connecting-Ip":"203.0.113.11",
+		"metadata":{
+			"Remote.Addr":"203.0.113.12",
+			"nested":[{"TRUE-CLIENT-IP":"203.0.113.13","keep":"value"}]
+		},
+		"model":"gpt-5"
+	}`)
+
+	out, changed, err := FilterUpstreamLocationData(input)
+
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.JSONEq(t, `{"metadata":{"nested":[{"keep":"value"}]},"model":"gpt-5"}`, string(out))
+}
+
+func TestFilterUpstreamLocationDataParsesEveryJSONRequest(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+
+	_, _, err := FilterUpstreamLocationData([]byte(`{"model":`))
+
+	require.Error(t, err)
+}
+
 func TestFilterUpstreamLocationDataAutoSelectsHostOrProxyProfile(t *testing.T) {
 	restoreLocationSettings(t)
 	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeAuto))

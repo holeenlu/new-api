@@ -82,6 +82,12 @@ func CompleteCodexOAuth(c *gin.Context) {
 	defer cancel()
 	result, err := service.ExchangeCodexAuthorizationCode(ctx, code, verifier)
 	if err != nil {
+		logMessage := err.Error()
+		var upstreamErr *service.CodexOAuthUpstreamError
+		if errors.As(err, &upstreamErr) && upstreamErr.Cause != nil {
+			logMessage += ": " + upstreamErr.Cause.Error()
+		}
+		common.SysError("Codex OAuth authorization failed: " + common.RedactSensitiveCredentials(logMessage))
 		respondCodexOAuthError(c, err, "OAuth authorization failed")
 		return
 	}

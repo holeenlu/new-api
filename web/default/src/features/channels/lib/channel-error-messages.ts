@@ -16,26 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import i18next from 'i18next'
+import {
+  localizeErrorCode,
+  localizeErrorMessage,
+} from '@/lib/localize-error-message'
 
 export function getChannelErrorMessage(
   errorCode: string | undefined,
   fallback: string
 ): string {
-  switch (errorCode) {
-    case 'oauth_unauthorized':
-      return i18next.t(
-        'OAuth credential is invalid or expired. Reauthorize or refresh the channel credential.'
-      )
-    case 'oauth_forbidden':
-      return i18next.t(
-        'OAuth account cannot access this resource. Check the subscription and account permissions.'
-      )
-    case 'model_not_supported':
-      return i18next.t(
-        'This model is not available to the OAuth account. Fetch the upstream model list or choose another model.'
-      )
-    default:
-      return fallback
-  }
+  return localizeErrorCode(errorCode) ?? localizeErrorMessage(fallback)
 }

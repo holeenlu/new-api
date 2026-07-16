@@ -214,15 +214,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		addUsedChannel(c, channel.Id)
 		attempt := len(c.GetStringSlice("use_channel"))
 		service.ApplyRelayDataPolicyHeaders(c, channel, attempt)
-		if retryParam.Boundary == nil {
-			retryParam.Boundary = service.NewRetryBoundary(channel)
-			if retryParam.Boundary != nil {
-				retryParam.CandidateFilter = retryParam.Boundary.Allows
-			}
-		}
-		if retryParam.Boundary != nil {
-			retryParam.Boundary.MarkAttempt(channel)
-		}
+		trackRetryAttempt(c, retryParam, channel)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -287,6 +279,23 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	c.Set("use_channel", useChannel)
 }
 
+func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) {
+	if retryParam.Boundary == nil {
+		retryParam.Boundary = service.NewRetryBoundary(channel)
+		if retryParam.Boundary != nil {
+			retryParam.CandidateFilter = retryParam.Boundary.Allows
+		}
+	}
+	if retryParam.Boundary == nil {
+		return
+	}
+	if channel.ChannelInfo.IsMultiKey {
+		retryParam.Boundary.MarkAttempt(channel, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
+		return
+	}
+	retryParam.Boundary.MarkAttempt(channel)
+}
+
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
 	if request == nil {
 		return &types.TokenCountMeta{}
@@ -335,7 +344,11 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
+	var excludedMultiKeyIndexes map[int]struct{}
+	if retryParam.Boundary != nil {
+		excludedMultiKeyIndexes = retryParam.Boundary.UsedMultiKeyIndexes(channel.Id)
+	}
+	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName, excludedMultiKeyIndexes)
 	if newAPIError != nil {
 		return nil, newAPIError
 	}
@@ -390,7 +403,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d): %s; detail: %s", channelError.ChannelId, errorSummary, errorDetail))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
+	if service.ShouldDisableChannelForType(channelError.ChannelType, err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, errorSummary)
 		})
@@ -556,7 +569,11 @@ func RelayTask(c *gin.Context) {
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
 			if retryParam.GetRetry() > 0 {
-				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
+				var excludedMultiKeyIndexes map[int]struct{}
+				if retryParam.Boundary != nil {
+					excludedMultiKeyIndexes = retryParam.Boundary.UsedMultiKeyIndexes(channel.Id)
+				}
+				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName, excludedMultiKeyIndexes); setupErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
 					break
 				}
@@ -572,6 +589,7 @@ func RelayTask(c *gin.Context) {
 		}
 
 		addUsedChannel(c, channel.Id)
+		trackRetryAttempt(c, retryParam, channel)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {

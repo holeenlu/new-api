@@ -17,14 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { AxiosError } from 'axios'
-import i18next from 'i18next'
 import { toast } from 'sonner'
+
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 
 export function handleServerError(error: unknown) {
   // eslint-disable-next-line no-console
   console.log(error)
 
-  let errMsg = i18next.t('Something went wrong!')
+  let errMsg = '发生错误'
 
   if (
     error &&
@@ -32,12 +33,12 @@ export function handleServerError(error: unknown) {
     'status' in error &&
     Number(error.status) === 204
   ) {
-    errMsg = i18next.t('Content not found.')
+    errMsg = '未找到内容'
   }
 
   if (error instanceof AxiosError) {
-    errMsg = error.response?.data.title
+    errMsg = localizeErrorMessage(error.response?.data || error, errMsg)
   }
 
-  toast.error(errMsg)
+  toast.error(localizeErrorMessage(errMsg))
 }

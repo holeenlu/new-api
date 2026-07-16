@@ -1,44 +1,27 @@
 package common
 
 import (
-	"bytes"
 	"io"
 	"testing"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
 )
 
-func TestStorageMayContainSensitiveLocationDataFindsMarkerAcrossChunks(t *testing.T) {
-	prefix := bytes.Repeat([]byte{'x'}, 32*1024-5)
-	storage := &diskLikeBodyStorage{Reader: bytes.NewReader(append(prefix, []byte(`"user_location"`)...))}
-	_, err := storage.Seek(17, io.SeekStart)
+func TestNewPrivacyFilteredPassThroughJSONBodyFiltersNormalizedSensitiveKeys(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+	storage, err := rootcommon.CreateBodyStorage([]byte(`{"metadata":{"TRUE-CLIENT-IP":"203.0.113.10","keep":"value"}}`))
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, storage.Close()) })
 
-	found, err := storageMayContainSensitiveLocationData(storage)
+	body, _, closer, err := NewPrivacyFilteredPassThroughJSONBody(storage)
 
 	require.NoError(t, err)
-	require.True(t, found)
-	offset, err := storage.Seek(0, io.SeekCurrent)
+	if closer != nil {
+		t.Cleanup(func() { require.NoError(t, closer.Close()) })
+	}
+	output, err := io.ReadAll(body)
 	require.NoError(t, err)
-	require.Equal(t, int64(17), offset)
-}
-
-type diskLikeBodyStorage struct {
-	*bytes.Reader
-}
-
-func (s *diskLikeBodyStorage) Bytes() ([]byte, error) {
-	return nil, nil
-}
-
-func (s *diskLikeBodyStorage) Size() int64 {
-	return s.Reader.Size()
-}
-
-func (s *diskLikeBodyStorage) IsDisk() bool {
-	return true
-}
-
-func (s *diskLikeBodyStorage) Close() error {
-	return nil
+	require.JSONEq(t, `{"metadata":{"keep":"value"}}`, string(output))
 }

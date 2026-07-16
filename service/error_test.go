@@ -64,7 +64,7 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
-func TestRelayErrorHandlerIncludesInvalidJSONBodyInErrorAndLog(t *testing.T) {
+func TestRelayErrorHandlerOmitsInvalidJSONBodyFromErrorAndLog(t *testing.T) {
 	withDebugEnabled(t, false)
 
 	body := strings.Repeat("b", common.LocalLogContentLimit+256)
@@ -83,13 +83,18 @@ func TestRelayErrorHandlerIncludesInvalidJSONBodyInErrorAndLog(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusInternalServerError,
 		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/plain"}, "X-Request-Id": []string{"req-upstream"}},
 	}
 
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+	newAPIError := RelayErrorHandler(context.Background(), resp)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, fmt.Sprintf("bad response status code 500, body: %s", body), newAPIError.Error())
-	require.Contains(t, logBuffer.String(), body)
+	require.Contains(t, newAPIError.Error(), "bad response status code 500")
+	require.Contains(t, newAPIError.Error(), "content_type: text/plain")
+	require.Contains(t, newAPIError.Error(), fmt.Sprintf("response_bytes: %d", len(body)))
+	require.Contains(t, newAPIError.Error(), "upstream_request_id: req-upstream")
+	require.NotContains(t, newAPIError.Error(), body)
+	require.NotContains(t, logBuffer.String(), body)
 }
 
 func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
@@ -100,10 +105,12 @@ func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+	newAPIError := RelayErrorHandler(context.Background(), resp)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, fmt.Sprintf("bad response status code 500, message: %s, body: %s", message, body), newAPIError.Error())
+	require.Contains(t, newAPIError.Error(), "bad response status code 500, message: ")
+	require.Contains(t, newAPIError.Error(), "[truncated]")
+	require.NotContains(t, newAPIError.Error(), body)
 }
 
 func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
@@ -114,13 +121,16 @@ func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+	newAPIError := RelayErrorHandler(context.Background(), resp)
 
 	require.NotNil(t, newAPIError)
-	require.Equal(t, fmt.Sprintf("bad response status code 500, message: %s, body: %s", message, body), newAPIError.Error())
+	require.Contains(t, newAPIError.Error(), "bad response status code 500, message: ")
+	require.Contains(t, newAPIError.Error(), "[truncated]")
+	require.NotContains(t, newAPIError.Error(), body)
+	require.Equal(t, types.ErrorCode("server_error"), newAPIError.GetErrorCode())
 }
 
-func TestRelayErrorHandlerIncludesInvalidJSONBodyInDebugLog(t *testing.T) {
+func TestRelayErrorHandlerOmitsInvalidJSONBodyInDebugLog(t *testing.T) {
 	withDebugEnabled(t, true)
 
 	body := strings.Repeat("e", common.LocalLogContentLimit+256)
@@ -141,10 +151,11 @@ func TestRelayErrorHandlerIncludesInvalidJSONBodyInDebugLog(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+	newAPIError := RelayErrorHandler(context.Background(), resp)
 
 	require.NotNil(t, newAPIError)
-	require.Contains(t, logBuffer.String(), body)
+	require.NotContains(t, logBuffer.String(), body)
+	require.Contains(t, logBuffer.String(), "response_bytes")
 }
 
 func withDebugEnabled(t *testing.T, enabled bool) {

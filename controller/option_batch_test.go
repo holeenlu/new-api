@@ -62,3 +62,57 @@ func TestUpdateModelPricingOptionsRejectsWholeInvalidBatch(t *testing.T) {
 	require.NoError(t, model.DB.Model(&model.Option{}).Count(&count).Error)
 	require.Zero(t, count)
 }
+
+func TestUpdateModelPricingOptionsRejectsUnsafeValuesAndExpressions(t *testing.T) {
+	tests := []struct {
+		name    string
+		options map[string]string
+	}{
+		{
+			name: "negative ratio",
+			options: map[string]string{
+				"ModelRatio": `{"unsafe":-1}`,
+			},
+		},
+		{
+			name: "invalid billing mode",
+			options: map[string]string{
+				"billing_setting.billing_mode": `{"unsafe":"unknown"}`,
+			},
+		},
+		{
+			name: "invalid billing expression",
+			options: map[string]string{
+				"billing_setting.billing_expr": `{"unsafe":"tier("}`,
+			},
+		},
+		{
+			name: "missing tiered expression",
+			options: map[string]string{
+				"billing_setting.billing_mode": `{"unsafe":"tiered_expr"}`,
+				"billing_setting.billing_expr": `{}`,
+			},
+		},
+		{
+			name: "mode-only update without existing expression",
+			options: map[string]string{
+				"billing_setting.billing_mode": `{"unsafe":"tiered_expr"}`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prepareOptionBatchTest(t)
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/option/model-pricing", modelPricingOptionsUpdateRequest{Options: test.options}, 1)
+
+			UpdateModelPricingOptions(ctx)
+
+			response := decodeAPIResponse(t, recorder)
+			require.False(t, response.Success)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.Option{}).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+}

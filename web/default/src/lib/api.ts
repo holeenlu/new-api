@@ -17,9 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import axios, { type AxiosRequestConfig } from 'axios'
-import { t } from 'i18next'
 import { toast } from 'sonner'
 
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 declare module 'axios' {
@@ -65,7 +65,8 @@ api.get = ((url: string, config: ApiRequestConfig = {}) => {
   const key = `${url}?${params}`
 
   // Return existing in-flight request if available
-  if (inFlightGet.has(key)) return inFlightGet.get(key)!
+  const existingRequest = inFlightGet.get(key)
+  if (existingRequest) return existingRequest
 
   // Create new request and clean up after completion
   const req = originalGet(url, config).finally(() => inFlightGet.delete(key))
@@ -84,15 +85,17 @@ api.interceptors.response.use(
 
     // Unified business response format: { success, message, data }
     if (
-      !skipBusiness &&
       response &&
       response.data &&
       typeof response.data.success === 'boolean'
     ) {
       if (!response.data.success) {
-        // Show error toast for business failures
-        const msg = response.data.message || t('Request failed')
-        toast.error(msg)
+        const msg = localizeErrorMessage(
+          response.data.message || response.data,
+          '请求失败'
+        )
+        response.data.message = msg
+        if (!skipBusiness) toast.error(msg)
       }
     }
     return response
@@ -100,6 +103,27 @@ api.interceptors.response.use(
   (error) => {
     const skip = error?.config?.skipErrorHandler
     const status = error?.response?.status
+    const data = error?.response?.data
+    const msg = localizeErrorMessage(data || error, '请求失败')
+    if (typeof data === 'string') {
+      error.response.data = msg
+    } else if (data && typeof data === 'object') {
+      if (typeof data.message === 'string') {
+        data.message = localizeErrorMessage(data.message)
+      }
+      if (typeof data.title === 'string') {
+        data.title = localizeErrorMessage(data.title)
+      }
+      if (typeof data.detail === 'string') {
+        data.detail = localizeErrorMessage(data.detail)
+      }
+      if (data.error && typeof data.error === 'object') {
+        if (typeof data.error.message === 'string') {
+          data.error.message = localizeErrorMessage(data.error.message)
+        }
+      }
+    }
+    if (error && typeof error === 'object') error.message = msg
 
     if (status === 401) {
       try {
@@ -109,12 +133,9 @@ api.interceptors.response.use(
       }
 
       if (!skip) {
-        toast.error(t('Session expired!'))
+        toast.error('会话已过期，请重新登录')
       }
     } else if (!skip) {
-      // Other errors: show error message from response or default
-      const msg =
-        error?.response?.data?.message || error?.message || t('Request failed')
       toast.error(msg)
     }
     return Promise.reject(error)

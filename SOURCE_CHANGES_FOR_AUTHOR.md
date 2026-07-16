@@ -43,6 +43,16 @@ POST /api/channel/codex/oauth/complete
 - 生成现有 Codex 渠道兼容的 JSON credential；
 - 授权完成后清理 session 中的 OAuth 状态。
 
+授权码换取 Token 的失败现在按原因返回安全提示：授权码或 redirect URI 被拒绝（`400/422`）、
+凭证无效（`401`）、账号无权访问（`403`）、上游限流（`429`）、上游临时不可用（`5xx`）、
+网络不可达、超时和异常成功响应不再统一显示为“OAuth authorization failed”。服务日志保留底层
+网络原因，但会统一脱敏 callback URL、授权码和 Token。
+
+授权、刷新、模型发现、用量查询和请求转发共用同一份 Codex credential DTO。刷新响应没有返回新的
+`refresh_token` 时保留原 refresh token；同一渠道的自动刷新、手动刷新和用量查询刷新按渠道 ID
+串行执行，避免 refresh token 轮换竞争。用量查询只在上游真实返回 `401` 时刷新，`403` 作为账号或
+组织权限问题直接返回，不再无效刷新。
+
 生成的 credential 结构包含：
 
 ```json
@@ -158,8 +168,12 @@ GET /v1/responses  (WebSocket Upgrade)
   错误处理链；同一会话固定渠道，避免 OAuth 身份在会话中途漂移；
 - 上游 WebSocket 事件按客户端协议实时返回；上游明确返回 `426 Upgrade Required`
   时自动回退 HTTP/SSE，不会因上游暂未开放 WebSocket 而中断请求。
-- WebSocket 帧和转换后的请求体统一使用 `MAX_REQUEST_BODY_MB`（默认 128 MB）限制，
-  不再额外硬编码 16 MB；真正超限时返回 `413` 并停止重试。
+- WebSocket 帧和转换后的请求体统一使用 `MAX_REQUEST_BODY_MB` 限制，默认 `128 MB`，
+  不再单独使用固定的 `16 MB` 限制；超限返回 `413 Request Entity Too Large`，并标记为
+  不可重试，避免大请求被重复发送到备用渠道。
+- Codex/Claude Code OAuth 遇到 EOF、连接重置等响应头前断连时返回 `502`，
+  交由 Retry Times 决定是否故障转移；不关闭共享 HTTP 连接池，且这类临时 `5xx`
+  不会禁用渠道或标记 OAuth 凭证失效。客户端已取消则返回 `499` 且不重试。
 
 该能力沿用 API Key 鉴权；WebSocket 客户端可通过既有
 `Sec-WebSocket-Protocol` 机制携带 API Key。WebSocket 的首个请求必须是
@@ -314,6 +328,8 @@ x-app: cli
 - 保存时提交编辑器的最新价格快照，并继续通过 React Hook Form/Zod Schema 校验；
 - 多项系统配置统一显示保存状态、成功或失败提示，并在完成后刷新系统配置缓存；
 - GPT-5.4 及后续模型的完成倍率允许自定义，其他硬编码锁定模型继续使用内置倍率；
+- 批量保存会在事务写入前拒绝负数、NaN、无穷值、未知计费模式、无效计费表达式，以及缺少表达式的
+  分层计费配置；
 - “从上游获取模型”只更新模型列表，不覆盖已有 `model_mapping`。
 
 ## 4. 国际化
@@ -359,9 +375,13 @@ model/option_location_test.go
 service/channel_oauth_policy_test.go
 service/http_client_test.go
 service/retry_data_policy_test.go
+service/codex_oauth_test.go
+service/error_test.go
 setting/ratio_setting/model_ratio_test.go
 relay/channel/codex/alpha_search_test.go
 relay/channel/codex/responses_websocket_test.go
+model/channel_multi_key_test.go
+web/default/src/lib/localize-error-message.test.ts
 ```
 
 覆盖内容：
@@ -383,7 +403,11 @@ relay/channel/codex/responses_websocket_test.go
 - 客户端网络 Header 禁止透传和 OAuth 身份 Header 防覆盖；
 - 宿主/代理出口画像发现、位置模式热更新和隐私过滤；
 - 默认渠道隔离、供应商隔离、策略组隔离和响应披露 Header；
-- 批量模型价格配置事务写入和位置模式运行时选项。
+- 批量模型价格配置事务写入和位置模式运行时选项；
+- OAuth refresh token 非轮换响应和授权错误分类；
+- 多 Key 随机与轮询重试排除本请求已使用 Key；
+- 上游错误正文不进入日志、数据库错误或客户端响应；
+- 前端传输错误、供应商错误和流终止原因统一显示为简体中文。
 
 ## 6. 部署和验证
 
@@ -405,9 +429,12 @@ bin/deploy-192.168.11.12.sh
   提供 `nextcode.buildtoconnect.com`；
 - 本地、174、192 服务时区统一为 UTC，与 Codex / Claude Code 上游时间戳和配额窗口保持一致；
 - Compose 默认设置 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT=30`；部署脚本仅将旧默认值 `120` 自动迁移为 `30`，保留管理员自定义值；
+- Compose 与部署脚本默认补齐 `MAX_REQUEST_BODY_MB=128`；可在三套部署的 `.env` 中按 MB 调整，
+  同时作用于普通 HTTP 请求和 Codex Responses WebSocket 请求；
 - Docker 构建支持 GOPROXY 主备切换；
 - 运行镜像只保留静态服务二进制、CA、时区数据库和健康检查所需工具，不携带 Go 编译器；
-- 当前默认 `APP_VERSION` 只取最近 Git tag；镜像归档 SHA-256 和镜像 ID 可以确认实际部署产物，但 `/api/status` 版本号不能区分同一 tag 上的不同补丁；
+- `APP_VERSION` 按部署要求固定取最近 Git Release tag，源码补丁构建不会改变页面显示版本；镜像归档
+  SHA-256 和镜像 ID 用于确认同一 Release 版本下的实际部署产物；
 - 镜像传输前后强制比较压缩包 SHA-256，服务器内部再比较已加载镜像与运行容器的镜像 ID，不一致立即失败；
 - 构建后默认将 Buildx 缓存控制在 20GB 内，并清理带有 new-api 镜像标签的无引用旧镜像；
 - 部署脚本等待容器健康，并再次请求 `/api/status`。
@@ -430,19 +457,25 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 
 - `174.137.56.226` 公网部署强制启用 `SESSION_COOKIE_SECURE=true`，可信入口默认为 `https://nextcode.buildtoconnect.com`；Caddy 将公网 IP 的 HTTP 请求永久重定向到该 HTTPS 域名并发送 HSTS；
 - 本地和 `192.168.11.12` 内网部署不强制 Secure Cookie，继续支持 HTTP；
-- Redis、支付回调、任务轮询、常规成功响应和多数流处理日志已改为只记录状态码、字节数与非内容元数据；OAuth code/token、Webhook 签名和正文经过专门省略或脱敏；通用错误响应与 Ollama 异常 SSE 仍有正文泄露缺口，见 9.1；
+- Redis、支付回调、任务轮询、常规成功响应和流处理日志只记录状态码、字节数与非内容元数据；OAuth
+  code/token、Webhook 签名和正文经过专门省略或脱敏；通用上游错误最多读取 1 MB，只保留脱敏、
+  限长后的结构化错误信息、Content-Type、响应字节数和上游 request ID，Ollama 异常 SSE 只记录行字节数；
 - 渠道编辑器新增“数据治理”，可填写真实供应商、数据区域、保留期、训练策略、重试隔离范围和策略组；
 - 默认 `channel` 隔离不把提示词发送到其他渠道；当前渠道为多 Key 时才可在该渠道内换 Key；
 - `provider` 隔离要求渠道类型、规范化上游端点、显式供应商、区域、保留期和训练策略全部一致；
 - `policy_group` 隔离要求显式供应商、区域、保留期、训练策略和策略组全部一致；配置不完整或非法时运行期自动回退到 `channel`，失败关闭；
-- 已尝试的单 Key 渠道不会再次入选；内存缓存和数据库直查路径使用同一候选过滤边界；找不到合规备用渠道时保留并返回原始上游错误；
+- 已尝试的单 Key 渠道不会再次入选；多 Key 渠道按请求记录 `(channel_id, key_index)`，随机和轮询模式
+  都会排除已经使用的 Key，所有启用 Key 用尽后停止选择该渠道；内存缓存和数据库直查路径使用同一
+  候选过滤边界；找不到合规备用渠道时保留并返回经过治理的上游错误摘要；
 - 响应通过 `X-Relay-Upstream-Provider`、`X-Relay-Attempt`、`X-Relay-Retry-Count`、`X-Relay-Retry-Isolation`、`X-Relay-Data-Region`、`X-Relay-Data-Retention` 和 `X-Relay-Data-Training` 披露实际处理策略，CORS 同步暴露这些 Header。
 
 新增回归测试：`service/retry_data_policy_test.go`，覆盖默认隔离、多 Key 渠道内重试、配置不完整时失败关闭、相同供应商边界、策略组边界和响应头披露。
 
 ## 8. 上游位置与客户端 IP 隐私
 
-- JSON 模型请求在最终出站边界执行位置隐私策略，常见协议位置字段、参数覆盖和渠道正文直通均纳入过滤；当前敏感字段预扫描仍可能漏掉大小写变体或未列入 marker 的顶层字段，见 9.2；
+- JSON 模型请求在最终出站边界执行位置隐私策略，常见协议位置字段、参数覆盖和渠道正文直通均纳入
+  过滤；隐私过滤不再依赖大小写敏感 marker 快路径，每个 JSON 出站请求都会解析，并使用规范化键
+  匹配大小写、连字符、点号、下划线及嵌套数组中的敏感网络字段；
 - `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
 - `UPSTREAM_LOCATION_MODE=auto` 根据真实网络路径选择画像：渠道配置代理或 `UPSTREAM_SYSTEM_PROXY_ENABLED=true` 时使用 VPN/代理出口画像，否则使用宿主网络出口画像；两套画像可分别由 `UPSTREAM_EGRESS_LOCATION_*` 和 `UPSTREAM_HOST_LOCATION_*` 显式配置；
 - `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径和已启用的系统代理/VPN 路径检查 ChatGPT、Claude 连通性；两者均可建立 HTTP 连接后，通过 Cloudflare trace 获取该路径的实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度。显式环境变量始终优先，探测只补充空字段；探测失败不会放行客户端位置；
@@ -463,22 +496,19 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 - 自动探测只发送无凭证的连通性请求，不携带客户端请求、OAuth Token 或模型数据；公网出口 IP 会被 Cloudflare 和 `ipwho.is` 看到。对第三方 IP 地理定位服务有合规限制时，可设置 `UPSTREAM_LOCATION_DISCOVERY_ENABLED=false` 并完全使用显式画像；
 - 三套部署入口共用 `docker-compose.deploy.yml` 的隐私环境变量，部署脚本会为已有或新建 `.env` 补齐 `UPSTREAM_LOCATION_MODE=strip`、`UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 和 8 秒总探测超时。安全默认仍为删除客户端位置，探测画像不会自动改变转发模式。
 
-## 9. 已知限制与待完善项
+## 9. 审查结论与剩余风险
 
-### 9.1 通用上游错误和 Ollama 异常流仍会记录完整响应内容
+### 9.1 已解决：通用上游错误和 Ollama 异常流正文泄露
 
-- `service/error.go` 的 `RelayErrorHandler` 忽略原有 `showBodyWhenFail` 参数，无条件读取并拼接完整响应体；
-- `controller/relay.go` 将该错误写入运行日志和持久化错误日志，并将未掩码的错误返回客户端；
-- `service/error_test.go` 当前测试明确要求完整正文出现在错误与日志中；
-- `relay/channel/ollama/stream.go` 在 JSON 解码失败时记录完整 SSE 行。
+- `RelayErrorHandler` 已移除无效的 `showBodyWhenFail` 参数，并限制最多读取 1 MB；
+- 原始响应正文不再写入运行日志、数据库错误或客户端错误；
+- 保留脱敏和限长后的供应商结构化错误信息、状态码、Content-Type、响应字节数及上游 request ID；
+- Ollama SSE 解码失败仅记录行字节数。
 
-这与“禁止正文/响应/SSE 内容日志”的治理目标直接冲突，也会绕过仅按字节数记录的其他日志清理。应只保留状态码、供应商错误码、请求 ID、Content-Type 和受限长度的非正文摘要；原始响应正文不得进入运行日志或数据库日志。
+### 9.2 已解决：位置隐私 marker 快路径漏检
 
-### 9.2 位置隐私过滤的 marker 快路径存在漏检
-
-`relay/common/location_privacy.go` 在解析 JSON 前先用大小写敏感的固定 marker 列表判断是否可能含敏感数据。`remote_addr`、`cf_connecting_ip` 等已被清理函数识别的顶层字段未全部进入 marker 列表，大小写变体也可能绕过预扫描，导致请求体原样发送上游。
-
-应让预扫描与规范化后的敏感键集合保持同一数据源，或在开启隐私保护时始终解析 JSON；补充顶层字段、大小写、连字符、下划线和嵌套数组回归测试。
+已删除大小写敏感的 marker 预扫描。所有 JSON 出站请求统一解析后过滤，测试覆盖顶层字段、大小写、
+连字符、点号、下划线、嵌套对象和嵌套数组。
 
 ### 9.3 订阅 OAuth 兼容实现不能等同于官方公开 API 合规
 
@@ -486,21 +516,26 @@ Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth clien
 
 部署前仍需取得 OpenAI/Anthropic 对账号共享、中转、自动化、转售、内部端点和订阅 OAuth Token 使用方式的明确授权。否则即使技术请求成功，也仍存在 401/403、组织禁用、接口变更和账号限制风险。
 
-### 9.4 单项系统配置忽略数据库写入错误
+### 9.4 已解决：单项系统配置忽略数据库写入错误
 
-`model/option.go` 的 `UpdateOption` 没有检查 `FirstOrCreate` 和 `Save` 的错误，却继续更新运行时 `OptionMap` 并向控制器返回成功。新开放的 `UpstreamLocationMode` 因此可能在页面上显示保存成功，但数据库实际没有持久化，重启后恢复旧值。应检查两个数据库操作，最好使用事务，并只在提交成功后更新运行时状态。
+`UpdateOption` 统一复用事务型 `UpdateOptionsBulk`。`FirstOrCreate`、`Save` 或事务提交失败会直接返回，
+只有数据库提交成功后才更新运行时 Option 状态。
 
-### 9.5 随机多 Key 渠道重试可能再次选择同一个 Key
+### 9.5 已解决：多 Key 渠道重试重复选择同一个 Key
 
-重试边界只记录已尝试的渠道 ID；多 Key 渠道被允许再次入选。轮询模式通常会切到下一个 Key，但随机模式没有记录本请求已使用的 Key 索引，可能再次把同一提示发送给同一账号，既不能实现有效故障转移，也可能产生重复执行或重复计费。应在请求级边界记录 `(channel_id, key_index)`，在所有可用 Key 尝试完之前排除已用 Key。
+重试边界已按请求记录 `(channel_id, key_index)`。随机、轮询和默认模式都会排除本请求已经使用的
+启用 Key；所有启用 Key 用尽后，该渠道不再进入候选列表。
 
-### 9.6 构建版本号不能区分同一 tag 的补丁
+### 9.6 有意行为：构建版本固定显示 Git Release
 
-`bin/deploy-common.sh` 的 `deploy_build_version` 只返回最近 release tag。镜像归档与运行镜像校验本身是严格的，但多个补丁仍会在 `/api/status` 显示同一版本。应把短 commit、dirty 标记或 UTC 构建号加入 `APP_VERSION`，并继续保留镜像 ID 强校验。
+按部署需求，`APP_VERSION` 只使用最近 Git Release tag。修改源码并重新编译不会改变页面显示版本；
+同一 Release 下的产物差异通过镜像归档 SHA-256、加载后的镜像 ID 和运行容器镜像 ID 校验，不向
+`APP_VERSION` 添加 commit、dirty 标记或构建时间。
 
-### 9.7 批量模型价格保存缺少语义校验
+### 9.7 已解决：批量模型价格保存缺少语义校验
 
-`controller/option.go` 的批量接口只验证 JSON 是否可解析为数值/字符串 map，没有验证倍率和价格的合法范围，也没有对 `billing_expr` 执行编译与 smoke test。负数最终会在预扣环节失败关闭，不会形成负扣费，但无效表达式或配置仍可持久化并使相关模型请求持续失败。应在事务写入前复用计费表达式和倍率的后端校验。
+批量接口在事务写入前验证有限非负价格/倍率、合法计费模式、非空模型名和表达式，并对
+`billing_expr` 执行 smoke test；分层计费缺少对应表达式时整批拒绝，不会部分写入。
 
 ### 9.8 Anthropic OAuth 组织权限
 

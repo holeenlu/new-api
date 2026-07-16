@@ -30,6 +30,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { formatTimestampToDate, formatTokens } from '@/lib/format'
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 import { cn } from '@/lib/utils'
 
 import { formatDuration } from '../../lib/format'
@@ -54,7 +55,7 @@ export function CacheTooltip({
       <Tooltip>
         <TooltipTrigger
           render={<Zap className={`size-3 flex-shrink-0 ${color}`} />}
-        ></TooltipTrigger>
+        />
         <TooltipContent side='top'>
           <p className='text-xs'>
             {label}: {formatTokens(tokens)}
@@ -210,7 +211,10 @@ export function createFailReasonColumn<T>(config: {
       <DataTableColumnHeader column={column} title={headerLabel} />
     ),
     cell: function FailReasonCell({ row }) {
-      const failReason = row.getValue(accessorKey) as string
+      const rawFailReason = row.getValue(accessorKey) as string
+      const failReason = rawFailReason
+        ? localizeErrorMessage(rawFailReason)
+        : ''
       const [dialogOpen, setDialogOpen] = useState(false)
 
       if (!failReason) {

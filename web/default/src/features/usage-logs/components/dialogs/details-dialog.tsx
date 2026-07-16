@@ -1,3 +1,4 @@
+import type { TFunction } from 'i18next'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -31,7 +32,6 @@ import {
   Info,
   LogIn,
 } from 'lucide-react'
-import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
@@ -43,8 +43,10 @@ import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-p
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 import { cn } from '@/lib/utils'
 
+import { LOG_TYPE_ENUM } from '../../constants'
 import type { UsageLog } from '../../data/schema'
 import {
   parseLogOther,
@@ -179,7 +181,9 @@ function getUsageBillingPathLabel(
   }
 }
 
-function isUsageBillingPathLocal(adminInfo: LogOtherData['admin_info']): boolean {
+function isUsageBillingPathLocal(
+  adminInfo: LogOtherData['admin_info']
+): boolean {
   if (adminInfo?.usage_billing_path) {
     return adminInfo.usage_billing_path === USAGE_BILLING_PATH.LOCAL
   }
@@ -459,7 +463,11 @@ interface DetailsDialogProps {
 export function DetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
-  const details = props.log.content ?? ''
+  const rawDetails = props.log.content ?? ''
+  const details =
+    props.log.type === LOG_TYPE_ENUM.ERROR
+      ? localizeErrorMessage(rawDetails)
+      : rawDetails
   const other = parseLogOther(props.log.other)
   const typeConfig = getLogTypeConfig(props.log.type)
 
@@ -1096,7 +1104,10 @@ export function DetailsDialog(props: DetailsDialogProps) {
                 label={t('Status')}
                 value={
                   <StatusBadge
-                    label={other.stream_status.status || t('Error')}
+                    label={localizeErrorMessage(
+                      other.stream_status.status,
+                      t('Error')
+                    )}
                     variant='red'
                     size='sm'
                     copyable={false}
@@ -1106,7 +1117,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
               {other.stream_status.end_reason && (
                 <DetailRow
                   label={t('End Reason')}
-                  value={other.stream_status.end_reason}
+                  value={localizeErrorMessage(other.stream_status.end_reason)}
                 />
               )}
               {(other.stream_status.error_count ?? 0) > 0 && (
@@ -1118,13 +1129,15 @@ export function DetailsDialog(props: DetailsDialogProps) {
               {other.stream_status.end_error && (
                 <DetailRow
                   label={t('End Error')}
-                  value={other.stream_status.end_error}
+                  value={localizeErrorMessage(other.stream_status.end_error)}
                 />
               )}
               {Array.isArray(other.stream_status.errors) &&
                 other.stream_status.errors.length > 0 && (
                   <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
-                    {other.stream_status.errors.join('\n')}
+                    {other.stream_status.errors
+                      .map((error) => localizeErrorMessage(error))
+                      .join('\n')}
                   </pre>
                 )}
             </DetailSection>

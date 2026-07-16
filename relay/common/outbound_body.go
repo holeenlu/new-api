@@ -38,17 +38,9 @@ func newOutboundJSONBody(data []byte) (body io.Reader, size int64, closer io.Clo
 	return common.ReaderOnly(storage), storage.Size(), storage, nil
 }
 
-// NewPrivacyFilteredPassThroughJSONBody avoids copying pass-through bodies when
-// no protected location data is present, while still enforcing the same final
-// outbound policy as converted requests.
+// NewPrivacyFilteredPassThroughJSONBody applies the same outbound privacy
+// policy to pass-through requests as converted requests.
 func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUsesProxy ...bool) (body io.Reader, size int64, closer io.Closer, err error) {
-	mayContainSensitiveData, err := storageMayContainSensitiveLocationData(storage)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	if !mayContainSensitiveData {
-		return common.ReaderOnly(storage), storage.Size(), nil, nil
-	}
 	data, err := storage.Bytes()
 	if err != nil {
 		return nil, 0, nil, err
@@ -61,59 +53,4 @@ func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUs
 		return common.ReaderOnly(storage), storage.Size(), nil, nil
 	}
 	return newOutboundJSONBody(filtered)
-}
-
-func storageMayContainSensitiveLocationData(storage common.BodyStorage) (bool, error) {
-	if !storage.IsDisk() {
-		data, err := storage.Bytes()
-		if err != nil {
-			return false, err
-		}
-		return mayContainSensitiveLocationData(data), nil
-	}
-
-	originalOffset, err := storage.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return false, err
-	}
-	if _, err := storage.Seek(0, io.SeekStart); err != nil {
-		return false, err
-	}
-
-	maxMarkerLength := 0
-	for _, marker := range sensitiveLocationDataMarkers {
-		if len(marker) > maxMarkerLength {
-			maxMarkerLength = len(marker)
-		}
-	}
-	window := make([]byte, 32*1024+maxMarkerLength-1)
-	overlapLength := 0
-	found := false
-	for {
-		count, readErr := storage.Read(window[overlapLength:])
-		if count > 0 {
-			windowLength := overlapLength + count
-			if mayContainSensitiveLocationData(window[:windowLength]) {
-				found = true
-				break
-			}
-			keep := maxMarkerLength - 1
-			if keep > windowLength {
-				keep = windowLength
-			}
-			copy(window[:keep], window[windowLength-keep:windowLength])
-			overlapLength = keep
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				_, _ = storage.Seek(originalOffset, io.SeekStart)
-				return false, readErr
-			}
-			break
-		}
-	}
-	if _, err := storage.Seek(originalOffset, io.SeekStart); err != nil {
-		return false, err
-	}
-	return found, nil
 }

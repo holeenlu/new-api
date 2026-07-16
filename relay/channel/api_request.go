@@ -580,6 +580,27 @@ func isSubscriptionOAuthResponseHeaderTimeout(err error, req *http.Request, info
 	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
 }
 
+func classifySubscriptionOAuthTransportError(err error, req *http.Request, info *common.RelayInfo) *types.NewAPIError {
+	if err == nil || req == nil || info == nil {
+		return nil
+	}
+	if info.ChannelType != rootconstant.ChannelTypeCodex && info.ChannelType != rootconstant.ChannelTypeClaudeCode {
+		return nil
+	}
+	if req.Context().Err() != nil {
+		return types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeDoRequestFailed,
+			499,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if isSubscriptionOAuthResponseHeaderTimeout(err, req, info) {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
+	}
+	return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	stripSensitiveClientNetworkHeaders(req.Header)
 	var client *http.Client
@@ -625,8 +646,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
-		if isSubscriptionOAuthResponseHeaderTimeout(err, req, info) {
-			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
+		if transportErr := classifySubscriptionOAuthTransportError(err, req, info); transportErr != nil {
+			if transportErr.StatusCode >= http.StatusInternalServerError {
+				c.Header("Retry-After", "1")
+			}
+			return nil, transportErr
 		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}

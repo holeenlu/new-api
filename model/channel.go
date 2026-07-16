@@ -196,7 +196,7 @@ func (channel *Channel) GetKeys() []string {
 	return keys
 }
 
-func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+func (channel *Channel) GetNextEnabledKey(excludedIndexes ...map[int]struct{}) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -238,11 +238,24 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	if len(enabledIdx) == 0 {
 		return "", 0, types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
 	}
+	var excluded map[int]struct{}
+	if len(excludedIndexes) > 0 {
+		excluded = excludedIndexes[0]
+	}
+	untriedIdx := make([]int, 0, len(enabledIdx))
+	for _, idx := range enabledIdx {
+		if _, used := excluded[idx]; !used {
+			untriedIdx = append(untriedIdx, idx)
+		}
+	}
+	if len(untriedIdx) == 0 {
+		return "", 0, types.NewError(errors.New("no untried enabled keys"), types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+	}
 
 	switch channel.ChannelInfo.MultiKeyMode {
 	case constant.MultiKeyModeRandom:
-		// Randomly pick one enabled key
-		selectedIdx := enabledIdx[rand.Intn(len(enabledIdx))]
+		// Randomly pick one enabled key that this request has not already used.
+		selectedIdx := untriedIdx[rand.Intn(len(untriedIdx))]
 		return keys[selectedIdx], selectedIdx, nil
 	case constant.MultiKeyModePolling:
 		// Use channel-specific lock to ensure thread-safe polling
@@ -269,16 +282,19 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
 			if getStatus(idx) == common.ChannelStatusEnabled {
+				if _, used := excluded[idx]; used {
+					continue
+				}
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil
 			}
 		}
 		// Fallback – should not happen, but return first enabled key
-		return keys[enabledIdx[0]], enabledIdx[0], nil
+		return keys[untriedIdx[0]], untriedIdx[0], nil
 	default:
-		// Unknown mode, default to first enabled key (or original key string)
-		return keys[enabledIdx[0]], enabledIdx[0], nil
+		// Unknown mode, default to the first untried enabled key.
+		return keys[untriedIdx[0]], untriedIdx[0], nil
 	}
 }
 

@@ -3,12 +3,14 @@ package channel
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -44,6 +46,44 @@ func TestIsSubscriptionOAuthResponseHeaderTimeout(t *testing.T) {
 	require.False(t, isSubscriptionOAuthResponseHeaderTimeout(timeoutErr, canceledReq, &relaycommon.RelayInfo{
 		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
 	}))
+}
+
+func TestClassifySubscriptionOAuthTransportError(t *testing.T) {
+	tests := []struct {
+		name       string
+		channel    int
+		err        error
+		cancel     bool
+		wantStatus int
+		wantSkip   bool
+	}{
+		{name: "codex eof", channel: constant.ChannelTypeCodex, err: io.EOF, wantStatus: http.StatusBadGateway},
+		{name: "claude reset", channel: constant.ChannelTypeClaudeCode, err: errors.New("connection reset by peer"), wantStatus: http.StatusBadGateway},
+		{name: "codex timeout", channel: constant.ChannelTypeCodex, err: responseHeaderTimeoutError{}, wantStatus: http.StatusGatewayTimeout},
+		{name: "client canceled", channel: constant.ChannelTypeCodex, err: context.Canceled, cancel: true, wantStatus: 499, wantSkip: true},
+		{name: "other channel", channel: constant.ChannelTypeOpenAI, err: io.EOF},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			if test.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+			got := classifySubscriptionOAuthTransportError(test.err, req, &relaycommon.RelayInfo{
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: test.channel},
+			})
+			if test.wantStatus == 0 {
+				require.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			require.Equal(t, test.wantStatus, got.StatusCode)
+			require.Equal(t, test.wantSkip, types.IsSkipRetryError(got))
+		})
+	}
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {

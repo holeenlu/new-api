@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { localizeErrorMessage } from '@/lib/localize-error-message'
+
 import { ERROR_MESSAGES } from '../../constants'
 import type { ChatCompletionChunk } from '../../types'
 
@@ -42,7 +44,10 @@ export type StreamErrorDetails = {
 }
 
 export function parseStreamErrorDetails(data?: string): StreamErrorDetails {
-  const fallbackMessage = data || ERROR_MESSAGES.API_REQUEST_ERROR
+  const fallbackMessage = localizeErrorMessage(
+    data,
+    localizeErrorMessage(ERROR_MESSAGES.API_REQUEST_ERROR)
+  )
 
   if (!data) {
     return { errorMessage: fallbackMessage }
@@ -57,7 +62,7 @@ export function parseStreamErrorDetails(data?: string): StreamErrorDetails {
 
     return {
       errorCode: parsed.error.code || undefined,
-      errorMessage: parsed.error.message || fallbackMessage,
+      errorMessage: localizeErrorMessage(parsed.error.message, fallbackMessage),
     }
   } catch {
     return { errorMessage: fallbackMessage }
@@ -105,7 +110,7 @@ export function getStreamReadyStateError(
     status !== undefined &&
     status !== 200
   ) {
-    return `HTTP ${status}: ${ERROR_MESSAGES.CONNECTION_CLOSED}`
+    return `HTTP ${status}：${localizeErrorMessage(ERROR_MESSAGES.CONNECTION_CLOSED)}`
   }
 
   return null

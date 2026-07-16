@@ -67,6 +67,16 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	return search
 }
 
+// ShouldDisableChannelForType keeps transient subscription transport failures
+// from being mistaken for invalid OAuth credentials. A 5xx may be retried or
+// routed elsewhere, but it must not change the channel's enabled state.
+func ShouldDisableChannelForType(channelType int, err *types.NewAPIError) bool {
+	if IsSubscriptionOAuthTransientError(channelType, err) {
+		return false
+	}
+	return ShouldDisableChannel(err)
+}
+
 func IsSubscriptionOAuthTransientError(channelType int, err *types.NewAPIError) bool {
 	if err == nil || (channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex) {
 		return false

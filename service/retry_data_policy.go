@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
@@ -38,15 +39,16 @@ type RetryBoundary struct {
 	initialType      int
 	policy           ResolvedChannelDataPolicy
 	usedChannelIDs   map[int]struct{}
+	usedKeyIndexes   map[int]map[int]struct{}
 }
 
 func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy {
 	policy := ResolvedChannelDataPolicy{
-		Provider:   "Unknown",
-		Region:     "provider_account_policy",
-		Retention:  "provider_account_policy",
-		Training:   string(dto.DataTrainingProviderDefault),
-		Endpoint:   normalizedUpstreamEndpoint(""),
+		Provider:  "Unknown",
+		Region:    "provider_account_policy",
+		Retention: "provider_account_policy",
+		Training:  string(dto.DataTrainingProviderDefault),
+		Endpoint:  normalizedUpstreamEndpoint(""),
 	}
 	if channel == nil {
 		policy.RetryIsolation = dto.RetryIsolationChannel
@@ -110,22 +112,63 @@ func NewRetryBoundary(channel *model.Channel) *RetryBoundary {
 		initialType:      channel.Type,
 		policy:           ResolveChannelDataPolicy(channel),
 		usedChannelIDs:   make(map[int]struct{}),
+		usedKeyIndexes:   make(map[int]map[int]struct{}),
 	}
 }
 
-func (b *RetryBoundary) MarkAttempt(channel *model.Channel) {
+func (b *RetryBoundary) MarkAttempt(channel *model.Channel, multiKeyIndex ...int) {
 	if b == nil || channel == nil {
 		return
 	}
 	b.usedChannelIDs[channel.Id] = struct{}{}
+	if channel.ChannelInfo.IsMultiKey && len(multiKeyIndex) > 0 && multiKeyIndex[0] >= 0 {
+		indexes := b.usedKeyIndexes[channel.Id]
+		if indexes == nil {
+			indexes = make(map[int]struct{})
+			b.usedKeyIndexes[channel.Id] = indexes
+		}
+		indexes[multiKeyIndex[0]] = struct{}{}
+	}
+}
+
+func (b *RetryBoundary) UsedMultiKeyIndexes(channelID int) map[int]struct{} {
+	if b == nil || len(b.usedKeyIndexes[channelID]) == 0 {
+		return nil
+	}
+	result := make(map[int]struct{}, len(b.usedKeyIndexes[channelID]))
+	for index := range b.usedKeyIndexes[channelID] {
+		result[index] = struct{}{}
+	}
+	return result
+}
+
+func (b *RetryBoundary) hasUntriedEnabledKey(channel *model.Channel) bool {
+	lock := model.GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	used := b.usedKeyIndexes[channel.Id]
+	keys := channel.GetKeys()
+	for index := range keys {
+		status, hasStatus := channel.ChannelInfo.MultiKeyStatusList[index]
+		if hasStatus && status != common.ChannelStatusEnabled {
+			continue
+		}
+		if _, attempted := used[index]; !attempted {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 	if b == nil || channel == nil {
 		return false
 	}
-	if _, used := b.usedChannelIDs[channel.Id]; used && !channel.ChannelInfo.IsMultiKey {
-		return false
+	if _, used := b.usedChannelIDs[channel.Id]; used {
+		if !channel.ChannelInfo.IsMultiKey || !b.hasUntriedEnabledKey(channel) {
+			return false
+		}
 	}
 	candidate := ResolveChannelDataPolicy(channel)
 	if candidate.Provider != b.policy.Provider || candidate.Region != b.policy.Region ||

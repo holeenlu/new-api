@@ -37,6 +37,9 @@ token_estimator_test.go
 skills-lock.json
 .playwright-mcp
 
+# Database exports may contain credentials, tokens, and user records.
+backups/
+
 # Local-only live probes and scratch test workspaces.
 .local-tests/
 service/relayconvert/chat_responses_live_local_test.go

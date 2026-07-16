@@ -1,7 +1,6 @@
 package common
 
 import (
-	"bytes"
 	"strings"
 
 	rootcommon "github.com/QuantumNous/new-api/common"
@@ -38,37 +37,16 @@ var sensitiveLocationMetadataKeys = map[string]string{
 	"timezone":  "timezone",
 }
 
-var sensitiveLocationDataMarkers = [][]byte{
-	[]byte(`"user_location"`),
-	[]byte(`"inference_geo"`),
-	[]byte(`"client_metadata"`),
-	[]byte(`"metadata"`),
-	[]byte(`"latLng"`),
-	[]byte(`"lat_lng"`),
-	[]byte(`"client_ip"`),
-	[]byte(`"ip_address"`),
-	[]byte(`"remote_ip"`),
-	[]byte(`"source_ip"`),
-	[]byte(`"x_forwarded_for"`),
-	[]byte(`"x-forwarded-for"`),
-	[]byte(`"x_real_ip"`),
-	[]byte(`"x-real-ip"`),
-	[]byte(`"ip"`),
-}
-
 // FilterUpstreamLocationData applies the outbound privacy policy only to
 // protocol-defined location containers and metadata. Prompt text and tool
 // arguments are deliberately left untouched.
 func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, bool, error) {
 	mode := rootcommon.GetUpstreamLocationMode()
-	if !mayContainSensitiveLocationData(data) {
-		return data, false, nil
+	var request map[string]interface{}
+	if err := rootcommon.Unmarshal(data, &request); err != nil {
+		return nil, false, err
 	}
 	if mode == rootcommon.UpstreamLocationModeClient {
-		var request map[string]interface{}
-		if err := rootcommon.Unmarshal(data, &request); err != nil {
-			return nil, false, err
-		}
 		if !sanitizeRequestNetworkData(request) {
 			return data, false, nil
 		}
@@ -80,10 +58,6 @@ func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, 
 	}
 	profile, replaceLocation := selectUpstreamLocationProfile(mode, len(channelUsesProxy) > 0 && channelUsesProxy[0])
 
-	var request map[string]interface{}
-	if err := rootcommon.Unmarshal(data, &request); err != nil {
-		return nil, false, err
-	}
 	changed := sanitizeRequestLocation(request, replaceLocation, profile)
 	if !changed {
 		return data, false, nil
@@ -180,15 +154,6 @@ func sanitizeMetadataNetworkData(metadata map[string]interface{}) bool {
 		}
 	}
 	return changed
-}
-
-func mayContainSensitiveLocationData(data []byte) bool {
-	for _, marker := range sensitiveLocationDataMarkers {
-		if bytes.Contains(data, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 func sanitizeRequestLocation(request map[string]interface{}, replaceLocation bool, profile rootcommon.UpstreamLocationProfile) bool {

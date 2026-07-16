@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { localizeErrorMessage } from '@/lib/localize-error-message'
+
 import { MESSAGE_STATUS } from '../../constants'
 import type { Message } from '../../types'
 import { getMessageContent } from './message-utils'
@@ -48,7 +50,10 @@ export function getMessageErrorState(
     return null
   }
 
-  const content = getMessageContent(message) || FALLBACK_ERROR_CONTENT
+  const content = localizeErrorMessage(
+    getMessageContent(message),
+    localizeErrorMessage(FALLBACK_ERROR_CONTENT)
+  )
   const isModelPriceError = message.errorCode === MODEL_PRICE_ERROR_CODE
 
   return {

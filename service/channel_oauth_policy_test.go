@@ -36,6 +36,18 @@ func TestApplyChannelErrorPolicyLeavesSubscriptionOAuthServerErrorsRetryable(t *
 	}
 }
 
+func TestSubscriptionOAuthTransientErrorDoesNotDisableChannel(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeClaudeCode, constant.ChannelTypeCodex} {
+		err := types.NewErrorWithStatusCode(
+			errors.New("upstream connection closed before response headers"),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+		)
+
+		require.False(t, ShouldDisableChannelForType(channelType, err))
+	}
+}
+
 func TestApplyChannelErrorPolicyLeavesOtherChannelsUnchanged(t *testing.T) {
 	err := types.NewOpenAIError(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 

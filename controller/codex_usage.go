@@ -100,13 +100,17 @@ func fetchCodexChannelWhamData(
 		return
 	}
 
-	client, err := service.NewProxyHttpClient(ch.GetSetting().Proxy)
+	responseHeaderTimeout := time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = 30 * time.Second
+	}
+	client, err := service.GetHttpClientWithResponseHeaderTimeout(ch.GetSetting().Proxy, responseHeaderTimeout)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), responseHeaderTimeout+5*time.Second)
 	defer cancel()
 
 	statusCode, body, err := fetch(ctx, client, ch.GetBaseURL(), accessToken, accountID)
@@ -116,30 +120,28 @@ func fetchCodexChannelWhamData(
 		return
 	}
 
-	if (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) && strings.TrimSpace(oauthKey.RefreshToken) != "" {
+	if statusCode == http.StatusUnauthorized && strings.TrimSpace(oauthKey.RefreshToken) != "" {
 		refreshCtx, refreshCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-		defer refreshCancel()
-
-		res, refreshErr := service.RefreshCodexOAuthTokenWithProxy(refreshCtx, oauthKey.RefreshToken, ch.GetSetting().Proxy)
-		if refreshErr == nil {
-			oauthKey.AccessToken = res.AccessToken
-			oauthKey.RefreshToken = res.RefreshToken
-			oauthKey.LastRefresh = time.Now().Format(time.RFC3339)
-			oauthKey.Expired = res.ExpiresAt.Format(time.RFC3339)
-			if strings.TrimSpace(oauthKey.Type) == "" {
-				oauthKey.Type = "codex"
+		refreshedKey, refreshedChannel, refreshErr := service.RefreshCodexChannelCredential(
+			refreshCtx,
+			ch.Id,
+			service.CodexCredentialRefreshOptions{ResetCaches: true},
+		)
+		refreshCancel()
+		if refreshErr != nil {
+			common.SysError(logPrefix + " credential refresh failed: " + refreshErr.Error())
+		} else {
+			oauthKey = refreshedKey
+			ch = refreshedChannel
+			accountID = strings.TrimSpace(oauthKey.AccountID)
+			client, err = service.GetHttpClientWithResponseHeaderTimeout(ch.GetSetting().Proxy, responseHeaderTimeout)
+			if err != nil {
+				common.ApiError(c, err)
+				return
 			}
-
-			encoded, encErr := common.Marshal(oauthKey)
-			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
-				model.InitChannelCache()
-				service.ResetProxyClientCache()
-			}
-
-			ctx2, cancel2 := context.WithTimeout(c.Request.Context(), 15*time.Second)
-			defer cancel2()
+			ctx2, cancel2 := context.WithTimeout(c.Request.Context(), responseHeaderTimeout+5*time.Second)
 			statusCode, body, err = fetch(ctx2, client, ch.GetBaseURL(), oauthKey.AccessToken, accountID)
+			cancel2()
 			if err != nil {
 				common.SysError(logPrefix + " after refresh: " + err.Error())
 				c.JSON(http.StatusOK, gin.H{"success": false, "message": userMessage})

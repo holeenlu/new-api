@@ -38,9 +38,10 @@ import {
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
 import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
+import { localizeErrorMessage } from '@/lib/localize-error-message'
 import { cn } from '@/lib/utils'
 
-import { LOG_TYPE_ALL_VALUE } from '../../constants'
+import { LOG_TYPE_ALL_VALUE, LOG_TYPE_ENUM } from '../../constants'
 import type { UsageLog } from '../../data/schema'
 import {
   formatModelName,
@@ -804,7 +805,9 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
         } else if (log.content) {
           detailPreview = (
             <span className='text-muted-foreground truncate group-hover:underline'>
-              {log.content}
+              {log.type === LOG_TYPE_ENUM.ERROR
+                ? localizeErrorMessage(log.content)
+                : log.content}
             </span>
           )
         }
