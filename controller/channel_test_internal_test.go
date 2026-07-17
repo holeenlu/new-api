@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +17,22 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestChannelTestAPIErrorPreservesTypedUpstreamError(t *testing.T) {
+	upstreamErr := types.NewErrorWithStatusCode(
+		errors.New("credential concurrency limit reached"),
+		types.ErrorCodeOAuthChannelConcurrencyLimit,
+		http.StatusServiceUnavailable,
+	)
+	upstreamErr.UpstreamStatusCode = http.StatusTooManyRequests
+
+	actual := channelTestAPIError(upstreamErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+
+	require.Same(t, upstreamErr, actual)
+	require.Equal(t, http.StatusServiceUnavailable, actual.StatusCode)
+	require.Equal(t, http.StatusTooManyRequests, actual.GetUpstreamStatusCode())
+	require.Equal(t, types.ErrorCodeOAuthChannelConcurrencyLimit, actual.GetErrorCode())
+}
 
 func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
 	info := &relaycommon.RelayInfo{
@@ -98,7 +115,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 	require.Equal(t, 2, selected[0].Id)
 }
 
-func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
+func TestSelectChannelsForAutomaticTestScheduledIncludesSubscriptionChannels(t *testing.T) {
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
@@ -109,9 +126,13 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
 
-	require.Len(t, selected, 2)
-	require.Equal(t, 1, selected[0].Id)
-	require.Equal(t, 2, selected[1].Id)
+	require.Len(t, selected, 4)
+	require.Equal(t, []int{1, 2, 4, 5}, []int{
+		selected[0].Id,
+		selected[1].Id,
+		selected[2].Id,
+		selected[3].Id,
+	})
 }
 
 func TestBuildTestRequestLimitsClaudeCodeProbeOutput(t *testing.T) {

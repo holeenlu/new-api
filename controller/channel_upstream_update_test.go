@@ -114,7 +114,6 @@ func TestCollectPendingApplyUpstreamModelChanges(t *testing.T) {
 }
 
 func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
-	t.Setenv("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", "true")
 	db := setupModelListControllerTestDB(t)
 
 	disabledChannel := &model.Channel{
@@ -151,7 +150,7 @@ func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
 	require.False(t, modelUpdateHandler{}.Enabled())
 }
 
-func TestModelUpdateScheduleHonorsEnvironmentKillSwitch(t *testing.T) {
+func TestModelUpdateScheduleIgnoresLegacyEnvironmentSwitch(t *testing.T) {
 	t.Setenv("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", "false")
 	db := setupModelListControllerTestDB(t)
 	channel := &model.Channel{
@@ -163,7 +162,7 @@ func TestModelUpdateScheduleHonorsEnvironmentKillSwitch(t *testing.T) {
 		UpstreamModelUpdateCheckEnabled: true,
 	})
 	require.NoError(t, db.Create(channel).Error)
-	require.False(t, modelUpdateHandler{}.Enabled())
+	require.True(t, modelUpdateHandler{}.Enabled())
 }
 
 func TestNormalizeChannelModelMapping(t *testing.T) {

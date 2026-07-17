@@ -76,10 +76,11 @@ services:
     networks:
       - new-api-network
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status/ready | grep -q '\"success\":true' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
 
   redis:
     image: redis:latest

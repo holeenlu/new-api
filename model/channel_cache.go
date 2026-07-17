@@ -123,6 +123,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
+	hasCandidateFilter := len(filters) > 0 && filters[0] != nil
 	channels := filterChannelsByRequestPathAndModel(group2model2channels[group][model], requestPath, model)
 	channels = filterChannelCandidates(channels, filters...)
 
@@ -158,7 +159,9 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
 
-	if retry >= len(uniquePriorities) {
+	if hasCandidateFilter {
+		retry = 0
+	} else if retry >= len(uniquePriorities) {
 		retry = len(uniquePriorities) - 1
 	}
 	targetPriority := int64(sortedUniquePriorities[retry])

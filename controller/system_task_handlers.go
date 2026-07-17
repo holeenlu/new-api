@@ -75,8 +75,7 @@ type modelUpdateHandler struct{}
 func (modelUpdateHandler) Type() string { return model.SystemTaskTypeModelUpdate }
 
 func (modelUpdateHandler) Enabled() bool {
-	return common.GetEnvOrDefaultBool("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", true) &&
-		hasEnabledChannelUpstreamModelUpdateCheck()
+	return hasEnabledChannelUpstreamModelUpdateCheck()
 }
 
 func (modelUpdateHandler) Interval() time.Duration {

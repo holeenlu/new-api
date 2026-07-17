@@ -22,13 +22,40 @@ type CodexCredentialRefreshOptions struct {
 
 type CodexOAuthKey = dto.CodexOAuthCredential
 
-var codexChannelCredentialRefreshLocks sync.Map
+type codexCredentialRefreshLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+var codexChannelCredentialRefreshLocks = struct {
+	sync.Mutex
+	locks map[int]*codexCredentialRefreshLock
+}{
+	locks: make(map[int]*codexCredentialRefreshLock),
+}
 
 var errCodexCredentialChanged = errors.New("codex channel credential changed during refresh")
 
-func codexChannelCredentialRefreshLock(channelID int) *sync.Mutex {
-	lock, _ := codexChannelCredentialRefreshLocks.LoadOrStore(channelID, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func acquireCodexChannelCredentialRefreshLock(channelID int) func() {
+	codexChannelCredentialRefreshLocks.Lock()
+	lock := codexChannelCredentialRefreshLocks.locks[channelID]
+	if lock == nil {
+		lock = &codexCredentialRefreshLock{}
+		codexChannelCredentialRefreshLocks.locks[channelID] = lock
+	}
+	lock.refs++
+	codexChannelCredentialRefreshLocks.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		codexChannelCredentialRefreshLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 && codexChannelCredentialRefreshLocks.locks[channelID] == lock {
+			delete(codexChannelCredentialRefreshLocks.locks, channelID)
+		}
+		codexChannelCredentialRefreshLocks.Unlock()
+	}
 }
 
 func parseCodexOAuthKey(raw string) (*CodexOAuthKey, error) {
@@ -43,9 +70,8 @@ func parseCodexOAuthKey(raw string) (*CodexOAuthKey, error) {
 }
 
 func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts CodexCredentialRefreshOptions) (*CodexOAuthKey, *model.Channel, error) {
-	refreshLock := codexChannelCredentialRefreshLock(channelID)
-	refreshLock.Lock()
-	defer refreshLock.Unlock()
+	releaseRefreshLock := acquireCodexChannelCredentialRefreshLock(channelID)
+	defer releaseRefreshLock()
 
 	ch, err := model.GetChannelById(channelID, true)
 	if err != nil {

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/url"
@@ -820,4 +821,12 @@ func PingDB() error {
 	lastPingTime = time.Now()
 	common.SysLog("Database pinged successfully")
 	return nil
+}
+
+func PingDBContext(ctx context.Context) error {
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
 }

@@ -39,6 +39,8 @@ skills-lock.json
 
 # Database exports may contain credentials, tokens, and user records.
 backups/
+.deploy-artifacts/
+.pnpm-store/
 
 # Local-only live probes and scratch test workspaces.
 .local-tests/

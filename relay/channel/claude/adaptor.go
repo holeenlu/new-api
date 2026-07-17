@@ -1,14 +1,13 @@
 package claude
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/relayconvert"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -33,19 +33,17 @@ const (
 )
 
 var (
-	ClaudeCodeOAuthMaxConcurrency     = 5
+	ClaudeCodeOAuthMaxConcurrency     = 10
 	ClaudeCodeOAuthMinRequestInterval = 750 * time.Millisecond
-	claudeCodeOAuthSlots              sync.Map
-	claudeCodeOAuthPacing             sync.Map
 )
 
 func InitOAuthRuntimeSettings() {
-	ClaudeCodeOAuthMaxConcurrency = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 5)
+	ClaudeCodeOAuthMaxConcurrency = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10)
 	ClaudeCodeOAuthMinRequestInterval = time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
 	if ClaudeCodeOAuthMaxConcurrency < 1 {
 		ClaudeCodeOAuthMaxConcurrency = 1
-	} else if ClaudeCodeOAuthMaxConcurrency > 8 {
-		ClaudeCodeOAuthMaxConcurrency = 8
+	} else if ClaudeCodeOAuthMaxConcurrency > 10 {
+		ClaudeCodeOAuthMaxConcurrency = 10
 	}
 	if ClaudeCodeOAuthMinRequestInterval < 0 {
 		ClaudeCodeOAuthMinRequestInterval = 0
@@ -54,62 +52,51 @@ func InitOAuthRuntimeSettings() {
 	}
 }
 
-type claudeCodeOAuthPacingState struct {
-	mu        sync.Mutex
-	nextStart time.Time
-}
-
 type claudeCodeOAuthResponseBody struct {
 	io.ReadCloser
-	release func()
-	once    sync.Once
+	lease *service.SubscriptionOAuthLease
 }
 
 func (b *claudeCodeOAuthResponseBody) Close() error {
 	err := b.ReadCloser.Close()
-	b.once.Do(b.release)
+	b.lease.ReleaseResponseBody()
 	return err
 }
 
-func acquireClaudeCodeOAuthSlot(channelID int) (func(), bool) {
-	value, _ := claudeCodeOAuthSlots.LoadOrStore(channelID, make(chan struct{}, ClaudeCodeOAuthMaxConcurrency))
-	slots := value.(chan struct{})
-	select {
-	case slots <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() { <-slots })
-		}, true
-	default:
-		return nil, false
+func acquireClaudeCodeOAuthCapacity(c *gin.Context, info *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		info.ChannelType,
+		info.ChannelId,
+		info.ChannelMultiKeyIndex,
+		info.ApiKey,
+	)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(
+		c.Request.Context(),
+		fingerprint,
+		ClaudeCodeOAuthMaxConcurrency,
+		ClaudeCodeOAuthMinRequestInterval,
+	)
+	if err == nil {
+		service.BindSubscriptionOAuthLease(c, lease)
+		return lease, nil
 	}
-}
-
-func waitForClaudeCodeOAuthTurn(ctx context.Context, channelID int) error {
-	value, _ := claudeCodeOAuthPacing.LoadOrStore(channelID, &claudeCodeOAuthPacingState{})
-	state := value.(*claudeCodeOAuthPacingState)
-
-	state.mu.Lock()
-	now := time.Now()
-	startAt := now
-	if state.nextStart.After(startAt) {
-		startAt = state.nextStart
+	if !service.IsSubscriptionOAuthCapacityError(err) {
+		status := http.StatusServiceUnavailable
+		if c.Request.Context().Err() != nil {
+			status = 499
+		}
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, status, types.ErrOptionWithSkipRetry())
 	}
-	state.nextStart = startAt.Add(ClaudeCodeOAuthMinRequestInterval)
-	state.mu.Unlock()
-
-	delay := time.Until(startAt)
-	if delay <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	retryAfter := service.SubscriptionOAuthCapacityRetryAfter(err)
+	c.Header("Retry-After", strconv.Itoa(service.SubscriptionOAuthCapacityRetryAfterSeconds(err)))
+	apiError := types.NewErrorWithStatusCode(
+		err,
+		types.ErrorCodeOAuthChannelConcurrencyLimit,
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithNoRecordErrorLog(),
+	)
+	apiError.RetryAfter = retryAfter
+	return nil, apiError
 }
 
 // ClaudeCodeIdentitySystem is the exact first system block Anthropic requires on
@@ -317,30 +304,32 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return channel.DoApiRequest(a, c, info, requestBody)
 	}
 
-	release, acquired := acquireClaudeCodeOAuthSlot(info.ChannelId)
-	if !acquired {
-		c.Header("Retry-After", "1")
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("claude code channel concurrency limit reached; retry later"),
-			types.ErrorCodeDoRequestFailed,
-			http.StatusServiceUnavailable,
-		)
+	lease, err := acquireClaudeCodeOAuthCapacity(c, info)
+	if err != nil {
+		return nil, err
 	}
-	if err := waitForClaudeCodeOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
-		release()
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
-	}
+	service.BindSubscriptionOAuthResponseLease(c, lease)
 
 	resp, err := channel.DoApiRequest(a, c, info, requestBody)
 	if err != nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return nil, err
 	}
 	if resp == nil || resp.Body == nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return resp, nil
 	}
-	resp.Body = &claudeCodeOAuthResponseBody{ReadCloser: resp.Body, release: release}
+	resp.Body = &claudeCodeOAuthResponseBody{ReadCloser: resp.Body, lease: lease}
 	return resp, nil
 }
 

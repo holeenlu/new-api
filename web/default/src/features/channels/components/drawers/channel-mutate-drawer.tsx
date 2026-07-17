@@ -3968,7 +3968,7 @@ export function ChannelMutateDrawer({
                                     </Select>
                                     <FormDescription>
                                       {t(
-                                        'Automatic mode keeps retries within the current channel. Select a broader scope only after verifying identical data terms.'
+                                        'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.'
                                       )}
                                     </FormDescription>
                                     <FormMessage />

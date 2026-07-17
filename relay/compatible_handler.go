@@ -70,11 +70,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	adaptor.Init(info)
 
 	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
-	useResponsesCompatibility := service.ShouldChatCompletionsUseResponsesGlobal(
-		info.ChannelId,
-		info.ChannelType,
-		info.OriginModelName,
-	) || (info.ApiType == constant.APITypeCodex && relaycommon.IsSubscriptionOAuthChannel(info.ChannelType))
+	useResponsesCompatibility := shouldUseResponsesCompatibility(info)
 	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
 		!passThroughEnabled &&
 		useResponsesCompatibility {
@@ -212,6 +208,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
+			info.MarkUpstreamFailureResponse()
 			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)

@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -19,7 +20,15 @@ type RetryParam struct {
 	Retry           *int
 	CandidateFilter model.ChannelCandidateFilter
 	Boundary        *RetryBoundary
+	capacityCycles  int
+	capacityWait    time.Duration
+	totalAttempts   int
 	resetNextTry    bool
+	oauthRetry      *SubscriptionOAuthRetryState
+	capacityOrder   []SubscriptionOAuthAttemptTarget
+	capacitySeen    map[string]struct{}
+	capacityReplay  bool
+	capacityCursor  int
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -33,6 +42,30 @@ func (p *RetryParam) SetRetry(retry int) {
 	p.Retry = &retry
 }
 
+func (p *RetryParam) NextCapacityCycleBackoff() (time.Duration, bool) {
+	if p.capacityCycles == 0 {
+		p.capacityCycles = 1
+	}
+	if p.capacityCycles >= common.SubscriptionOAuthCapacityCycleTimes {
+		return 0, false
+	}
+	maxWait := time.Duration(common.SubscriptionOAuthCapacityWaitSeconds) * time.Second
+	remaining := maxWait - p.capacityWait
+	if remaining <= 0 {
+		return 0, false
+	}
+	p.capacityCycles++
+	shift := min(p.capacityCycles-2, 3)
+	base := 250 * time.Millisecond * time.Duration(1<<shift)
+	jitterLimit := min(int(base/(4*time.Millisecond)), 100)
+	delay := base + time.Duration(common.GetRandomInt(jitterLimit+1))*time.Millisecond
+	if delay > remaining {
+		delay = remaining
+	}
+	p.capacityWait += delay
+	return delay, true
+}
+
 func (p *RetryParam) IncreaseRetry() {
 	if p.resetNextTry {
 		p.resetNextTry = false
@@ -44,8 +77,63 @@ func (p *RetryParam) IncreaseRetry() {
 	*p.Retry++
 }
 
+func (p *RetryParam) RecordAttempt() {
+	p.totalAttempts++
+}
+
+func (p *RetryParam) AttemptIndex() int {
+	if p == nil || p.totalAttempts == 0 {
+		return 0
+	}
+	return p.totalAttempts - 1
+}
+
 func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
+}
+
+func (p *RetryParam) recordCapacityTarget(target *SubscriptionOAuthAttemptTarget) {
+	if p == nil || target == nil || target.Fingerprint == "" {
+		return
+	}
+	if p.capacitySeen == nil {
+		p.capacitySeen = make(map[string]struct{})
+	}
+	if _, exists := p.capacitySeen[target.Fingerprint]; exists {
+		return
+	}
+	p.capacitySeen[target.Fingerprint] = struct{}{}
+	p.capacityOrder = append(p.capacityOrder, SubscriptionOAuthAttemptTarget{
+		ChannelID:   target.ChannelID,
+		KeyIndex:    target.KeyIndex,
+		Fingerprint: target.Fingerprint,
+	})
+}
+
+func (p *RetryParam) advanceCapacityReplay() {
+	if p == nil || !p.capacityReplay || p.capacityCursor >= len(p.capacityOrder) {
+		if p != nil {
+			p.capacityReplay = false
+		}
+		return
+	}
+	target := p.capacityOrder[p.capacityCursor]
+	p.capacityCursor++
+	state := p.ensureSubscriptionOAuthRetryState()
+	state.current = &target
+	if state.credentials[target.Fingerprint] == nil {
+		state.credentials[target.Fingerprint] = &subscriptionOAuthCredentialRetry{}
+	}
+}
+
+func (p *RetryParam) StartCapacityReplay() bool {
+	if p == nil || len(p.capacityOrder) == 0 {
+		return false
+	}
+	p.capacityReplay = true
+	p.capacityCursor = 0
+	p.advanceCapacityReplay()
+	return p.SubscriptionOAuthAttemptTarget() != nil
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.

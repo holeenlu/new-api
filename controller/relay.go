@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -198,12 +199,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
-		relayInfo.RetryIndex = retryParam.GetRetry()
+	retryTimes := common.RetryTimes
+	isSubscriptionOAuth := relaycommon.IsSubscriptionOAuthChannel(
+		common.GetContextKeyInt(c, constant.ContextKeyChannelType),
+	)
+	if isSubscriptionOAuth {
+		retryTimes = common.SubscriptionOAuthUpstreamRetryTimes
+	}
+	for {
+		if !isSubscriptionOAuth && retryParam.GetRetry() > retryTimes {
+			break
+		}
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			if retryParam.GetRetry() > 0 && relayInfo.LastError != nil {
+			if relayInfo.LastError != nil && channelErr.StatusCode != 499 &&
+				(isSubscriptionOAuth || retryParam.GetRetry() > 0) {
 				newAPIError = relayInfo.LastError
 			} else {
 				newAPIError = channelErr
@@ -211,10 +222,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
+		retryParam.RecordAttempt()
+		if isSubscriptionOAuth {
+			relayInfo.RetryIndex = retryParam.AttemptIndex()
+		} else {
+			relayInfo.RetryIndex = retryParam.GetRetry()
+		}
 		addUsedChannel(c, channel.Id)
 		attempt := len(c.GetStringSlice("use_channel"))
 		service.ApplyRelayDataPolicyHeaders(c, channel, attempt)
 		trackRetryAttempt(c, retryParam, channel)
+		clearStaleRetryAfter(c)
+		relayInfo.ResetUpstreamAttemptState()
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -237,24 +256,50 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		default:
 			newAPIError = relayHandler(c, relayInfo)
 		}
+		retryParam.CaptureSubscriptionOAuthAttemptMetadata(c)
 
 		if newAPIError == nil {
+			affinitySuccess := true
+			if relayInfo.StreamStatus != nil &&
+				(!relayInfo.StreamStatus.IsNormalEnd() || relayInfo.StreamStatus.HasErrors()) {
+				affinitySuccess = false
+			}
+			if isSubscriptionOAuth && affinitySuccess {
+				retryParam.MarkSubscriptionOAuthSuccess()
+			} else if isSubscriptionOAuth {
+				retryParam.MarkSubscriptionOAuthFailure()
+			}
+			c.Set("relay_affinity_success", affinitySuccess)
 			relayInfo.LastError = nil
 			return
 		}
+		retryParam.MarkSubscriptionOAuthFailure()
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		newAPIError = service.ApplyChannelErrorPolicy(channel.Type, newAPIError)
-		if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, newAPIError) && retryParam.Boundary != nil {
-			retryParam.Boundary.AllowDefaultSubscriptionOAuthFailover()
-		}
+		applySubscriptionOAuthCapacityFailover(channel, newAPIError, retryParam)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, newAPIError) {
+			logger.LogWarn(c, fmt.Sprintf(
+				"subscription OAuth capacity failover: channel=%d credential=%s",
+				channel.Id,
+				c.GetString("subscription_oauth_credential_fp"),
+			))
+		} else {
+			processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		}
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		if isSubscriptionOAuth {
+			if !shouldContinueSubscriptionOAuthRetry(c, relayInfo, retryParam, newAPIError) {
+				break
+			}
+			continue
+		}
+		if !shouldRetry(c, newAPIError, retryTimes-retryParam.GetRetry()) {
 			break
 		}
+		retryParam.IncreaseRetry()
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -267,6 +312,63 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
 	}
+}
+
+func shouldContinueSubscriptionOAuthRetry(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	retryParam *service.RetryParam,
+	apiError *types.NewAPIError,
+) bool {
+	statusCode := 0
+	if apiError != nil {
+		statusCode = apiError.GetUpstreamStatusCode()
+	}
+	accountUnavailable := service.IsSubscriptionOAuthAccountUnavailable(c.GetInt("channel_type"), apiError)
+	modelUnavailable := service.IsSubscriptionOAuthModelUnavailable(c.GetInt("channel_type"), apiError)
+	if accountUnavailable || modelUnavailable {
+		if accountUnavailable {
+			retryParam.HandleSubscriptionOAuthAccountUnavailable()
+		} else if !c.Writer.Written() {
+			retryParam.HandleSubscriptionOAuthModelUnavailable()
+		}
+		if c.Writer.Written() {
+			return false
+		}
+		if _, specificChannel := c.Get("specific_channel_id"); specificChannel {
+			return false
+		}
+		return true
+	}
+	if statusCode == http.StatusTooManyRequests {
+		retryAfter := service.SubscriptionOAuthRetryCooldown(apiError.RetryAfter)
+		seconds := int((retryAfter + time.Second - 1) / time.Second)
+		c.Header("Retry-After", strconv.Itoa(max(seconds, 1)))
+		written, responseStarted := info.UpstreamAttemptState()
+		return retryParam.DecideSubscriptionOAuthRetry(
+			written,
+			responseStarted,
+			info.HasUpstreamFailureResponse(),
+			c.Writer.Written(),
+			statusCode,
+			apiError.RetryAfter,
+		) != service.SubscriptionOAuthRetryStop
+	}
+	if !shouldRetry(c, apiError, common.SubscriptionOAuthUpstreamRetryTimes) {
+		return false
+	}
+	if service.IsSubscriptionOAuthConcurrencyLimit(c.GetInt("channel_type"), apiError) {
+		return true
+	}
+	written, responseStarted := info.UpstreamAttemptState()
+	return retryParam.DecideSubscriptionOAuthRetry(
+		written,
+		responseStarted,
+		info.HasUpstreamFailureResponse(),
+		c.Writer.Written(),
+		statusCode,
+		apiError.RetryAfter,
+	) != service.SubscriptionOAuthRetryStop
 }
 
 var upgrader = websocket.Upgrader{
@@ -282,6 +384,20 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	c.Set("use_channel", useChannel)
 }
 
+func clearStaleRetryAfter(c *gin.Context) {
+	if c == nil || c.Writer == nil {
+		return
+	}
+	c.Writer.Header().Del("Retry-After")
+}
+
+func applySubscriptionOAuthCapacityFailover(channel *model.Channel, apiError *types.NewAPIError, retryParam *service.RetryParam) {
+	if channel == nil || retryParam == nil || retryParam.Boundary == nil || !service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, apiError) {
+		return
+	}
+	retryParam.HandleSubscriptionOAuthCapacityFailure()
+}
+
 func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) {
 	if retryParam.Boundary == nil {
 		retryParam.Boundary = service.NewRetryBoundary(channel)
@@ -291,6 +407,24 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 	}
 	if retryParam.Boundary == nil {
 		return
+	}
+	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
+		service.ClearSubscriptionOAuthAttemptMetadata(c)
+		keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+		fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+			channel.Type,
+			channel.Id,
+			keyIndex,
+			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+		)
+		retryParam.SetSubscriptionOAuthAttempt(channel.Id, keyIndex, fingerprint)
+		fingerprintPreview := fingerprint
+		if len(fingerprintPreview) > 12 {
+			fingerprintPreview = fingerprintPreview[:12]
+		}
+		c.Set("subscription_oauth_credential_fp", fingerprintPreview)
+		fingerprints := c.GetStringSlice("subscription_oauth_credential_path")
+		c.Set("subscription_oauth_credential_path", append(fingerprints, fingerprintPreview))
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		retryParam.Boundary.MarkAttempt(channel, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
@@ -336,7 +470,52 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		}
 		return channel, nil
 	}
-	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
+	var channel *model.Channel
+	var selectGroup string
+	var err error
+	for {
+		if target := retryParam.SubscriptionOAuthAttemptTarget(); target != nil {
+			channel, err = model.CacheGetChannel(target.ChannelID)
+			if err == nil && retryParam.Boundary != nil && retryParam.Boundary.Allows(channel) {
+				matched, setupErr := middleware.SetupContextForSelectedChannelAtCredential(
+					c,
+					channel,
+					info.OriginModelName,
+					target.KeyIndex,
+					target.Fingerprint,
+				)
+				if setupErr == nil && matched {
+					return channel, nil
+				}
+			}
+			retryParam.HandleSubscriptionOAuthCredentialUnavailable()
+			continue
+		}
+
+		channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(retryParam)
+		if err != nil || channel != nil || retryParam.Boundary == nil || !retryParam.Boundary.HasCapacityExclusions() {
+			break
+		}
+		delay, canRestart := retryParam.NextCapacityCycleBackoff()
+		if !canRestart {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-c.Request.Context().Done():
+			timer.Stop()
+			return nil, types.NewErrorWithStatusCode(
+				c.Request.Context().Err(),
+				types.ErrorCodeDoRequestFailed,
+				499,
+				types.ErrOptionWithSkipRetry(),
+			)
+		case <-timer.C:
+		}
+		if !retryParam.Boundary.RestartCapacityCycle() || !retryParam.StartCapacityReplay() {
+			break
+		}
+	}
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
 
@@ -349,7 +528,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	var excludedMultiKeyIndexes map[int]struct{}
 	if retryParam.Boundary != nil {
-		excludedMultiKeyIndexes = retryParam.Boundary.UsedMultiKeyIndexes(channel.Id)
+		excludedMultiKeyIndexes = retryParam.Boundary.ExcludedKeyIndexes(channel)
 	}
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName, excludedMultiKeyIndexes)
 	if newAPIError != nil {
@@ -362,7 +541,14 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
-	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+	if _, ok := c.Get("specific_channel_id"); ok {
+		return false
+	}
+	if service.IsSubscriptionOAuthConcurrencyLimit(c.GetInt("channel_type"), openaiErr) {
+		return true
+	}
+	if !relaycommon.IsSubscriptionOAuthChannel(c.GetInt("channel_type")) &&
+		service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {
@@ -371,10 +557,10 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if types.IsSkipRetryError(openaiErr) {
 		return false
 	}
-	if retryTimes <= 0 {
-		return false
+	if service.IsSubscriptionOAuthTransientError(c.GetInt("channel_type"), openaiErr) {
+		return true
 	}
-	if _, ok := c.Get("specific_channel_id"); ok {
+	if retryTimes <= 0 {
 		return false
 	}
 	code := openaiErr.StatusCode
@@ -386,9 +572,6 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	}
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
-	}
-	if service.IsSubscriptionOAuthTransientError(c.GetInt("channel_type"), openaiErr) {
-		return true
 	}
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
@@ -404,6 +587,9 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	// the actual upstream/network error in runtime and persisted error logs.
 	errorDetail := err.ErrorWithStatusCode()
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d): %s; detail: %s", channelError.ChannelId, errorSummary, errorDetail))
+	if service.IsSubscriptionOAuthAccountUnavailable(channelError.ChannelType, err) {
+		service.QuarantineSubscriptionOAuthCredential(channelError, err)
+	}
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannelForType(channelError.ChannelType, err) && channelError.AutoBan {
@@ -432,6 +618,10 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		other["channel_type"] = c.GetInt("channel_type")
 		adminInfo := make(map[string]interface{})
 		adminInfo["use_channel"] = c.GetStringSlice("use_channel")
+		if credentialPath := c.GetStringSlice("subscription_oauth_credential_path"); len(credentialPath) > 0 {
+			adminInfo["subscription_oauth_credential_path"] = credentialPath
+			adminInfo["subscription_oauth_credential_fp"] = c.GetString("subscription_oauth_credential_fp")
+		}
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
 		if isMultiKey {
 			adminInfo["is_multi_key"] = true

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -163,6 +164,9 @@ type RelayInfo struct {
 	IsChannelTest                         bool // channel test request
 	RetryIndex                            int
 	LastError                             *types.NewAPIError
+	upstreamRequestWritten                atomic.Bool
+	upstreamResponseStarted               atomic.Bool
+	upstreamFailureResponse               atomic.Bool
 	RuntimeHeadersOverride                map[string]interface{}
 	UseRuntimeHeadersOverride             bool
 	ParamOverrideAudit                    []string
@@ -204,6 +208,44 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+func (info *RelayInfo) ResetUpstreamAttemptState() {
+	if info == nil {
+		return
+	}
+	info.upstreamRequestWritten.Store(false)
+	info.upstreamResponseStarted.Store(false)
+	info.upstreamFailureResponse.Store(false)
+}
+
+func (info *RelayInfo) MarkUpstreamRequestWritten() {
+	if info != nil {
+		info.upstreamRequestWritten.Store(true)
+	}
+}
+
+func (info *RelayInfo) MarkUpstreamResponseStarted() {
+	if info != nil {
+		info.upstreamResponseStarted.Store(true)
+	}
+}
+
+func (info *RelayInfo) MarkUpstreamFailureResponse() {
+	if info != nil {
+		info.upstreamFailureResponse.Store(true)
+	}
+}
+
+func (info *RelayInfo) UpstreamAttemptState() (written bool, responseStarted bool) {
+	if info == nil {
+		return false, false
+	}
+	return info.upstreamRequestWritten.Load(), info.upstreamResponseStarted.Load()
+}
+
+func (info *RelayInfo) HasUpstreamFailureResponse() bool {
+	return info != nil && info.upstreamFailureResponse.Load()
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {

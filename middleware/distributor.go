@@ -164,7 +164,11 @@ func Distribute() func(c *gin.Context) {
 		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
 		service.ApplyRelayDataPolicyHeaders(c, channel, 1)
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		finalChannelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
+		isSubscriptionChannel := finalChannelType == constant.ChannelTypeCodex ||
+			finalChannelType == constant.ChannelTypeClaudeCode
+		subscriptionAffinitySucceeded := !isSubscriptionChannel || c.GetBool("relay_affinity_success")
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && subscriptionAffinitySucceeded {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -442,6 +446,35 @@ func getTaskOriginModelName(c *gin.Context) string {
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, excludedMultiKeyIndexes ...map[int]struct{}) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, nil, excludedMultiKeyIndexes...)
+}
+
+type selectedChannelKey struct {
+	index int
+	key   string
+}
+
+func SetupContextForSelectedChannelAtCredential(
+	c *gin.Context,
+	channel *model.Channel,
+	modelName string,
+	keyIndex int,
+	expectedFingerprint string,
+) (bool, *types.NewAPIError) {
+	if channel == nil {
+		return false, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	key, err := channel.GetEnabledKeyAt(keyIndex)
+	if err != nil {
+		return false, err
+	}
+	if service.SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, keyIndex, key) != expectedFingerprint {
+		return false, nil
+	}
+	return true, setupContextForSelectedChannel(c, channel, modelName, &selectedChannelKey{index: keyIndex, key: key})
+}
+
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, preferredKey *selectedChannelKey, excludedMultiKeyIndexes ...map[int]struct{}) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
@@ -466,7 +499,15 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey(excludedMultiKeyIndexes...)
+	var key string
+	var index int
+	var newAPIError *types.NewAPIError
+	if preferredKey != nil {
+		index = preferredKey.index
+		key = preferredKey.key
+	} else {
+		key, index, newAPIError = channel.GetNextEnabledKey(excludedMultiKeyIndexes...)
+	}
 	if newAPIError != nil {
 		return newAPIError
 	}

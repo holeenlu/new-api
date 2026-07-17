@@ -258,12 +258,6 @@ func (channel *Channel) GetNextEnabledKey(excludedIndexes ...map[int]struct{}) (
 		selectedIdx := untriedIdx[rand.Intn(len(untriedIdx))]
 		return keys[selectedIdx], selectedIdx, nil
 	case constant.MultiKeyModePolling:
-		// Use channel-specific lock to ensure thread-safe polling
-
-		channelInfo, err := CacheGetChannelInfo(channel.Id)
-		if err != nil {
-			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		}
 		defer func() {
 			if common.DebugEnabled {
 				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ChannelInfo.MultiKeyPollingIndex)
@@ -275,7 +269,10 @@ func (channel *Channel) GetNextEnabledKey(excludedIndexes ...map[int]struct{}) (
 			}
 		}()
 		// Start from the saved polling index and look for the next enabled key
-		start := channelInfo.MultiKeyPollingIndex
+		// The caller's channel snapshot is protected by the polling lock. Looking
+		// it up in the global channel cache here would reverse the lock order used
+		// by candidate selection and can deadlock a pending cache refresh.
+		start := channel.ChannelInfo.MultiKeyPollingIndex
 		if start < 0 || start >= len(keys) {
 			start = 0
 		}
@@ -296,6 +293,24 @@ func (channel *Channel) GetNextEnabledKey(excludedIndexes ...map[int]struct{}) (
 		// Unknown mode, default to the first untried enabled key.
 		return keys[untriedIdx[0]], untriedIdx[0], nil
 	}
+}
+
+func (channel *Channel) GetEnabledKeyAt(index int) (string, *types.NewAPIError) {
+	if channel.ChannelInfo.IsMultiKey {
+		lock := GetChannelPollingLock(channel.Id)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	keys := channel.GetKeys()
+	if index < 0 || index >= len(keys) {
+		return "", types.NewError(errors.New("channel key index is out of range"), types.ErrorCodeChannelNoAvailableKey)
+	}
+	if channel.ChannelInfo.IsMultiKey {
+		if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
+			return "", types.NewError(errors.New("channel key is disabled"), types.ErrorCodeChannelNoAvailableKey)
+		}
+	}
+	return keys[index], nil
 }
 
 func (channel *Channel) SaveChannelInfo() error {
@@ -332,7 +347,7 @@ func (channel *Channel) GetOtherInfo() map[string]interface{} {
 }
 
 func (channel *Channel) SetOtherInfo(otherInfo map[string]interface{}) {
-	otherInfoBytes, err := json.Marshal(otherInfo)
+	otherInfoBytes, err := common.Marshal(otherInfo)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
 		return
@@ -980,6 +995,11 @@ func (channel *Channel) ValidateSettings() error {
 	}
 	if err := channelOtherSettings.DataPolicy.Validate(); err != nil {
 		return err
+	}
+	if channelOtherSettings.DataPolicy != nil &&
+		channelOtherSettings.DataPolicy.RetryIsolation == dto.RetryIsolationTag &&
+		(channel.Tag == nil || strings.TrimSpace(*channel.Tag) == "") {
+		return fmt.Errorf("tag is required for tag retry isolation")
 	}
 	return nil
 }

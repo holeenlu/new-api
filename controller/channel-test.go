@@ -41,6 +41,14 @@ type testResult struct {
 	newAPIError *types.NewAPIError
 }
 
+func channelTestAPIError(err error, code types.ErrorCode, statusCode int) *types.NewAPIError {
+	var apiErr *types.NewAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return types.NewOpenAIError(err, code, statusCode)
+}
+
 func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
 	normalized := strings.TrimSpace(endpointType)
 	if normalized != "" {
@@ -392,7 +400,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		return testResult{
 			context:     c,
 			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
+			newAPIError: channelTestAPIError(err, types.ErrorCodeConvertRequestFailed, http.StatusInternalServerError),
 		}
 	}
 	jsonData, err := common.Marshal(convertedRequest)
@@ -434,11 +442,17 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	requestBody := bytes.NewBuffer(jsonData)
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
 	resp, err := adaptor.DoRequest(c, info, requestBody)
+	responseSucceeded := false
+	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
+		defer func() {
+			service.ResolveBoundSubscriptionOAuthResponse(c, responseSucceeded)
+		}()
+	}
 	if err != nil {
 		return testResult{
 			context:     c,
 			localErr:    err,
-			newAPIError: types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+			newAPIError: channelTestAPIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
 		}
 	}
 	var httpResp *http.Response
@@ -460,7 +474,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			return testResult{
 				context:     c,
 				localErr:    err,
-				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+				newAPIError: err,
 			}
 		}
 	}
@@ -521,6 +535,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	} else {
 		common.SysLog(fmt.Sprintf("testing channel #%d, response body omitted (%d bytes)", channel.Id, len(respBody)))
 	}
+	responseSucceeded = true
 	return testResult{
 		context:     c,
 		localErr:    nil,
@@ -875,6 +890,13 @@ func TestChannel(c *gin.Context) {
 		requestCtx = c.Request.Context()
 	}
 	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, result.newAPIError) {
+		service.QuarantineSubscriptionOAuthCredential(
+			*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+				common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+			result.newAPIError,
+		)
+	}
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -952,6 +974,14 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		shouldBanChannel := false
 		newAPIError := result.newAPIError
+		credentialQuarantined := false
+		if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, newAPIError) {
+			credentialQuarantined = service.QuarantineSubscriptionOAuthCredential(
+				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+					common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+				newAPIError,
+			)
+		}
 		// request error disables the channel
 		if newAPIError != nil {
 			shouldBanChannel = service.ShouldDisableChannelForType(channel.Type, result.newAPIError)
@@ -973,7 +1003,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		}
 
 		// disable channel
-		if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+		if !credentialQuarantined && allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
 			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 			summary.Disabled++
 		}
@@ -1035,11 +1065,6 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
 	for _, channel := range channels {
-		// Subscription OAuth channels are intentionally excluded from scheduled
-		// inference probes. A manual single-channel test remains available.
-		if channel.Type == constant.ChannelTypeClaudeCode || channel.Type == constant.ChannelTypeCodex {
-			continue
-		}
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
 		}

@@ -70,6 +70,20 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 	}
 }
 
+func shouldUseResponsesCompatibility(info *relaycommon.RelayInfo) bool {
+	if info == nil || info.ChannelMeta == nil {
+		return false
+	}
+	if info.ApiType == constant.APITypeCodex && relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
+		return true
+	}
+	return service.ShouldChatCompletionsUseResponsesGlobal(
+		info.ChannelId,
+		info.ChannelType,
+		info.OriginModelName,
+	)
+}
+
 func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
 	chatJSON, err := common.Marshal(request)
 	if err != nil {
@@ -161,6 +175,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	upstreamStream := isResponsesEventStreamContentType(httpResp.Header.Get("Content-Type"))
 	info.IsStream = clientStream || upstreamStream
 	if httpResp.StatusCode != http.StatusOK {
+		info.MarkUpstreamFailureResponse()
 		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp)
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr

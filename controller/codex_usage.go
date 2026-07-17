@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -99,6 +100,18 @@ func fetchCodexChannelWhamData(
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "codex channel: account_id is required"})
 		return
 	}
+	lease, err := acquireSubscriptionOAuthManagementCapacity(
+		c.Request.Context(),
+		ch.Type,
+		ch.Id,
+		0,
+		ch.Key,
+	)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	defer lease.Release()
 
 	responseHeaderTimeout := time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	if responseHeaderTimeout <= 0 {
@@ -166,15 +179,20 @@ func fetchCodexChannelWhamData(
 		"data":            payload,
 	}
 	if !ok {
-		switch statusCode {
-		case http.StatusUnauthorized:
-			resp["error_code"] = types.ErrorCodeOAuthUnauthorized
-			resp["message"] = "OAuth credential is invalid or expired"
-		case http.StatusForbidden:
-			resp["error_code"] = types.ErrorCodeOAuthForbidden
-			resp["message"] = "OAuth account is not permitted to access this resource"
-		default:
-			resp["message"] = fmt.Sprintf("upstream status: %d", statusCode)
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			message = fmt.Sprintf("upstream status: %d", statusCode)
+		}
+		upstreamErr := types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, statusCode)
+		upstreamErr.UpstreamStatusCode = statusCode
+		upstreamErr = service.ApplyChannelErrorPolicy(ch.Type, upstreamErr)
+		resp["error_code"] = upstreamErr.GetErrorCode()
+		resp["message"] = upstreamErr.Error()
+		if service.IsSubscriptionOAuthAccountUnavailable(ch.Type, upstreamErr) {
+			service.QuarantineSubscriptionOAuthCredential(
+				*types.NewChannelError(ch.Id, ch.Type, ch.Name, ch.ChannelInfo.IsMultiKey, ch.Key, ch.GetAutoBan()),
+				upstreamErr,
+			)
 		}
 	}
 	c.JSON(http.StatusOK, resp)

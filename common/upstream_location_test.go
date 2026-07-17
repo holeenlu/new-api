@@ -126,6 +126,28 @@ func TestDiscoverUpstreamLocationProfileRejectsIncompleteConnectivityCheck(t *te
 	require.Empty(t, profile)
 }
 
+func TestDiscoverUpstreamLocationProfileDoesNotFollowRedirects(t *testing.T) {
+	redirectTargetReached := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect-target" {
+			redirectTargetReached = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Redirect(w, r, "/redirect-target", http.StatusFound)
+	}))
+	defer server.Close()
+
+	_, err := discoverUpstreamLocationProfile(context.Background(), server.Client(), upstreamLocationDiscoveryEndpoints{
+		ProbeURLs:            []string{server.URL + "/probe"},
+		PublicIPTraceURL:     server.URL + "/trace",
+		GeoLookupURLTemplate: server.URL + "/geo/{ip}",
+	})
+
+	require.Error(t, err)
+	require.False(t, redirectTargetReached)
+}
+
 func TestMergeUpstreamLocationProfilePreservesExplicitConfiguration(t *testing.T) {
 	discoveredLatitude := 37.4056
 	discoveredLongitude := -122.0775

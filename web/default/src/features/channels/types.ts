@@ -115,7 +115,7 @@ export interface ChannelDataPolicy {
   region?: string
   retention?: string
   training?: 'provider_default' | 'disabled' | 'enabled'
-  retry_isolation?: 'channel' | 'provider' | 'policy_group'
+  retry_isolation?: 'channel' | 'provider' | 'policy_group' | 'tag'
   retry_policy_group?: string
 }
 

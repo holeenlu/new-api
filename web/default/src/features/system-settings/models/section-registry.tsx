@@ -72,6 +72,13 @@ const MODELS_SECTIONS = [
       <RoutingReliabilitySection
         defaultValues={{
           RetryTimes: settings.RetryTimes,
+          SubscriptionOAuthUpstreamRetryTimes:
+            settings.SubscriptionOAuthUpstreamRetryTimes,
+          SubscriptionOAuthCapacityCycleTimes:
+            settings.SubscriptionOAuthCapacityCycleTimes,
+          SubscriptionOAuthCapacityWaitSeconds:
+            settings.SubscriptionOAuthCapacityWaitSeconds,
+          SubscriptionOAuthRetry429: settings.SubscriptionOAuthRetry429,
           ChannelDisableThreshold: settings.ChannelDisableThreshold,
           AutomaticDisableChannelEnabled:
             settings.AutomaticDisableChannelEnabled,

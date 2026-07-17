@@ -1,13 +1,12 @@
 package codex
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -29,7 +29,6 @@ var codexClientHeaders = []string{
 	"session-id",
 	"thread-id",
 	"x-client-request-id",
-	"x-codex-beta-features",
 	"x-codex-parent-thread-id",
 	"x-codex-turn-state",
 	"x-codex-turn-metadata",
@@ -172,19 +171,17 @@ func ensureCodexLiteInclude(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 var (
-	CodexOAuthMaxConcurrency     = 5
+	CodexOAuthMaxConcurrency     = 10
 	CodexOAuthMinRequestInterval = 750 * time.Millisecond
-	codexOAuthSlots              sync.Map
-	codexOAuthPacing             sync.Map
 )
 
 func InitOAuthRuntimeSettings() {
-	CodexOAuthMaxConcurrency = common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 5)
+	CodexOAuthMaxConcurrency = common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 10)
 	CodexOAuthMinRequestInterval = time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
 	if CodexOAuthMaxConcurrency < 1 {
 		CodexOAuthMaxConcurrency = 1
-	} else if CodexOAuthMaxConcurrency > 8 {
-		CodexOAuthMaxConcurrency = 8
+	} else if CodexOAuthMaxConcurrency > 10 {
+		CodexOAuthMaxConcurrency = 10
 	}
 	if CodexOAuthMinRequestInterval < 0 {
 		CodexOAuthMinRequestInterval = 0
@@ -193,62 +190,61 @@ func InitOAuthRuntimeSettings() {
 	}
 }
 
-type codexOAuthPacingState struct {
-	mu        sync.Mutex
-	nextStart time.Time
-}
-
 type codexOAuthResponseBody struct {
 	io.ReadCloser
-	release func()
-	once    sync.Once
+	lease *service.SubscriptionOAuthLease
 }
 
 func (b *codexOAuthResponseBody) Close() error {
 	err := b.ReadCloser.Close()
-	b.once.Do(b.release)
+	b.lease.ReleaseResponseBody()
 	return err
 }
 
-func acquireCodexOAuthSlot(channelID int) (func(), bool) {
-	value, _ := codexOAuthSlots.LoadOrStore(channelID, make(chan struct{}, CodexOAuthMaxConcurrency))
-	slots := value.(chan struct{})
-	select {
-	case slots <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() { <-slots })
-		}, true
-	default:
-		return nil, false
+func newCodexOAuthConcurrencyLimitError(c *gin.Context, cause error) *types.NewAPIError {
+	retryAfter := service.SubscriptionOAuthCapacityRetryAfter(cause)
+	if c != nil {
+		c.Header("Retry-After", strconv.Itoa(service.SubscriptionOAuthCapacityRetryAfterSeconds(cause)))
 	}
+	message := "codex OAuth credential concurrency limit reached; retry later"
+	if cause != nil {
+		message = cause.Error()
+	}
+	apiError := types.NewErrorWithStatusCode(
+		errors.New(message),
+		types.ErrorCodeOAuthChannelConcurrencyLimit,
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithNoRecordErrorLog(),
+	)
+	apiError.RetryAfter = retryAfter
+	return apiError
 }
 
-func waitForCodexOAuthTurn(ctx context.Context, channelID int) error {
-	value, _ := codexOAuthPacing.LoadOrStore(channelID, &codexOAuthPacingState{})
-	state := value.(*codexOAuthPacingState)
-
-	state.mu.Lock()
-	now := time.Now()
-	startAt := now
-	if state.nextStart.After(startAt) {
-		startAt = state.nextStart
+func acquireCodexOAuthCapacity(c *gin.Context, info *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		info.ChannelType,
+		info.ChannelId,
+		info.ChannelMultiKeyIndex,
+		info.ApiKey,
+	)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(
+		c.Request.Context(),
+		fingerprint,
+		CodexOAuthMaxConcurrency,
+		CodexOAuthMinRequestInterval,
+	)
+	if service.IsSubscriptionOAuthCapacityError(err) {
+		return nil, newCodexOAuthConcurrencyLimitError(c, err)
 	}
-	state.nextStart = startAt.Add(CodexOAuthMinRequestInterval)
-	state.mu.Unlock()
-
-	delay := time.Until(startAt)
-	if delay <= 0 {
-		return nil
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if c.Request.Context().Err() != nil {
+			status = 499
+		}
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, status, types.ErrOptionWithSkipRetry())
 	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	service.BindSubscriptionOAuthLease(c, lease)
+	return lease, nil
 }
 
 func isCodexLiteModel(info *relaycommon.RelayInfo) bool {
@@ -424,30 +420,41 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func doCodexHTTPResponseRequest(c *gin.Context, a *Adaptor, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
-	release, acquired := acquireCodexOAuthSlot(info.ChannelId)
-	if !acquired {
-		c.Header("Retry-After", "1")
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("codex OAuth channel concurrency limit reached; retry later"),
-			types.ErrorCodeOAuthChannelConcurrencyLimit,
-			http.StatusServiceUnavailable,
-		)
+	lease, err := acquireCodexOAuthCapacity(c, info)
+	if err != nil {
+		return nil, err
 	}
-	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
-		release()
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
-	}
+	return doCodexHTTPResponseRequestWithLease(c, a, info, requestBody, lease)
+}
 
+func doCodexHTTPResponseRequestWithLease(
+	c *gin.Context,
+	a *Adaptor,
+	info *relaycommon.RelayInfo,
+	requestBody io.Reader,
+	lease *service.SubscriptionOAuthLease,
+) (*http.Response, error) {
+	service.BindSubscriptionOAuthResponseLease(c, lease)
 	resp, err := channel.DoApiRequest(a, c, info, requestBody)
 	if err != nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return nil, err
 	}
 	if resp == nil || resp.Body == nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return resp, nil
 	}
-	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, release: release}
+	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, lease: lease}
 	return resp, nil
 }
 

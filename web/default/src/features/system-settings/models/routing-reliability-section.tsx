@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -69,6 +69,10 @@ type ChannelTestMode = (typeof channelTestModes)[number]
 const routingReliabilitySchema = z
   .object({
     RetryTimes: z.coerce.number().min(0).max(10),
+    SubscriptionOAuthUpstreamRetryTimes: z.coerce.number().int().min(0).max(10),
+    SubscriptionOAuthCapacityCycleTimes: z.coerce.number().int().min(0).max(10),
+    SubscriptionOAuthCapacityWaitSeconds: z.coerce.number().int().min(0).max(30),
+    SubscriptionOAuthRetry429: z.boolean(),
     ChannelDisableThreshold: numericString,
     AutomaticDisableChannelEnabled: z.boolean(),
     AutomaticEnableChannelEnabled: z.boolean(),
@@ -118,6 +122,10 @@ type RoutingReliabilityFormInput = z.input<typeof routingReliabilitySchema>
 type RoutingReliabilitySectionProps = {
   defaultValues: {
     RetryTimes: number
+    SubscriptionOAuthUpstreamRetryTimes: number
+    SubscriptionOAuthCapacityCycleTimes: number
+    SubscriptionOAuthCapacityWaitSeconds: number
+    SubscriptionOAuthRetry429: boolean
     ChannelDisableThreshold: string
     AutomaticDisableChannelEnabled: boolean
     AutomaticEnableChannelEnabled: boolean
@@ -136,6 +144,10 @@ function normalizeLineEndings(value: string) {
 
 type NormalizedRoutingReliabilityValues = {
   RetryTimes: number
+  SubscriptionOAuthUpstreamRetryTimes: number
+  SubscriptionOAuthCapacityCycleTimes: number
+  SubscriptionOAuthCapacityWaitSeconds: number
+  SubscriptionOAuthRetry429: boolean
   ChannelDisableThreshold: string
   AutomaticDisableChannelEnabled: boolean
   AutomaticEnableChannelEnabled: boolean
@@ -155,6 +167,13 @@ const buildFormDefaults = (
   defaults: RoutingReliabilitySectionProps['defaultValues']
 ): RoutingReliabilityFormInput => ({
   RetryTimes: defaults.RetryTimes ?? 0,
+  SubscriptionOAuthUpstreamRetryTimes:
+    defaults.SubscriptionOAuthUpstreamRetryTimes ?? 5,
+  SubscriptionOAuthCapacityCycleTimes:
+    defaults.SubscriptionOAuthCapacityCycleTimes ?? 5,
+  SubscriptionOAuthCapacityWaitSeconds:
+    defaults.SubscriptionOAuthCapacityWaitSeconds ?? 5,
+  SubscriptionOAuthRetry429: defaults.SubscriptionOAuthRetry429 ?? false,
   ChannelDisableThreshold: defaults.ChannelDisableThreshold ?? '',
   AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
@@ -178,6 +197,13 @@ const normalizeDefaults = (
   defaults: RoutingReliabilitySectionProps['defaultValues']
 ): NormalizedRoutingReliabilityValues => ({
   RetryTimes: defaults.RetryTimes ?? 0,
+  SubscriptionOAuthUpstreamRetryTimes:
+    defaults.SubscriptionOAuthUpstreamRetryTimes ?? 5,
+  SubscriptionOAuthCapacityCycleTimes:
+    defaults.SubscriptionOAuthCapacityCycleTimes ?? 5,
+  SubscriptionOAuthCapacityWaitSeconds:
+    defaults.SubscriptionOAuthCapacityWaitSeconds ?? 5,
+  SubscriptionOAuthRetry429: defaults.SubscriptionOAuthRetry429 ?? false,
   ChannelDisableThreshold: (defaults.ChannelDisableThreshold ?? '').trim(),
   AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
@@ -203,6 +229,13 @@ const normalizeFormValues = (
   values: RoutingReliabilityFormValues
 ): NormalizedRoutingReliabilityValues => ({
   RetryTimes: values.RetryTimes,
+  SubscriptionOAuthUpstreamRetryTimes:
+    values.SubscriptionOAuthUpstreamRetryTimes,
+  SubscriptionOAuthCapacityCycleTimes:
+    values.SubscriptionOAuthCapacityCycleTimes,
+  SubscriptionOAuthCapacityWaitSeconds:
+    values.SubscriptionOAuthCapacityWaitSeconds,
+  SubscriptionOAuthRetry429: values.SubscriptionOAuthRetry429,
   ChannelDisableThreshold: values.ChannelDisableThreshold.trim(),
   AutomaticDisableChannelEnabled: values.AutomaticDisableChannelEnabled,
   AutomaticEnableChannelEnabled: values.AutomaticEnableChannelEnabled,
@@ -235,6 +268,10 @@ export function RoutingReliabilitySection({
     () => buildFormDefaults(defaultValues),
     [defaultValues]
   )
+
+  useEffect(() => {
+    baselineRef.current = normalizeDefaults(defaultValues)
+  }, [defaultValues])
 
   const form = useForm<
     RoutingReliabilityFormInput,
@@ -344,6 +381,99 @@ export function RoutingReliabilitySection({
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
+                )}
+              />
+            </div>
+
+            <div className='flex flex-col gap-1 pt-2'>
+              <h4 className='text-sm font-medium'>
+                {t('Subscription OAuth retry')}
+              </h4>
+            </div>
+            <div className='grid min-w-0 gap-6 lg:grid-cols-2 xl:grid-cols-4'>
+              <FormField
+                control={form.control}
+                name='SubscriptionOAuthUpstreamRetryTimes'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Upstream retry times')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min='0'
+                        max='10'
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Maximum retryable failures per OAuth credential before same-tag failover',
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='SubscriptionOAuthCapacityCycleTimes'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Capacity cycle times')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min='0'
+                        max='10'
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t('Maximum passes through channels in the same retry pool')}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='SubscriptionOAuthCapacityWaitSeconds'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Capacity wait limit (seconds)')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type='number'
+                        min='0'
+                        max='30'
+                        {...safeNumberFieldProps(field)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t('Total wait budget across all capacity cycles')}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='SubscriptionOAuthRetry429'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Retry 429 across OAuth accounts')}</FormLabel>
+                      <FormDescription>
+                        {t('Disabled by default to avoid amplifying upstream rate limits')}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
                 )}
               />
             </div>

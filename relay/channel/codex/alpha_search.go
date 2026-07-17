@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"time"
 
 	rootcommon "github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -46,27 +46,19 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	if err != nil {
 		return nil, fmt.Errorf("filter Codex alpha search location data: %w", err)
 	}
-	release, acquired := acquireCodexOAuthSlot(info.ChannelId)
-	if !acquired {
-		c.Header("Retry-After", "1")
-		return nil, types.NewErrorWithStatusCode(
-			errors.New("codex OAuth channel concurrency limit reached; retry later"),
-			types.ErrorCodeOAuthChannelConcurrencyLimit,
-			http.StatusServiceUnavailable,
-		)
-	}
-	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
-		release()
+	lease, err := acquireCodexOAuthCapacity(c, info)
+	if err != nil {
 		return nil, err
 	}
+	service.BindSubscriptionOAuthResponseLease(c, lease)
 
 	oauthKey, err := ParseOAuthKey(strings.TrimSpace(info.ApiKey))
 	if err != nil {
-		release()
+		lease.Abandon()
 		return nil, err
 	}
 	if strings.TrimSpace(oauthKey.AccessToken) == "" || strings.TrimSpace(oauthKey.AccountID) == "" {
-		release()
+		lease.Abandon()
 		return nil, errors.New("codex alpha search: OAuth access_token and account_id are required")
 	}
 
@@ -77,7 +69,7 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	)
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
-		release()
+		lease.Abandon()
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(oauthKey.AccessToken))
@@ -91,7 +83,6 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 		"Session_id",
 		"X-Session-ID",
 		"X-Client-Request-Id",
-		"X-OpenAI-Actor-Authorization",
 	} {
 		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
 			req.Header.Set(name, value)
@@ -101,19 +92,34 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	timeout := time.Duration(rootcommon.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	client, err := service.GetHttpClientWithResponseHeaderTimeout(info.ChannelSetting.Proxy, timeout)
 	if err != nil {
-		release()
+		lease.Abandon()
 		return nil, err
 	}
+	trace := &httptrace.ClientTrace{
+		WroteHeaders:         info.MarkUpstreamRequestWritten,
+		GotFirstResponseByte: info.MarkUpstreamResponseStarted,
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := client.Do(req)
 	if err != nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return nil, err
 	}
 	if resp == nil || resp.Body == nil {
-		release()
+		written, _ := info.UpstreamAttemptState()
+		if written {
+			lease.Release()
+		} else {
+			lease.Abandon()
+		}
 		return nil, errors.New("codex alpha search: upstream returned an empty response")
 	}
-	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, release: release}
+	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, lease: lease}
 	return resp, nil
 }
 

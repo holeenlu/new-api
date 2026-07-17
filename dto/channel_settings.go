@@ -25,6 +25,7 @@ const (
 	RetryIsolationChannel     RetryIsolation = "channel"
 	RetryIsolationProvider    RetryIsolation = "provider"
 	RetryIsolationPolicyGroup RetryIsolation = "policy_group"
+	RetryIsolationTag         RetryIsolation = "tag"
 )
 
 type DataTrainingPolicy string
@@ -69,7 +70,7 @@ func (p *ChannelDataPolicy) Validate() error {
 		return fmt.Errorf("invalid data policy training value %q", p.Training)
 	}
 	switch p.RetryIsolation {
-	case "", RetryIsolationChannel, RetryIsolationProvider:
+	case "", RetryIsolationChannel, RetryIsolationProvider, RetryIsolationTag:
 	case RetryIsolationPolicyGroup:
 		if strings.TrimSpace(p.RetryPolicyGroup) == "" {
 			return fmt.Errorf("retry_policy_group is required for policy_group retry isolation")
@@ -77,7 +78,7 @@ func (p *ChannelDataPolicy) Validate() error {
 	default:
 		return fmt.Errorf("invalid retry isolation value %q", p.RetryIsolation)
 	}
-	if p.RetryIsolation == RetryIsolationProvider || p.RetryIsolation == RetryIsolationPolicyGroup {
+	if p.RetryIsolation == RetryIsolationProvider || p.RetryIsolation == RetryIsolationPolicyGroup || p.RetryIsolation == RetryIsolationTag {
 		if strings.TrimSpace(p.Provider) == "" ||
 			strings.TrimSpace(p.Region) == "" ||
 			strings.TrimSpace(p.Retention) == "" ||

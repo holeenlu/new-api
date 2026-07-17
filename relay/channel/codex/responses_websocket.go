@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -29,12 +31,15 @@ const (
 var errCodexResponsesWebSocketUpgradeRequired = errors.New("codex responses websocket upgrade required")
 
 type ResponsesWebSocketSession struct {
-	mu           sync.Mutex
-	conn         *websocket.Conn
-	channelID    int
-	model        string
-	httpFallback bool
-	release      func()
+	mu            sync.Mutex
+	conn          *websocket.Conn
+	channelID     int
+	model         string
+	httpFallback  bool
+	lease         *service.SubscriptionOAuthLease
+	fallbackLease *service.SubscriptionOAuthLease
+	pendingID     int
+	pendingModel  string
 }
 
 func SetResponsesWebSocketSession(c *gin.Context, session *ResponsesWebSocketSession) {
@@ -66,11 +71,39 @@ func (s *ResponsesWebSocketSession) Close() error {
 		err = s.conn.Close()
 		s.conn = nil
 	}
-	if s.release != nil {
-		s.release()
-		s.release = nil
+	if s.lease != nil {
+		s.lease.Release()
+		s.lease = nil
+	}
+	if s.fallbackLease != nil {
+		s.fallbackLease.Release()
+		s.fallbackLease = nil
 	}
 	return err
+}
+
+func (s *ResponsesWebSocketSession) ChannelID() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.channelID
+}
+
+func (s *ResponsesWebSocketSession) ConfirmHTTPFallbackSuccess() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.httpFallback || s.channelID != 0 || s.pendingID == 0 {
+		return
+	}
+	s.channelID = s.pendingID
+	s.model = s.pendingModel
+	s.pendingID = 0
+	s.pendingModel = ""
 }
 
 func (s *ResponsesWebSocketSession) doRequest(c *gin.Context, adaptor *Adaptor, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
@@ -111,15 +144,13 @@ func (s *ResponsesWebSocketSession) doRequest(c *gin.Context, adaptor *Adaptor, 
 		return nil, errors.New("codex responses websocket cannot switch models within one session")
 	}
 	if s.httpFallback {
-		return doCodexHTTPResponseRequest(c, adaptor, info, bytes.NewReader(httpBody))
+		return s.doHTTPFallbackLocked(c, adaptor, info, model, httpBody)
 	}
 	if s.conn == nil {
 		if err := s.connect(c, adaptor, info); err != nil {
 			if errors.Is(err, errCodexResponsesWebSocketUpgradeRequired) {
-				s.channelID = info.ChannelId
-				s.model = model
 				s.httpFallback = true
-				return doCodexHTTPResponseRequest(c, adaptor, info, bytes.NewReader(httpBody))
+				return s.doHTTPFallbackLocked(c, adaptor, info, model, httpBody)
 			}
 			return nil, err
 		}
@@ -141,6 +172,32 @@ func (s *ResponsesWebSocketSession) doRequest(c *gin.Context, adaptor *Adaptor, 
 	}, nil
 }
 
+func (s *ResponsesWebSocketSession) doHTTPFallbackLocked(
+	c *gin.Context,
+	adaptor *Adaptor,
+	info *relaycommon.RelayInfo,
+	model string,
+	body []byte,
+) (*http.Response, error) {
+	var response *http.Response
+	var err error
+	if s.fallbackLease != nil {
+		lease := s.fallbackLease
+		s.fallbackLease = nil
+		response, err = doCodexHTTPResponseRequestWithLease(c, adaptor, info, bytes.NewReader(body), lease)
+	} else {
+		response, err = doCodexHTTPResponseRequest(c, adaptor, info, bytes.NewReader(body))
+	}
+	if err != nil || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 {
+		s.pendingID = 0
+		s.pendingModel = ""
+		return response, err
+	}
+	s.pendingID = info.ChannelId
+	s.pendingModel = model
+	return response, nil
+}
+
 func (s *ResponsesWebSocketSession) invalidateLocked(conn *websocket.Conn) {
 	if s.conn != conn {
 		return
@@ -149,25 +206,25 @@ func (s *ResponsesWebSocketSession) invalidateLocked(conn *websocket.Conn) {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
-	if s.release != nil {
-		s.release()
-		s.release = nil
+	if s.lease != nil {
+		s.lease.Release()
+		s.lease = nil
+	}
+	if s.fallbackLease != nil {
+		s.fallbackLease.Release()
+		s.fallbackLease = nil
 	}
 }
 
 func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, info *relaycommon.RelayInfo) error {
-	release, acquired := acquireCodexOAuthSlot(info.ChannelId)
-	if !acquired {
-		return errors.New("codex OAuth channel concurrency limit reached; retry later")
-	}
-	if err := waitForCodexOAuthTurn(c.Request.Context(), info.ChannelId); err != nil {
-		release()
+	lease, err := acquireCodexOAuthCapacity(c, info)
+	if err != nil {
 		return err
 	}
 
 	httpURL, err := adaptor.GetRequestURL(info)
 	if err != nil {
-		release()
+		lease.Abandon()
 		return err
 	}
 	webSocketURL := httpURL
@@ -177,13 +234,13 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 	case strings.HasPrefix(webSocketURL, "http://"):
 		webSocketURL = "ws://" + strings.TrimPrefix(webSocketURL, "http://")
 	default:
-		release()
+		lease.Abandon()
 		return fmt.Errorf("codex responses websocket: unsupported URL scheme")
 	}
 
 	headers := make(http.Header)
 	if err := adaptor.SetupRequestHeader(c, &headers, info); err != nil {
-		release()
+		lease.Abandon()
 		return err
 	}
 	headers.Set("OpenAI-Beta", codexResponsesWebSocketBeta)
@@ -192,7 +249,7 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 
 	client, err := service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 	if err != nil {
-		release()
+		lease.Abandon()
 		return err
 	}
 	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second, EnableCompression: true}
@@ -201,6 +258,7 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 		dialer.NetDialContext = transport.DialContext
 		dialer.TLSClientConfig = transport.TLSClientConfig
 	}
+	info.MarkUpstreamRequestWritten()
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
 	var responseBody []byte
 	if response != nil && response.Body != nil {
@@ -208,27 +266,43 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 		response.Body.Close()
 	}
 	if err != nil {
-		release()
 		if response != nil && response.StatusCode == http.StatusUpgradeRequired {
+			s.fallbackLease = lease
 			return errCodexResponsesWebSocketUpgradeRequired
 		}
+		lease.Release()
 		if response != nil && response.StatusCode > 0 {
+			info.MarkUpstreamResponseStarted()
+			info.MarkUpstreamFailureResponse()
 			detail := strings.TrimSpace(string(responseBody))
 			if len(responseBody) > maxResponsesWebSocketErrorBytes {
 				detail += " (truncated)"
 			}
+			message := fmt.Errorf("codex responses websocket dial failed: status=%d: %w", response.StatusCode, err)
 			if detail != "" {
-				return fmt.Errorf("codex responses websocket dial failed: status=%d: %s", response.StatusCode, detail)
+				message = fmt.Errorf("codex responses websocket dial failed: status=%d: %s", response.StatusCode, detail)
 			}
-			return fmt.Errorf("codex responses websocket dial failed: status=%d: %w", response.StatusCode, err)
+			apiError := types.NewErrorWithStatusCode(
+				message,
+				types.ErrorCodeBadResponseStatusCode,
+				response.StatusCode,
+			)
+			apiError.UpstreamStatusCode = response.StatusCode
+			apiError.RetryAfter = service.ParseRetryAfterHeader(response.Header.Get("Retry-After"), time.Now())
+			return apiError
 		}
-		return fmt.Errorf("codex responses websocket dial failed: %w", err)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("codex responses websocket dial failed: %w", err),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+		)
 	}
 	conn.EnableWriteCompression(false)
 	s.conn = conn
 	s.channelID = info.ChannelId
 	s.model = strings.TrimSpace(info.UpstreamModelName)
-	s.release = release
+	s.lease = lease
+	common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(info.ChannelId))
 	return nil
 }
 

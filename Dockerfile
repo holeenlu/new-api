@@ -6,7 +6,16 @@ WORKDIR /build/web
 COPY web/package.json web/bun.lock ./
 COPY web/default/package.json ./default/package.json
 COPY web/classic/package.json ./classic/package.json
-RUN bun install --frozen-lockfile
+RUN set -eux; \
+    for attempt in 1 2; do \
+      if bun install --frozen-lockfile; then \
+        exit 0; \
+      fi; \
+      echo "bun install failed (attempt ${attempt}/2); clearing download cache" >&2; \
+      bun pm cache rm || rm -rf /root/.bun/install/cache; \
+      sleep $((attempt * 5)); \
+    done; \
+    exit 1
 COPY ./web/default ./default
 COPY ./VERSION /build/VERSION
 RUN if [ -n "$APP_VERSION" ]; then printf '%s\n' "$APP_VERSION" > /build/VERSION; fi
@@ -20,7 +29,16 @@ WORKDIR /build/web
 COPY web/package.json web/bun.lock ./
 COPY web/default/package.json ./default/package.json
 COPY web/classic/package.json ./classic/package.json
-RUN bun install --filter ./classic --frozen-lockfile
+RUN set -eux; \
+    for attempt in 1 2; do \
+      if bun install --filter ./classic --frozen-lockfile; then \
+        exit 0; \
+      fi; \
+      echo "bun install for classic failed (attempt ${attempt}/2); clearing download cache" >&2; \
+      bun pm cache rm || rm -rf /root/.bun/install/cache; \
+      sleep $((attempt * 5)); \
+    done; \
+    exit 1
 COPY ./web/classic ./classic
 COPY ./VERSION /build/VERSION
 RUN if [ -n "$APP_VERSION" ]; then printf '%s\n' "$APP_VERSION" > /build/VERSION; fi

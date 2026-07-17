@@ -275,13 +275,17 @@ func discoverUpstreamLocationProfile(ctx context.Context, client *http.Client, e
 	if client == nil {
 		return UpstreamLocationProfile{}, fmt.Errorf("HTTP client is nil")
 	}
+	discoveryClient := *client
+	discoveryClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	for _, probeURL := range endpoints.ProbeURLs {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 		if err != nil {
 			return UpstreamLocationProfile{}, fmt.Errorf("create upstream connectivity request: %w", err)
 		}
 		request.Header.Set("User-Agent", "new-api-upstream-location-discovery")
-		response, err := client.Do(request)
+		response, err := discoveryClient.Do(request)
 		if err != nil {
 			return UpstreamLocationProfile{}, fmt.Errorf("connect to %s: %w", request.URL.Hostname(), err)
 		}
@@ -294,7 +298,7 @@ func discoverUpstreamLocationProfile(ctx context.Context, client *http.Client, e
 		return UpstreamLocationProfile{}, fmt.Errorf("create public IP trace request: %w", err)
 	}
 	request.Header.Set("User-Agent", "new-api-upstream-location-discovery")
-	response, err := client.Do(request)
+	response, err := discoveryClient.Do(request)
 	if err != nil {
 		return UpstreamLocationProfile{}, fmt.Errorf("discover public IP: %w", err)
 	}
@@ -322,7 +326,7 @@ func discoverUpstreamLocationProfile(ctx context.Context, client *http.Client, e
 		Country:  strings.TrimSpace(traceFields["loc"]),
 	}
 
-	geoProfile, err := lookupUpstreamLocationProfile(ctx, client, endpoints.GeoLookupURLTemplate, publicIP)
+	geoProfile, err := lookupUpstreamLocationProfile(ctx, &discoveryClient, endpoints.GeoLookupURLTemplate, publicIP)
 	if err != nil {
 		return profile, fmt.Errorf("public IP discovered but geolocation enrichment failed: %w", err)
 	}

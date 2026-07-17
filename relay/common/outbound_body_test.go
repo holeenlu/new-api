@@ -51,7 +51,7 @@ func TestNewPrivacyFilteredPassThroughJSONBodyFiltersNormalizedSensitiveKeys(t *
 
 func TestNewPrivacyFilteredPassThroughJSONBodySkipsMaterializingLargeSafeRequest(t *testing.T) {
 	restoreLocationSettings(t)
-	storage := newTrackingBodyStorage([]byte(`{"model":"gpt-5","input":"` + strings.Repeat("x", 2*1024*1024) + `"}`))
+	storage := newTrackingBodyStorage([]byte(`{"model":"gpt-5","metadata":{"request_kind":"turn"},"input":"` + strings.Repeat("x", 2*1024*1024) + `"}`))
 
 	body, size, closer, err := NewPrivacyFilteredPassThroughJSONBody(storage)
 

@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 
@@ -54,14 +55,14 @@ func TestClaudeCodeRelayAndModelDiscoveryUseSameOAuthHeaders(t *testing.T) {
 }
 
 func TestClaudeCodeOAuthPacing(t *testing.T) {
-	originalInterval := ClaudeCodeOAuthMinRequestInterval
-	ClaudeCodeOAuthMinRequestInterval = 20 * time.Millisecond
-	t.Cleanup(func() { ClaudeCodeOAuthMinRequestInterval = originalInterval })
-
-	channelID := 900003
-	require.NoError(t, waitForClaudeCodeOAuthTurn(context.Background(), channelID))
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 900003, 0, "sk-ant-oat01-pacing")
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 20*time.Millisecond)
+	require.NoError(t, err)
+	lease.Release()
 	started := time.Now()
-	require.NoError(t, waitForClaudeCodeOAuthTurn(context.Background(), channelID))
+	lease, err = service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 20*time.Millisecond)
+	require.NoError(t, err)
+	lease.Release()
 	require.GreaterOrEqual(t, time.Since(started), 15*time.Millisecond)
 }
 
@@ -121,24 +122,27 @@ func TestEnsureClaudeCodeIdentitySystem(t *testing.T) {
 }
 
 func TestClaudeCodeOAuthConcurrencySlots(t *testing.T) {
-	originalMaxConcurrency := ClaudeCodeOAuthMaxConcurrency
-	ClaudeCodeOAuthMaxConcurrency = 2
-	t.Cleanup(func() { ClaudeCodeOAuthMaxConcurrency = originalMaxConcurrency })
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 900001, 0, "sk-ant-oat01-concurrency")
+	first, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	_, err = service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.Error(t, err)
+	first.Release()
+	third, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second.Release()
+	third.Release()
+}
 
-	channelID := 900001
-	releaseFirst, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
-	releaseSecond, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
+func TestClaudeCodeOAuthRuntimeKeyUsesCredentialFingerprint(t *testing.T) {
+	first := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 1, 0, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-shared")
+	second := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 2, 0, "sk-ant-oat01-shared")
+	different := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 3, 0, "sk-ant-oat01-other")
 
-	_, ok = acquireClaudeCodeOAuthSlot(channelID)
-	require.False(t, ok)
-
-	releaseFirst()
-	releaseThird, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
-	releaseSecond()
-	releaseThird()
+	require.Equal(t, first, second)
+	require.NotEqual(t, first, different)
 }
 
 func TestInitOAuthRuntimeSettingsReadsLoadedEnvironment(t *testing.T) {
@@ -163,47 +167,48 @@ func TestClaudeCodeLocalConcurrencyLimitRemainsRetryable(t *testing.T) {
 	t.Cleanup(func() { ClaudeCodeOAuthMaxConcurrency = originalMaxConcurrency })
 
 	channelID := 900004
-	release, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
-	defer release()
+	key := "sk-ant-oat01-limited"
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, channelID, 0, key)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 1, 0)
+	require.NoError(t, err)
+	defer lease.Release()
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	_, err := (&Adaptor{}).DoRequest(c, &relaycommon.RelayInfo{
+	_, err = (&Adaptor{}).DoRequest(c, &relaycommon.RelayInfo{
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelId:   channelID,
 			ChannelType: constant.ChannelTypeClaudeCode,
+			ApiKey:      key,
 		},
 	}, http.NoBody)
 	require.Error(t, err)
 	var apiErr *types.NewAPIError
 	require.ErrorAs(t, err, &apiErr)
 	require.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeOAuthChannelConcurrencyLimit, apiErr.GetErrorCode())
 	require.False(t, types.IsSkipRetryError(apiErr))
+	require.False(t, types.IsRecordErrorLog(apiErr))
 }
 
 func TestClaudeCodeOAuthResponseBodyReleasesSlotOnce(t *testing.T) {
-	originalMaxConcurrency := ClaudeCodeOAuthMaxConcurrency
-	ClaudeCodeOAuthMaxConcurrency = 2
-	t.Cleanup(func() { ClaudeCodeOAuthMaxConcurrency = originalMaxConcurrency })
-
-	channelID := 900002
-	release, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 900002, 0, "sk-ant-oat01-response-body")
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
 	body := &claudeCodeOAuthResponseBody{
 		ReadCloser: io.NopCloser(strings.NewReader("ok")),
-		release:    release,
+		lease:      lease,
 	}
 
 	require.NoError(t, body.Close())
 	require.NoError(t, body.Close())
 
-	first, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
-	second, ok := acquireClaudeCodeOAuthSlot(channelID)
-	require.True(t, ok)
-	_, ok = acquireClaudeCodeOAuthSlot(channelID)
-	require.False(t, ok)
-	first()
-	second()
+	first, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	_, err = service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.Error(t, err)
+	first.Release()
+	second.Release()
 }

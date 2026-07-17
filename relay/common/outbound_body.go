@@ -2,6 +2,7 @@ package common
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 
 	"github.com/QuantumNous/new-api/common"
@@ -24,6 +25,13 @@ import (
 // size is meant to be propagated to http.Request.ContentLength because the
 // type-erased io.Reader prevents net/http from auto-detecting it.
 func NewOutboundJSONBody(data []byte, channelUsesProxy ...bool) (body io.Reader, size int64, closer io.Closer, err error) {
+	mayContainLocationData, err := readerMayContainLocationPrivacyData(bytes.NewReader(data))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if !mayContainLocationData {
+		return newOutboundJSONBody(data)
+	}
 	data, _, err = FilterUpstreamLocationData(data, channelUsesProxy...)
 	if err != nil {
 		return nil, 0, nil, err
@@ -66,6 +74,10 @@ func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUs
 const maxPrivacyCandidateKeyBytes = 1024
 
 func storageMayContainLocationPrivacyData(storage common.BodyStorage) (mayContain bool, err error) {
+	return readerMayContainLocationPrivacyData(storage)
+}
+
+func readerMayContainLocationPrivacyData(storage io.ReadSeeker) (mayContain bool, err error) {
 	originalOffset, err := storage.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return false, err

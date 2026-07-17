@@ -42,6 +42,10 @@ describe('localizeErrorMessage', () => {
       localizeErrorCode('oauth_unauthorized'),
       'OAuth 凭证无效或已过期，请重新授权或刷新渠道凭证。'
     )
+    assert.equal(
+      localizeErrorCode('upstream_quota_exhausted'),
+      '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。'
+    )
     assert.equal(localizeErrorCode('unclassified_error'), undefined)
   })
 })

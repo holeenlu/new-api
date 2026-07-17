@@ -21,6 +21,24 @@ func NotifyRootUser(t string, subject string, content string) {
 	}
 }
 
+func NotifyAdminUsers(t string, subject string, content string) {
+	var users []model.User
+	if err := model.DB.
+		Select("id", "email", "role", "status", "setting").
+		Where("status = ? AND role >= ?", common.UserStatusEnabled, common.RoleAdminUser).
+		Find(&users).Error; err != nil {
+		common.SysLog(fmt.Sprintf("failed to query administrator notification users: %s", err.Error()))
+		return
+	}
+
+	notification := dto.NewNotify(t, subject, content, nil)
+	for _, user := range users {
+		if err := NotifyUser(user.Id, user.Email, user.GetSetting(), notification); err != nil {
+			common.SysLog(fmt.Sprintf("failed to notify administrator %d: %s", user.Id, err.Error()))
+		}
+	}
+}
+
 func NotifyUpstreamModelUpdateWatchers(subject string, content string) {
 	var users []model.User
 	if err := model.DB.

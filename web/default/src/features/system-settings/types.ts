@@ -230,6 +230,10 @@ export type ModelSettings = {
   DefaultUseAutoGroup: boolean
   'group_ratio_setting.group_special_usable_group': string
   RetryTimes: number
+  SubscriptionOAuthUpstreamRetryTimes: number
+  SubscriptionOAuthCapacityCycleTimes: number
+  SubscriptionOAuthCapacityWaitSeconds: number
+  SubscriptionOAuthRetry429: boolean
   ChannelDisableThreshold: string
   AutomaticDisableChannelEnabled: boolean
   AutomaticEnableChannelEnabled: boolean

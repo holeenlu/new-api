@@ -72,6 +72,10 @@ export function useStatus() {
     staleTime: 5 * 60 * 1000,
     // Cache expires after 30 minutes
     gcTime: 30 * 60 * 1000,
+    // Runtime fields such as start_time must be refreshed after a deployment.
+    // placeholderData may still render the last known status while this runs.
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
   })
 
   return {

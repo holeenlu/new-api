@@ -4,11 +4,25 @@ import (
 	"math"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestShouldUseResponsesCompatibilityAlwaysEnablesCodex(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ApiType:     constant.APITypeCodex,
+			ChannelType: constant.ChannelTypeCodex,
+			ChannelId:   42,
+		},
+		OriginModelName: "gpt-5.6-luna",
+	}
+
+	require.True(t, shouldUseResponsesCompatibility(info))
+}
 
 func TestIsResponsesEventStreamContentType(t *testing.T) {
 	tests := []struct {

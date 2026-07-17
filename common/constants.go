@@ -157,6 +157,10 @@ var QuotaRemindThreshold = 1000
 var PreConsumedQuota = 500
 
 var RetryTimes = 0
+var SubscriptionOAuthUpstreamRetryTimes = 5
+var SubscriptionOAuthCapacityCycleTimes = 5
+var SubscriptionOAuthCapacityWaitSeconds = 5
+var SubscriptionOAuthRetry429 = false
 
 //var RootUserEmail = ""
 

@@ -103,7 +103,6 @@ web/default/src/features/channels/api.ts
 session-id
 thread-id
 x-client-request-id
-x-codex-beta-features
 x-codex-parent-thread-id
 x-codex-turn-state
 x-codex-turn-metadata
@@ -113,7 +112,8 @@ x-openai-subagent
 x-responsesapi-include-timing-metrics
 ```
 
-认证、账号、`originator`、`user-agent`、`content-type` 等身份与协议 Header
+认证、账号、`originator`、`user-agent`、`content-type`、
+`x-codex-beta-features` 等身份、能力与协议 Header
 由服务端生成，客户端和渠道静态配置均不能覆盖。内部
 `x-openai-internal-codex-responses-lite` 不接受客户端透传，也不能通过渠道
 Header Override 强制开启；服务端仅在映射后的上游模型属于 `gpt-5.6-*`
@@ -148,6 +148,11 @@ Lite 请求还必须满足：
 
 这些修改用于解决 Codex Lite 对请求头、流式响应和 reasoning context 的严格校验。
 
+Codex 订阅渠道只支持 Responses 上游。客户端使用 `/v1/chat/completions` 或
+`/v1/messages` 时，无论全局 Chat Completions 转 Responses 策略是否启用，都会
+强制执行协议转换并把响应转换回客户端原协议，避免系统设置关闭后直接落入 Codex
+适配器的“不支持端点”分支。
+
 ### 1.5 Responses Lite 搜索与 WebSocket
 
 新增客户端入口：
@@ -161,7 +166,8 @@ GET /v1/responses  (WebSocket Upgrade)
 - Alpha search 通过当前 API Key 的分组和模型规则选择 Codex OAuth 渠道，转发至
   `/backend-api/codex/alpha/search`，恢复 Responses Lite 的 `web.run` 搜索；
 - 搜索请求移除仅用于本地路由的 `prompt_cache_key` 和
-  `prompt_cache_retention`，保留会话及 actor authorization Header；
+  `prompt_cache_retention`，保留非认证会话 Header；客户端提供的
+  `X-OpenAI-Actor-Authorization` 不会转发，避免覆盖 OAuth 账号身份边界；
 - Responses WebSocket 会话固定同一 OAuth 渠道和模型，使用上游
   `responses_websockets=2026-02-06` 协议；
 - `/v1/models?client_version=...` 返回 Codex 客户端兼容目录，并仅为实际由 Codex
@@ -172,7 +178,8 @@ GET /v1/responses  (WebSocket Upgrade)
   时自动回退 HTTP/SSE，不会因上游暂未开放 WebSocket 而中断请求。
 - WebSocket 帧和转换后的请求体统一使用 `MAX_REQUEST_BODY_MB` 限制，默认 `128 MB`，
   不再单独使用固定的 `16 MB` 限制；超限返回 `413 Request Entity Too Large`，并标记为
-  不可重试，避免大请求被重复发送到备用渠道。
+  不可重试，避免大请求被重复发送到备用渠道。每轮结束只保留后续 append 所需的模型和配置字段，
+  不保留上一轮 `input`、`previous_response_id` 等大请求状态；
 - Codex/Claude Code OAuth 遇到 EOF、连接重置等响应头前断连时返回 `502`，
   交由 Retry Times 决定是否故障转移；不关闭共享 HTTP 连接池，且这类临时 `5xx`
   不会禁用渠道或标记 OAuth 凭证失效。客户端已取消则返回 `499` 且不重试。
@@ -206,7 +213,8 @@ Context json.RawMessage `json:"context,omitempty"`
 - `controller/channel.go`
 - `controller/channel_upstream_update.go`
 
-Codex 渠道测试强制使用 stream 模式，定时自动测试会跳过订阅 OAuth 渠道。
+Codex 渠道测试强制使用 stream 模式。定时自动测试是否执行完全由后台渠道健康检查中的
+“定时渠道测试”设置控制，不在 Compose、环境变量或渠道类型判断中额外硬编码排除。
 适配器仅在配置 `CODEX_MODEL_LIST` 时返回该显式限制列表；管理端手动抓取模型和上游模型巡检调用
 `/backend-api/codex/models`，按当前 ChatGPT 账号返回实际可用模型。模型抓取继承请求或任务
 Context，并受到订阅 OAuth 超时限制，不再使用不可取消的 `context.Background()`。
@@ -315,15 +323,27 @@ x-app: cli
 - Codex 和 Claude Code 禁止请求体直通与请求体参数覆盖；
 - 允许渠道亲和生成的安全 Header 透传，但过滤认证和身份 Header；
 - 调试日志只记录请求体大小，不输出订阅 OAuth 请求正文；
-- 每个渠道默认最多 5 个并发请求，相邻请求启动间隔默认 750ms；
+- 并发与 750ms 最小启动间隔按 Codex `account_id` 或 Claude Code 凭证指纹共享，而非按渠道 ID；默认单服务实例账号并发为 10，同一凭证配置到多个渠道不会叠加额度；不同服务器按各自实例独立限流；
+- 手动模型发现、定时上游模型检查和 Codex 用量/重置管理请求占用同一凭证并发槽并遵守相同最小启动间隔，避免后台操作与推理请求叠加突破账号限制；这些管理请求只参与容量控制，不改变账号冷却状态，也不会抢占半开放恢复探针；
 - 等待上游首个响应头默认最多 30 秒；Transport 超时返回 `504` 和 `Retry-After`，便于客户端与真正的应用内部 `500` 区分；
-- 本地并发保护触发时返回专用、可重试的 `oauth_channel_concurrency_limit` 503。若 Codex 渠道未显式
-  设置“仅当前渠道”隔离，重试会限定在相同渠道类型、相同规范化上游端点且处理策略一致的未尝试
-  Codex 渠道；显式 `channel`、`provider` 或 `policy_group` 隔离配置始终优先，不会被该容量回退覆盖；
+- 本地并发保护在 HTTP/SSE、Responses WebSocket 和 Alpha Search 路径统一返回专用、可重试的
+  `oauth_channel_concurrency_limit` 503。并发槽饱和时使用 `Retry-After: 1`，凭证处于冷却时返回向上取整后的真实剩余冷却秒数；该错误只写运行日志，不进入持久化错误日志；
+- 达到并发上限后排除的是 OAuth 凭证指纹，而非整个渠道；相同凭证配置在其他渠道时会一并跳过，多 Key 渠道仍可继续使用其他未饱和账号；自动安全默认值在渠道具有标签时限定到相同标签、相同渠道类型和相同数据处理策略，无标签时保持当前渠道隔离；
+- 订阅 OAuth 独立配置上游重试次数、容量循环次数、容量累计等待上限和 429 跨账号重试。默认分别为 5、5、5 秒和关闭；本地容量切换不消耗上游重试额度；429 始终按上游 `Retry-After`（最长 15 分钟，缺失时 30 秒）冷却当前凭证，关闭开关时将错误返回客户端，打开时立即切换同标签账号，不在原账号上重复放大 429；
+- 每个 OAuth 凭证拥有独立的 5 次可重试上游失败预算；耗尽后该凭证在当前请求中不可再次选择，并进入短暂冷却和单探针半开放恢复，再立即切换相同标签内的下一凭证；恢复状态使用代际校验，旧请求的迟到成功不能清除新一轮冷却；恢复探测的结果确认与并发槽释放在同一临界区完成，不会短暂重新打开冷却；可能已发送但没有明确失败响应的请求最多额外重试一次，且仍受 5 次总失败预算约束；下游已经输出或客户端取消后禁止重试；
+- 订阅 OAuth 上游错误按语义统一为 `oauth_unauthorized`（401 凭证无效）、`oauth_forbidden`（403 权限拒绝）、`upstream_account_disabled`（账号或组织停用）、`upstream_quota_exhausted`（余额或额度耗尽）、`upstream_rate_limited`（临时限流）和 `model_not_supported`（模型不可用）；额度识别覆盖上游 error code 及中英文常见错误文本，不再把所有 429 混为同一种故障；
+- OAuth `401/403`、账号或组织停用、余额或额度耗尽会立即在当前请求中排除凭证，持久化禁用单 Key 渠道或多 Key 渠道中的对应凭证，并异步通知所有已启用的管理员和根管理员；后续用户请求及相同标签故障转移均不能再选择该凭证，管理员修复或重新授权后需手动启用。额度耗尽即使以 429 返回，也不受“429 跨账号重试”开关限制，会切换相同标签、渠道类型和数据策略内的备用账号；普通临时 429 仍只按 Retry-After 冷却，默认返回客户端；模型不支持只在当前模型请求中排除该凭证，不会误伤该账号的其他模型；显式指定渠道及已开始下游输出的请求仍禁止切换；
+- 恢复探测若在最小请求间隔等待或其他上游发送前阶段被取消，会以“未发送”结果释放并发槽，不会被误判为上游失败或延长冷却；
+- 管理员手动渠道测试保留适配器返回的结构化状态码、错误代码、上游状态和重试信息，并在测试结束时确认恢复探针结果，避免将真实 400/429/503 包装成通用 500 或让半开放并发槽长期占用；
+- 每个服务实例运行独立的凭证状态条件清理器，每 10 分钟从数据库读取当前 Codex/Claude Code 渠道仍引用的凭证指纹；仍被任一渠道引用的有效指纹即使长期没有请求也保留状态。只有凭证轮换、渠道删除或渠道类型变更后不再被数据库引用的旧指纹，且至少空闲 1 小时、没有活动租约、恢复探测、未结束冷却或节流预约时才回收；回收只删除进程内并发/冷却状态，不修改数据库渠道、OAuth 凭证或标签组；数据库查询失败时整轮清理失败关闭；回收先在状态锁内标记 retired，再按指针匹配从共享 Map 删除，并发请求发现 retired 后重新加载，避免同一凭证被拆成两套并发计数；
+- 容量池全部饱和时执行包含首次扫描在内的 5 轮凭证检查，采用约 250ms、500ms、1s、2s 的带抖动退避，累计等待不超过 5 秒；第一轮按优先级和权重确定凭证顺序，后续轮次稳定复用该顺序，实现 A→B→C→A；上游失败路径由有限凭证集合及每凭证预算自然终止，不再使用会截断后续凭证预算的隐藏总尝试数和 45 秒软限制；
+- Alpha Search 使用与普通 Relay 相同的订阅 OAuth 重试预算、RetryBoundary、模型映射和渠道数据策略；
+  WebSocket 只在首次上游 WebSocket 握手成功或 HTTP 回退响应完整成功后固定渠道，使内部 Relay 能在会话固定前选择合规备用凭证；成功重试前
+  清除前一失败尝试的 `Retry-After`，避免 `200` 响应携带过期重试指令；
 - 重试候选已排除本请求尝试过的渠道时，先尝试当前最高优先级中仍可用的渠道，再降到下一优先级，
   不会因为重试次数直接跳过同优先级备用渠道；
-- 上游 5xx、504、524 可进入重试判断，但默认只允许当前多 Key 渠道换 Key 重试；只有管理员显式配置相同供应商端点或相同数据策略组后，才允许跨渠道重试；
-- 定时推理测试和上游价格同步跳过订阅 OAuth 渠道。
+- 上游 5xx、504、524 在下游尚未输出时按当前凭证累计重试；当前凭证预算耗尽后按同标签、渠道类型和数据策略边界跨渠道切换，成功后将渠道亲和性更新到最终成功渠道；
+- 定时推理测试由后台渠道健康检查开关统一控制；上游价格同步跳过订阅 OAuth 渠道。
 
 ## 3. 管理与模型价格
 
@@ -340,7 +360,8 @@ x-app: cli
 - 可视化编辑器支持按输入单价反算输入、缓存、输出、图片和音频倍率；
 - 保存时提交编辑器的最新价格快照，并继续通过 React Hook Form/Zod Schema 校验；
 - 多项系统配置统一显示保存状态、成功或失败提示，并在完成后刷新系统配置缓存；
-- GPT-5.4 及后续模型的完成倍率允许自定义，其他硬编码锁定模型继续使用内置倍率；
+- 内置完成倍率只作为未配置时的默认值，不再锁定任何模型；人工保存和上游价格同步写入的
+  `CompletionRatio` 始终优先生效；
 - 批量保存会在事务写入前拒绝负数、NaN、无穷值、未知计费模式、无效计费表达式，以及缺少表达式的
   分层计费配置；
 - “从上游获取模型”只更新模型列表，不覆盖已有 `model_mapping`。
@@ -407,9 +428,9 @@ web/default/src/lib/localize-error-message.test.ts
 - Codex Bearer 和 account ID 设置；
 - Codex 显式模型限制和账号动态模型获取；
 - 订阅 OAuth 安全字段、Header、超时与重试分类；
-- 上游价格/模型巡检排除和任务启用条件；
+- 上游价格排除和逐渠道模型巡检调度条件；
 - 管理员与 Root 的令牌权限边界及批量删除原子性；
-- 硬编码完成倍率锁定与 GPT-5.4 可配置行为；
+- 内置完成倍率默认值与全部模型可覆盖行为；
 - Codex Responses Lite 元数据、工具兼容、普通模式回退和非流式拒绝；
 - Alpha search 请求清理和 Responses WebSocket 帧校验、会话渠道固定、SSE 事件转换及
   `426` 回退；
@@ -417,67 +438,71 @@ web/default/src/lib/localize-error-message.test.ts
 - 全局/渠道请求透传对 Codex、Claude Code 的强制禁用；
 - 客户端网络 Header 禁止透传和 OAuth 身份 Header 防覆盖；
 - 宿主/代理出口画像发现、位置模式热更新和隐私过滤；
-- 默认渠道隔离、供应商隔离、策略组隔离和响应披露 Header；
+- 自动标签隔离、渠道隔离、供应商隔离、策略组隔离和响应披露 Header；
 - 批量模型价格配置事务写入和位置模式运行时选项；
 - OAuth refresh token 非轮换响应、并发刷新复用和授权错误分类；
 - Codex Wham 用量请求路径、认证 Header、重置请求体及响应大小限制；
 - 多 Key 随机与轮询重试排除本请求已使用 Key；
+- Codex/Claude Code 凭证级单实例并发租约、HTTP/WebSocket/Alpha Search 统一 503 错误契约、凭证级排除、成功重试 Header 清理和非持久化容量日志策略；
 - 上游错误正文不进入日志、数据库错误或客户端响应；
 - 前端传输错误、供应商错误和流终止原因统一显示为简体中文。
 
 ## 6. 部署和验证
 
-提供三套部署入口：
+部署采用“规范一致、配置独立、脚本独立”的方式。每个目标只有一份完整 Compose 和一支明确入口，
+不再通过公共 Compose 叠加目标覆盖，也不再通过参数化远程总脚本统一编排：
 
 ```text
-bin/deploy-local.sh
-bin/deploy-174.137.56.226.sh
-bin/deploy-192.168.11.12.sh
+本机测试  docker-compose.local.yml                       bin/deploy-local.sh
+174 正式  docker-compose.server-174.137.56.226.yml       bin/deploy-174.137.56.226.sh
+192 正式  docker-compose.server-192.168.11.12.yml        bin/deploy-192.168.11.12.sh
 ```
 
-部署行为：
+三份 Compose 都完整声明 new-api、PostgreSQL、Redis、网络、卷、健康检查和该目标需要的代理，不依赖
+`docker-compose.yml` 或已删除的 `docker-compose.deploy.yml`。174 独立包含 HTTPS Caddy，192 独立包含
+3000 端口代理，本机只监听 `127.0.0.1:3000`。三份文件采用相同字段顺序和命名规范，但修改其中一份
+不会改变其他目标。首次使用新脚本成功校验独立 Compose 后，会删除该服务器部署目录中不再使用的
+基础 Compose、覆盖 Compose 和旧公共远程脚本，保留 `.env`、数据、日志、备份和目标配置。
 
-- `docker-compose.deploy.yml` 统一维护应用、PostgreSQL、Redis 和 OAuth 保护参数，三套目标 Compose 只保留端口、Caddy 等目标差异；
-- `bin/deploy-common.sh` 统一版本号、Buildx、镜像平台检查和 `.env` 初始化，远程脚本复用同一套环境初始化逻辑；
-- `bin/deploy-remote.sh` 统一 174、192 的远程构建发布流程，两个服务器脚本只声明目标地址、目录、端口和额外服务；
-- 远程源码同步使用 `.new-api-deploy-manifest` 记录脚本实际管理的文件；后续部署只清理旧清单中存在、
-  新清单中已移除的文件，并始终保护 `.env`、`data`、`logs`、`backups` 和 `caddy` 持久目录；
-- 不启用 Caddy 的目标会检查 `new-api-caddy` 的 Compose service 与 working-dir 标签，只有确认属于当前
-  部署目录时才删除该孤立容器；不会使用宽泛的 `--remove-orphans` 影响其他项目容器；
-- 公网服务器部署目标已从 `104.128.92.169` 迁移至 `174.137.56.226`：Caddy、Compose 文件、
-  远程部署脚本与兼容入口均已改名并指向新地址；本地和 192 服务监听 3000，174 由 Caddy 对外
-  提供 `nextcode.buildtoconnect.com`；
-- 本地、174、192 服务时区统一为 UTC，与 Codex / Claude Code 上游时间戳和配额窗口保持一致；
-- Compose 默认设置 `SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT=30`；部署脚本仅将旧默认值 `120` 自动迁移为 `30`，保留管理员自定义值；
-- Compose 与部署脚本默认补齐 `MAX_REQUEST_BODY_MB=128`；可在三套部署的 `.env` 中按 MB 调整，
-  同时作用于普通 HTTP 请求和 Codex Responses WebSocket 请求；
-- 共享部署 Compose 将 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY` 显式传入应用容器；192 等需要
-  VPN/代理访问上游的服务器应在目标 `.env` 同时配置前两个变量。`UPSTREAM_SYSTEM_PROXY_ENABLED`
-  只影响位置画像选择；真正让 Go 上游客户端走代理的是 `HTTP_PROXY/HTTPS_PROXY`；
-- Compose 为 Linux 容器声明 `host.docker.internal:host-gateway`。代理若监听在宿主机本地端口，
-  `.env` 应使用 `http://host.docker.internal:<port>`，不能写成容器自身的 `127.0.0.1`；代理还必须
-  监听 Docker 网桥或 `0.0.0.0`，仅监听宿主机 loopback 时容器无法连接；
-- Docker 构建支持 GOPROXY 主备切换；
-- 运行镜像只保留静态服务二进制、CA、时区数据库和健康检查所需工具，不携带 Go 编译器；
-- `APP_VERSION` 按部署要求固定取最近 Git Release tag，源码补丁构建不会改变页面显示版本；镜像归档
-  SHA-256 和镜像 ID 用于确认同一 Release 版本下的实际部署产物；
-- 镜像传输前后强制比较压缩包 SHA-256，服务器内部再比较已加载镜像与运行容器的镜像 ID，不一致立即失败；
-- Docker Desktop 对 `--max-used-space` 的执行不可靠时会留下大量内部 Buildx 缓存，因此构建后默认
-  使用 `docker buildx prune --all --force` 清空全部可回收缓存（包括 frontend 镜像）；如需以磁盘
-  空间换取下一次构建速度，可显式设置 `DEPLOY_PRUNE_BUILD_CACHE=false`；
-- 部署脚本等待容器健康，并再次请求 `/api/status`。
+`bin/deploy-local.sh` 负责本机 `linux/amd64` 构建、镜像版本冒烟检查、本机数据库备份、本机持久测试
+环境更新和三个 Relay 路由检查；它只维护 `http://127.0.0.1:3000` 的测试环境，不生成正式发布制品。
+Buildx 缓存默认保留，方便后续增量构建。
 
-部署缓存清理可通过 `DEPLOY_PRUNE_BUILD_CACHE` 和 `DEPLOY_PRUNE_PROJECT_IMAGES` 调整。上游模型巡检总开关为
-`CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED`；部署脚本会在目标 `.env` 中补齐该配置，
-设置为 `false` 后即使渠道自身启用了巡检也不会执行。
+两支正式服务器脚本分别配置自己的 SSH、目录、Compose、Caddy、镜像标签、回滚标签和公网验收，
+只复用 `bin/deploy-common.sh` 中无服务器状态的构建、校验和环境文件工具；已删除旧的参数化
+`bin/deploy-remote.sh`。每个正式入口都会在本机以当前源码独立构建自己的 `linux/amd64` 镜像，
+构建在服务器外完成，随后只传输该服务器 Compose、Caddyfile 和本次临时压缩镜像；不依赖
+`.deploy-artifacts`，不上传源码，也不自动修改服务器 `.env`。服务器 `.env` 缺失时直接停止，避免使用
+其他服务器默认值。
+
+Docker 构建上下文明确排除 `.env`、数据库导出、`data/`、`logs/`、部署制品和本地测试目录，避免凭证
+或用户数据进入 BuildKit 缓存与构建上下文。
+
+正式部署按固定轻量步骤执行：构建当前源码并校验 Release 版本；校验本次临时镜像压缩包 SHA-256；确认
+已有 PostgreSQL、Redis 健康且不重建它们；保留最近三份数据库备份；校验 Caddy；保存固定 rollback
+镜像；只重建 new-api；应用健康
+后热加载 Caddy 配置；精确比较远端目标镜像 ID 与运行容器镜像 ID；校验内部和外部启动时间；最后检查 `/v1/responses`、
+`/v1/chat/completions`、`/v1/messages` 均返回未授权 401。任一步失败恢复该服务器自己的 rollback 镜像。
+部署过程不执行蓝绿切换、候选容器、全工作区同步或自动镜像清理。
+
+两个正式入口互不调用、互不连续部署，必须单独执行：
+
+```bash
+./bin/deploy-174.137.56.226.sh
+./bin/deploy-192.168.11.12.sh
+```
+
+正式环境参数由各自 `.env` 管理，包括 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`、
+OAuth 并发和请求间隔。`UPSTREAM_SYSTEM_PROXY_ENABLED`
+只影响位置画像选择，真正的上游网络代理仍由 `HTTP_PROXY/HTTPS_PROXY` 控制。
 
 Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIRECT_URI`
 和 `CODEX_OAUTH_SCOPE` 管理；`CODEX_MODEL_LIST` 可提供管理员预设模型，留空时应在
 渠道编辑器中从上游账户动态获取模型。渠道测试会为每次请求生成独立的 session、turn
 和 installation 元数据，OAuth 凭证及回调地址在日志输出前统一脱敏。
 
-本地服务地址为 `http://127.0.0.1:3000`，192 服务地址为
-`http://192.168.11.12:3000`；174 服务器保留宿主机本地诊断映射
+持久本地测试环境地址为 `http://127.0.0.1:3000`。192 正式服务地址为
+`http://192.168.11.12:3000`；174 正式服务器保留宿主机本地诊断映射
 `http://127.0.0.1:3001`，公网入口为 `https://nextcode.buildtoconnect.com`。
 
 ## 7. HTTPS、日志和重试数据治理
@@ -488,7 +513,7 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
   code/token、Webhook 签名和正文经过专门省略或脱敏；通用上游错误最多读取 1 MB，只保留脱敏、
   限长后的结构化错误信息、Content-Type、响应字节数和上游 request ID，Ollama 异常 SSE 只记录行字节数；
 - 渠道编辑器新增“数据治理”，可填写真实供应商、数据区域、保留期、训练策略、重试隔离范围和策略组；
-- 默认 `channel` 隔离不把提示词发送到其他渠道；当前渠道为多 Key 时才可在该渠道内换 Key；
+- 自动隔离在渠道具有非空标签时只允许相同标签、相同渠道类型和相同数据策略的候选；未设置标签时退回当前渠道隔离。当前渠道为多 Key 时可在该渠道内换 Key；
 - `provider` 隔离要求渠道类型、规范化上游端点、显式供应商、区域、保留期和训练策略全部一致；
 - `policy_group` 隔离要求显式供应商、区域、保留期、训练策略和策略组全部一致；配置不完整或非法时运行期自动回退到 `channel`，失败关闭；
 - 已尝试的单 Key 渠道不会再次入选；多 Key 渠道按请求记录 `(channel_id, key_index)`，随机和轮询模式
@@ -501,7 +526,7 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 ## 8. 上游位置与客户端 IP 隐私
 
 - JSON 模型请求在最终出站边界执行位置隐私策略，常见协议位置字段、参数覆盖和渠道正文直通均纳入
-  过滤；渠道正文直通先以固定内存流式扫描 JSON 对象键，仅在发现位置、网络或相关容器候选键时才
+  过滤；转换请求和渠道正文直通均先以固定内存流式扫描 JSON 对象键，仅在发现位置或网络候选键时才
   整体解析过滤。扫描支持大小写、连字符、点号、下划线、跨缓冲区和 `\uXXXX` 转义键；无候选键的
   大请求直接复用原 `BodyStorage`，避免磁盘缓存正文重新读入堆内存并放大；
 - `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
@@ -522,7 +547,9 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
   当前进程内存，重启后仍以显式环境变量和启动探测重建；
 - `UPSTREAM_HOST_PUBLIC_IP` 和 `UPSTREAM_EGRESS_PUBLIC_IP` 仅作为 Root 控制面板中的出口 IP 展示值，不会写入模型请求；真实网络来源仍由 TCP/TLS 出口决定；
 - 自动探测只发送无凭证的连通性请求，不携带客户端请求、OAuth Token 或模型数据；公网出口 IP 会被 Cloudflare 和 `ipwho.is` 看到。对第三方 IP 地理定位服务有合规限制时，可设置 `UPSTREAM_LOCATION_DISCOVERY_ENABLED=false` 并完全使用显式画像；
-- 三套部署入口共用 `docker-compose.deploy.yml` 的隐私环境变量，部署脚本会为已有或新建 `.env` 补齐 `UPSTREAM_LOCATION_MODE=strip`、`UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 和 8 秒总探测超时。安全默认仍为删除客户端位置，探测画像不会自动改变转发模式。
+- 三套独立 Compose 均按同一规范声明隐私环境变量，默认使用 `UPSTREAM_LOCATION_MODE=strip`、
+  `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 和 8 秒总探测超时。正式部署脚本不创建或改写服务器
+  `.env`；每台服务器可独立覆盖这些值。安全默认仍为删除客户端位置，探测画像不会自动改变转发模式。
 
 ## 9. 审查结论与剩余风险
 
@@ -536,8 +563,9 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
 ### 9.2 已解决：位置隐私 marker 快路径漏检和大请求内存放大
 
 原大小写敏感 marker 预扫描已替换为常量内存 JSON 对象键扫描器。它会解码转义键并使用与完整过滤器
-相同的规范化候选键；只有命中候选键才调用 `BodyStorage.Bytes()` 和完整 JSON 解析。测试覆盖顶层字段、
-大小写、连字符、点号、下划线、跨 32KB 缓冲区、转义键、读取位置恢复及无隐私字段的大正文零复制路径。
+相同的规范化候选键；转换请求同样先扫描，正文直通只有命中候选键才调用 `BodyStorage.Bytes()` 和完整
+JSON 解析。测试覆盖顶层字段、大小写、连字符、点号、下划线、跨 32KB 缓冲区、转义键、读取位置恢复
+及仅含普通 metadata 的大正文零复制路径。
 
 ### 9.3 订阅 OAuth 兼容实现不能等同于官方公开 API 合规
 
@@ -558,7 +586,7 @@ Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth clien
 ### 9.6 有意行为：构建版本固定显示 Git Release
 
 按部署需求，`APP_VERSION` 只使用最近 Git Release tag。修改源码并重新编译不会改变页面显示版本；
-同一 Release 下的产物差异通过镜像归档 SHA-256、加载后的镜像 ID 和运行容器镜像 ID 校验，不向
+同一 Release 下的产物差异通过本次临时镜像压缩包 SHA-256 和运行容器 RootFS 校验，不向
 `APP_VERSION` 添加 commit、dirty 标记或构建时间。
 
 ### 9.7 已解决：批量模型价格保存缺少语义校验

@@ -37,20 +37,11 @@ var sensitiveLocationMetadataKeys = map[string]string{
 	"timezone":  "timezone",
 }
 
-var locationPrivacyContainerKeys = map[string]struct{}{
-	"client_metadata":    {},
-	"inference_geo":      {},
-	"lat_lng":            {},
-	"latlng":             {},
-	"metadata":           {},
-	"requests":           {},
-	"retrieval_config":   {},
-	"retrievalconfig":    {},
-	"tool_config":        {},
-	"toolconfig":         {},
-	"tools":              {},
-	"user_location":      {},
-	"web_search_options": {},
+var directLocationPrivacyKeys = map[string]struct{}{
+	"inference_geo": {},
+	"lat_lng":       {},
+	"latlng":        {},
+	"user_location": {},
 }
 
 func isLocationPrivacyCandidateKey(key string) bool {
@@ -61,8 +52,8 @@ func isLocationPrivacyCandidateKey(key string) bool {
 	if _, sensitive := sensitiveLocationMetadataKeys[normalized]; sensitive {
 		return true
 	}
-	_, container := locationPrivacyContainerKeys[normalized]
-	return container
+	_, direct := directLocationPrivacyKeys[normalized]
+	return direct
 }
 
 // FilterUpstreamLocationData applies the outbound privacy policy only to

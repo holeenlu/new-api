@@ -24,6 +24,9 @@ const ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
     'OAuth 账号无法使用此模型，请获取上游模型列表或选择其他模型。',
   oauth_forbidden: 'OAuth 账号无权访问此资源，请检查订阅状态和账号权限。',
   oauth_unauthorized: 'OAuth 凭证无效或已过期，请重新授权或刷新渠道凭证。',
+  upstream_account_disabled: '上游账号或组织已被停用，相关 OAuth 凭证已隔离，请联系管理员。',
+  upstream_quota_exhausted: '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。',
+  upstream_rate_limited: '上游账号触发临时频率限制，请稍后重试。',
 }
 
 const TOKEN_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [

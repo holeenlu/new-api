@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -177,7 +179,7 @@ func TestCodexResponsesLiteIsNotEnabledForOtherModelsOrCompact(t *testing.T) {
 	}
 }
 
-func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {
+func TestSetupRequestHeaderDoesNotForwardProtectedCodexClientHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -196,7 +198,7 @@ func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	require.Equal(t, "remote_compaction_v2", headers.Get("X-Codex-Beta-Features"))
+	require.Empty(t, headers.Get("X-Codex-Beta-Features"))
 	require.Empty(t, headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
 	require.Equal(t, "session-123", headers.Get("Session-Id"))
 	require.Equal(t, "Bearer access-token", headers.Get("Authorization"))
@@ -206,36 +208,38 @@ func TestSetupRequestHeaderForwardsCodexClientHeaders(t *testing.T) {
 }
 
 func TestCodexOAuthPacingHonorsContextCancellation(t *testing.T) {
-	originalInterval := CodexOAuthMinRequestInterval
-	CodexOAuthMinRequestInterval = time.Hour
-	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
-
-	channelID := 910003
-	require.NoError(t, waitForCodexOAuthTurn(context.Background(), channelID))
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 910003, 0, `{"account_id":"pacing-account"}`)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, time.Hour)
+	require.NoError(t, err)
+	lease.Release()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.ErrorIs(t, waitForCodexOAuthTurn(ctx, channelID), context.Canceled)
+	_, err = service.AcquireSubscriptionOAuthCapacity(ctx, fingerprint, 10, time.Hour)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestCodexOAuthConcurrencySlots(t *testing.T) {
-	originalMaxConcurrency := CodexOAuthMaxConcurrency
-	CodexOAuthMaxConcurrency = 2
-	t.Cleanup(func() { CodexOAuthMaxConcurrency = originalMaxConcurrency })
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 910001, 0, `{"account_id":"concurrency-account"}`)
+	first, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	_, err = service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.Error(t, err)
+	first.Release()
+	third, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second.Release()
+	third.Release()
+}
 
-	channelID := 910001
-	releaseFirst, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
-	releaseSecond, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
+func TestCodexOAuthRuntimeKeyUsesAccountIdentity(t *testing.T) {
+	first := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 1, 0, `{"access_token":"token-a","account_id":"shared-account"}`)
+	second := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 2, 0, `{"access_token":"token-b","account_id":"shared-account"}`)
+	different := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 3, 0, `{"access_token":"token-c","account_id":"other-account"}`)
 
-	_, ok = acquireCodexOAuthSlot(channelID)
-	require.False(t, ok)
-
-	releaseFirst()
-	releaseThird, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
-	releaseSecond()
-	releaseThird()
+	require.Equal(t, first, second)
+	require.NotEqual(t, first, different)
 }
 
 func TestInitOAuthRuntimeSettingsReadsLoadedEnvironment(t *testing.T) {
@@ -260,14 +264,17 @@ func TestCodexLocalConcurrencyLimitRemainsRetryable(t *testing.T) {
 	t.Cleanup(func() { CodexOAuthMaxConcurrency = originalMaxConcurrency })
 
 	channelID := 910004
-	release, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
-	defer release()
+	key := `{"access_token":"token","account_id":"limited-account"}`
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, channelID, 0, key)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 1, 0)
+	require.NoError(t, err)
+	defer lease.Release()
 
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err := (&Adaptor{}).DoRequest(c, &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channelID},
+	_, err = (&Adaptor{}).DoRequest(c, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channelID, ChannelType: constant.ChannelTypeCodex, ApiKey: key},
 	}, http.NoBody)
 	require.Error(t, err)
 	var apiErr *types.NewAPIError
@@ -275,30 +282,28 @@ func TestCodexLocalConcurrencyLimitRemainsRetryable(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
 	require.Equal(t, types.ErrorCodeOAuthChannelConcurrencyLimit, apiErr.GetErrorCode())
 	require.False(t, types.IsSkipRetryError(apiErr))
+	require.False(t, types.IsRecordErrorLog(apiErr))
+	require.Equal(t, "1", recorder.Header().Get("Retry-After"))
 }
 
 func TestCodexOAuthResponseBodyReleasesSlotOnce(t *testing.T) {
-	originalMaxConcurrency := CodexOAuthMaxConcurrency
-	CodexOAuthMaxConcurrency = 2
-	t.Cleanup(func() { CodexOAuthMaxConcurrency = originalMaxConcurrency })
-
-	channelID := 910002
-	release, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 910002, 0, `{"account_id":"response-body-account"}`)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
 	body := &codexOAuthResponseBody{
 		ReadCloser: io.NopCloser(strings.NewReader("ok")),
-		release:    release,
+		lease:      lease,
 	}
 
 	require.NoError(t, body.Close())
 	require.NoError(t, body.Close())
 
-	first, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
-	second, ok := acquireCodexOAuthSlot(channelID)
-	require.True(t, ok)
-	_, ok = acquireCodexOAuthSlot(channelID)
-	require.False(t, ok)
-	first()
-	second()
+	first, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	second, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.NoError(t, err)
+	_, err = service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
+	require.Error(t, err)
+	first.Release()
+	second.Release()
 }

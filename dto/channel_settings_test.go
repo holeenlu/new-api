@@ -30,6 +30,10 @@ func TestChannelDataPolicyValidateBroaderRetryRequirements(t *testing.T) {
 	err = missingGroup.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "retry_policy_group is required")
+
+	tagIsolation := *valid
+	tagIsolation.RetryIsolation = RetryIsolationTag
+	require.NoError(t, tagIsolation.Validate())
 }
 
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {

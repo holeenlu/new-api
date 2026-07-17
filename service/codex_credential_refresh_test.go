@@ -57,3 +57,20 @@ func TestReplaceCodexChannelCredentialDoesNotOverwriteConcurrentUpdate(t *testin
 	require.NoError(t, err)
 	assert.Equal(t, "credential-from-reauthorization", channel.Key)
 }
+
+func TestCodexCredentialRefreshLockIsRemovedAfterLastCaller(t *testing.T) {
+	const channelID = 987654
+	release := acquireCodexChannelCredentialRefreshLock(channelID)
+
+	codexChannelCredentialRefreshLocks.Lock()
+	lock := codexChannelCredentialRefreshLocks.locks[channelID]
+	require.NotNil(t, lock)
+	require.Equal(t, 1, lock.refs)
+	codexChannelCredentialRefreshLocks.Unlock()
+
+	release()
+	codexChannelCredentialRefreshLocks.Lock()
+	_, exists := codexChannelCredentialRefreshLocks.locks[channelID]
+	codexChannelCredentialRefreshLocks.Unlock()
+	require.False(t, exists)
+}

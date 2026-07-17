@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 )
@@ -62,6 +63,9 @@ const (
 	ErrorCodeOAuthChannelConcurrencyLimit ErrorCode = "oauth_channel_concurrency_limit"
 	ErrorCodeOAuthUnauthorized            ErrorCode = "oauth_unauthorized"
 	ErrorCodeOAuthForbidden               ErrorCode = "oauth_forbidden"
+	ErrorCodeUpstreamAccountDisabled      ErrorCode = "upstream_account_disabled"
+	ErrorCodeUpstreamQuotaExhausted       ErrorCode = "upstream_quota_exhausted"
+	ErrorCodeUpstreamRateLimited          ErrorCode = "upstream_rate_limited"
 	ErrorCodeModelNotSupported            ErrorCode = "model_not_supported"
 
 	// client request error
@@ -92,14 +96,16 @@ const (
 )
 
 type NewAPIError struct {
-	Err            error
-	RelayError     any
-	skipRetry      bool
-	recordErrorLog *bool
-	errorType      ErrorType
-	errorCode      ErrorCode
-	StatusCode     int
-	Metadata       json.RawMessage
+	Err                error
+	RelayError         any
+	skipRetry          bool
+	recordErrorLog     *bool
+	errorType          ErrorType
+	errorCode          ErrorCode
+	StatusCode         int
+	UpstreamStatusCode int `json:"-"`
+	Metadata           json.RawMessage
+	RetryAfter         time.Duration `json:"-"`
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -122,6 +128,30 @@ func (e *NewAPIError) GetErrorType() ErrorType {
 		return ""
 	}
 	return e.errorType
+}
+
+func (e *NewAPIError) GetUpstreamStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	if e.UpstreamStatusCode > 0 {
+		return e.UpstreamStatusCode
+	}
+	return e.StatusCode
+}
+
+// Reclassify returns an independent error with a gateway classification while
+// preserving transport metadata and retry options from the original error.
+func (e *NewAPIError) Reclassify(err error, errorCode ErrorCode) *NewAPIError {
+	if e == nil {
+		return NewError(err, errorCode)
+	}
+	classified := *e
+	classified.Err = err
+	classified.RelayError = nil
+	classified.errorType = ErrorTypeNewAPIError
+	classified.errorCode = errorCode
+	return &classified
 }
 
 func (e *NewAPIError) Error() string {

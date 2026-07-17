@@ -62,11 +62,27 @@ func TestNormalizeResponsesWebSocketFrameSupportsAppend(t *testing.T) {
 	appendFrame, err := normalizeResponsesWebSocketFrame(map[string]any{
 		"type":  "response.append",
 		"input": []any{map[string]any{"role": "user", "content": "two"}},
-	}, first)
+	}, reusableResponsesWebSocketFields(first))
 	require.NoError(t, err)
 	require.Equal(t, "gpt-5.6-sol", appendFrame["model"])
 	require.Equal(t, "answer briefly", appendFrame["instructions"])
 	require.Equal(t, true, appendFrame["stream"])
+}
+
+func TestReusableResponsesWebSocketFieldsDropsRequestState(t *testing.T) {
+	defaults := reusableResponsesWebSocketFields(map[string]any{
+		"model":                "gpt-5.6-luna",
+		"instructions":         "keep",
+		"input":                []any{map[string]any{"content": "large input"}},
+		"previous_response_id": "response-id",
+		"stream":               true,
+		"generate":             true,
+	})
+
+	require.Equal(t, map[string]any{
+		"model":        "gpt-5.6-luna",
+		"instructions": "keep",
+	}, defaults)
 }
 
 func TestNormalizeResponsesWebSocketFrameRejectsAppendBeforeCreate(t *testing.T) {

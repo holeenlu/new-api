@@ -486,7 +486,10 @@ export function transformChannelToFormDefaults(
         dataRegion = parsed.data_policy.region || ''
         dataRetention = parsed.data_policy.retention || ''
         dataTraining = parsed.data_policy.training || 'provider_default'
-        retryIsolation = parsed.data_policy.retry_isolation || 'auto'
+        retryIsolation =
+          parsed.data_policy.retry_isolation === 'tag'
+            ? 'auto'
+            : parsed.data_policy.retry_isolation || 'auto'
         retryPolicyGroup = parsed.data_policy.retry_policy_group || ''
       }
     } catch (error) {

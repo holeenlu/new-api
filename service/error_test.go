@@ -8,12 +8,38 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRelayErrorHandlerPreservesRetryAfter(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{"12"},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`)),
+	}
+
+	err := RelayErrorHandler(context.Background(), response)
+	require.NotNil(t, err)
+	require.Equal(t, 12*time.Second, err.RetryAfter)
+}
+
+func TestSanitizeUpstreamErrorMessagePreventsLogLineInjection(t *testing.T) {
+	message := sanitizeUpstreamErrorMessage("first line\r\n[FAKE] second line\tvalue")
+
+	require.Equal(t, "first line  [FAKE] second line value", message)
+}
+
+func TestParseRetryAfterCapsOversizedValues(t *testing.T) {
+	require.Equal(t, maximumSubscriptionOAuthRetryAfter, ParseRetryAfterHeader("999999999999999999", time.Now()))
+}
 
 func TestResetStatusCode(t *testing.T) {
 	t.Parallel()

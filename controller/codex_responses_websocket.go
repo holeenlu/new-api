@@ -74,11 +74,14 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			turn.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(errors.New("Responses WebSocket requires a ChatGPT Subscription (Codex) channel"), types.ErrorCodeInvalidRequest).ToOpenAIError()})
 			return
 		}
-		pinnedChannelID = common.GetContextKeyInt(turn, constant.ContextKeyChannelId)
-		common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(pinnedChannelID))
 		codex.SetResponsesWebSocketSession(turn, session)
 		Relay(turn, types.RelayFormatOpenAIResponses)
-		pinnedChannelID = common.GetContextKeyInt(turn, constant.ContextKeyChannelId)
+		if turn.GetBool("relay_affinity_success") {
+			session.ConfirmHTTPFallbackSuccess()
+		}
+		if connectedChannelID := session.ChannelID(); connectedChannelID > 0 {
+			pinnedChannelID = connectedChannelID
+		}
 	})
 
 	for {
@@ -121,8 +124,26 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		if err := writer.Finish(); err != nil {
 			return
 		}
-		previousRequest = frame
+		previousRequest = reusableResponsesWebSocketFields(frame)
 	}
+}
+
+func reusableResponsesWebSocketFields(frame map[string]any) map[string]any {
+	if len(frame) == 0 {
+		return nil
+	}
+	defaults := make(map[string]any, len(frame))
+	for key, value := range frame {
+		switch key {
+		case "input", "previous_response_id", "stream", "generate":
+			continue
+		}
+		defaults[key] = value
+	}
+	if len(defaults) == 0 {
+		return nil
+	}
+	return defaults
 }
 
 func normalizeResponsesWebSocketFrame(frame map[string]any, previous map[string]any) (map[string]any, error) {

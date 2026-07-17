@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strings"
 	"sync"
@@ -643,6 +644,14 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	trace := &httptrace.ClientTrace{
+		WroteHeaders: info.MarkUpstreamRequestWritten,
+		WroteRequest: func(traceInfo httptrace.WroteRequestInfo) {
+			info.MarkUpstreamRequestWritten()
+		},
+		GotFirstResponseByte: info.MarkUpstreamResponseStarted,
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())

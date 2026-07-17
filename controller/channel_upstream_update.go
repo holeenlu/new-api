@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -282,10 +283,29 @@ func getUpstreamModelUpdateMinCheckIntervalSeconds() int64 {
 	return interval
 }
 
-func fetchCodexUpstreamModelIDs(ctx context.Context, baseURL string, key string, proxyURL string) ([]string, error) {
+func fetchCodexUpstreamModelIDs(
+	ctx context.Context,
+	channelID int,
+	keyIndex int,
+	baseURL string,
+	key string,
+	proxyURL string,
+) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	lease, err := acquireSubscriptionOAuthManagementCapacity(
+		ctx,
+		constant.ChannelTypeCodex,
+		channelID,
+		keyIndex,
+		key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Release()
+
 	timeout := time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -300,8 +320,22 @@ func fetchCodexUpstreamModelIDs(ctx context.Context, baseURL string, key string,
 }
 
 func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) ([]string, error) {
+	if channel == nil {
+		return nil, errors.New("channel is nil")
+	}
 	if channel.Type == constant.ChannelTypeCodex {
-		models, err := fetchCodexUpstreamModelIDs(ctx, channel.GetBaseURL(), channel.Key, channel.GetSetting().Proxy)
+		key, keyIndex, apiErr := channel.GetNextEnabledKey()
+		if apiErr != nil {
+			return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+		}
+		models, err := fetchCodexUpstreamModelIDs(
+			ctx,
+			channel.Id,
+			keyIndex,
+			channel.GetBaseURL(),
+			key,
+			channel.GetSetting().Proxy,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -363,11 +397,24 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 		url = fmt.Sprintf("%s/v1/models", baseURL)
 	}
 
-	key, _, apiErr := channel.GetNextEnabledKey()
+	key, keyIndex, apiErr := channel.GetNextEnabledKey()
 	if apiErr != nil {
 		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
 	}
 	key = strings.TrimSpace(key)
+	lease, err := acquireSubscriptionOAuthManagementCapacity(
+		ctx,
+		channel.Type,
+		channel.Id,
+		keyIndex,
+		key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		defer lease.Release()
+	}
 
 	headers, err := buildFetchModelsHeaders(channel, key)
 	if err != nil {

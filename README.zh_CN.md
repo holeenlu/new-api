@@ -402,7 +402,7 @@ docker run --name new-api -d --restart always \
 
 **重试配置：** `设置 → 运营设置 → 通用设置 → 失败重试次数`
 
-自动重试默认限制在当前渠道内，避免将同一提示词发送给其他渠道或供应商。管理员可以在渠道编辑器的“数据治理”中配置供应商、数据区域、保留期和训练策略；跨渠道重试必须明确填写供应商，并选择“相同供应商端点”或“策略组”，且数据策略完全一致。
+自动重试会在“相同非空标签”且供应商、数据区域、保留期和训练策略完全一致的渠道间切换；未设置标签的渠道仍只在当前渠道内重试。管理员可以在渠道编辑器的“数据治理”中选择更严格或更宽的重试范围。
 
 每个 API 响应都会通过以下响应头披露实际数据处理信息：`X-Relay-Upstream-Provider`、`X-Relay-Attempt`、`X-Relay-Retry-Count`、`X-Relay-Retry-Isolation`、`X-Relay-Data-Region`、`X-Relay-Data-Retention` 和 `X-Relay-Data-Training`。
 

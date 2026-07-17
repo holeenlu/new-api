@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -155,6 +156,10 @@ func InitOptionMap() {
 	//common.OptionMap["ChatLink2"] = common.ChatLink2
 	common.OptionMap["QuotaPerUnit"] = strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64)
 	common.OptionMap["RetryTimes"] = strconv.Itoa(common.RetryTimes)
+	common.OptionMap["SubscriptionOAuthUpstreamRetryTimes"] = strconv.Itoa(common.SubscriptionOAuthUpstreamRetryTimes)
+	common.OptionMap["SubscriptionOAuthCapacityCycleTimes"] = strconv.Itoa(common.SubscriptionOAuthCapacityCycleTimes)
+	common.OptionMap["SubscriptionOAuthCapacityWaitSeconds"] = strconv.Itoa(common.SubscriptionOAuthCapacityWaitSeconds)
+	common.OptionMap["SubscriptionOAuthRetry429"] = strconv.FormatBool(common.SubscriptionOAuthRetry429)
 	common.OptionMap["DataExportInterval"] = strconv.Itoa(common.DataExportInterval)
 	common.OptionMap["DataExportDefaultTime"] = common.DataExportDefaultTime
 	common.OptionMap["DefaultCollapseSidebar"] = strconv.FormatBool(common.DefaultCollapseSidebar)
@@ -517,6 +522,14 @@ func updateOptionMap(key string, value string) (err error) {
 		err = setting.UpdateModelRequestRateLimitGroupByJSONString(value)
 	case "RetryTimes":
 		common.RetryTimes, _ = strconv.Atoi(value)
+	case "SubscriptionOAuthUpstreamRetryTimes":
+		common.SubscriptionOAuthUpstreamRetryTimes, _ = strconv.Atoi(value)
+	case "SubscriptionOAuthCapacityCycleTimes":
+		common.SubscriptionOAuthCapacityCycleTimes, _ = strconv.Atoi(value)
+	case "SubscriptionOAuthCapacityWaitSeconds":
+		common.SubscriptionOAuthCapacityWaitSeconds, _ = strconv.Atoi(value)
+	case "SubscriptionOAuthRetry429":
+		common.SubscriptionOAuthRetry429, _ = strconv.ParseBool(value)
 	case "DataExportInterval":
 		common.DataExportInterval, _ = strconv.Atoi(value)
 	case "DataExportDefaultTime":
@@ -576,8 +589,23 @@ func updateOptionMap(key string, value string) (err error) {
 }
 
 func validateOptionValue(key string, value string) error {
-	if key == "UpstreamLocationMode" {
+	switch key {
+	case "UpstreamLocationMode":
 		return common.ValidateUpstreamLocationMode(value)
+	case "SubscriptionOAuthUpstreamRetryTimes", "SubscriptionOAuthCapacityCycleTimes":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 10 {
+			return fmt.Errorf("%s must be an integer between 0 and 10", key)
+		}
+	case "SubscriptionOAuthCapacityWaitSeconds":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 30 {
+			return fmt.Errorf("%s must be an integer between 0 and 30", key)
+		}
+	case "SubscriptionOAuthRetry429":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s must be true or false", key)
+		}
 	}
 	return nil
 }

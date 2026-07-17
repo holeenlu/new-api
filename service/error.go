@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -87,6 +88,12 @@ const maxUpstreamErrorResponseBytes = 1 << 20
 
 func sanitizeUpstreamErrorMessage(message string) string {
 	message = common.RedactSensitiveCredentials(strings.TrimSpace(message))
+	message = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, message)
 	runes := []rune(message)
 	if len(runes) > common.LocalLogContentLimit {
 		return fmt.Sprintf("%s... [truncated]", string(runes[:common.LocalLogContentLimit]))
@@ -121,6 +128,13 @@ func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncat
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *types.NewAPIError) {
+	retryAfter := ParseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+	defer func() {
+		if newApiErr != nil {
+			newApiErr.RetryAfter = retryAfter
+			newApiErr.UpstreamStatusCode = resp.StatusCode
+		}
+	}()
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorResponseBytes+1))
@@ -156,6 +170,31 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 	newApiErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	newApiErr.Err = buildUpstreamErrorSummary(resp, responseBody, truncated, message)
 	return
+}
+
+func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds >= int64(maximumSubscriptionOAuthRetryAfter/time.Second) {
+			return maximumSubscriptionOAuthRetryAfter
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	duration := when.Sub(now)
+	if duration > maximumSubscriptionOAuthRetryAfter {
+		return maximumSubscriptionOAuthRetryAfter
+	}
+	return duration
 }
 
 func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) {

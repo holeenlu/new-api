@@ -33,17 +33,20 @@ deploy_require_commands() {
   done
 }
 
-deploy_source_version() {
-  local root_dir=$1
-  git -C "$root_dir" describe --tags --always --dirty 2>/dev/null || sed -n '1p' "$root_dir/VERSION"
-}
-
 deploy_build_version() {
   local root_dir=$1
   local release_version
   release_version=$(git -C "$root_dir" describe --tags --abbrev=0 2>/dev/null || sed -n '1p' "$root_dir/VERSION")
   [[ -n "$release_version" ]] || deploy_die "Unable to determine the release version"
   printf '%s\n' "$release_version"
+}
+
+deploy_file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+    return
+  fi
+  shasum -a 256 "$1" | awk '{print $1}'
 }
 
 deploy_build_image() {
@@ -70,34 +73,52 @@ deploy_build_image() {
     args+=(--no-cache)
   fi
 
-  deploy_log "Building image=$image platform=${platform:-native} version=$app_version"
-  "${args[@]}" "$root_dir"
-  deploy_prune_build_cache
+  local max_attempts=${DEPLOY_BUILD_ATTEMPTS:-2}
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || deploy_die "DEPLOY_BUILD_ATTEMPTS must be a positive integer"
+  local build_log
+  build_log=$(mktemp "${TMPDIR:-/tmp}/new-api-build.XXXXXX")
+
+  local attempt
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    : >"$build_log"
+    deploy_log "Building image=$image platform=${platform:-native} version=$app_version attempt=$attempt/$max_attempts"
+    if "${args[@]}" "$root_dir" 2>&1 | tee "$build_log"; then
+      rm -f "$build_log"
+      deploy_prune_build_cache
+      return 0
+    fi
+
+    if ((attempt >= max_attempts)) || ! grep -Eiq \
+      'failed to resolve source metadata|failed to do request|unexpected EOF|(^|[[:space:]:])EOF$|TLS handshake timeout|connection reset by peer|i/o timeout|temporary failure|429 Too Many Requests|503 Service Unavailable' \
+      "$build_log"; then
+      rm -f "$build_log"
+      return 1
+    fi
+
+    local retry_delay=$((attempt * 5))
+    deploy_log "Transient registry or network failure detected; retrying in ${retry_delay}s"
+    sleep "$retry_delay"
+  done
+
+  rm -f "$build_log"
+  return 1
 }
 
 deploy_prune_build_cache() {
-  local enabled=${DEPLOY_PRUNE_BUILD_CACHE:-true}
-  if [[ "$enabled" != "true" && "$enabled" != "1" ]]; then
+  local mode=${DEPLOY_PRUNE_BUILD_CACHE:-false}
+  if [[ "$mode" == "false" || "$mode" == "0" ]]; then
     return 0
   fi
 
-  # Docker Desktop may report all cache records as reclaimable while ignoring
-  # --max-used-space. Remove the Buildx cache deterministically after deploy.
-  deploy_log "Pruning all Buildx cache after deployment"
-  if ! docker buildx prune --all --force; then
+  if [[ "$mode" == "all" ]]; then
+    deploy_log "Pruning all Buildx cache"
+    docker buildx prune --all --force || deploy_log "Warning: Buildx cache cleanup failed"
+    return 0
+  fi
+  [[ "$mode" == "true" || "$mode" == "1" ]] || deploy_die "DEPLOY_PRUNE_BUILD_CACHE must be false, true, or all"
+  deploy_log "Pruning Buildx cache unused for seven days"
+  if ! docker buildx prune --force --filter 'until=168h'; then
     deploy_log "Warning: Buildx cache cleanup failed; deployment will continue"
-  fi
-}
-
-deploy_prune_project_images() {
-  local enabled=${DEPLOY_PRUNE_PROJECT_IMAGES:-true}
-  if [[ "$enabled" != "true" && "$enabled" != "1" ]]; then
-    return 0
-  fi
-
-  deploy_log "Pruning unused new-api images"
-  if ! docker image prune --force --filter "label=org.opencontainers.image.title=new-api"; then
-    deploy_log "Warning: unused new-api image cleanup failed; deployment will continue"
   fi
 }
 
@@ -121,21 +142,64 @@ deploy_image_id() {
   docker image inspect "$1" --format '{{.Id}}'
 }
 
-deploy_file_sha256() {
-  local file=$1
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-    return
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-    return
-  fi
-  deploy_die "Neither sha256sum nor shasum is available"
-}
-
 deploy_random_hex() {
   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+deploy_assert_image_runs() {
+  local image=$1
+  local expected_version=$2
+  local platform=${3:-}
+  local actual_version
+  local args=(docker run --rm)
+  if [[ -n "$platform" ]]; then
+    args+=(--platform "$platform")
+  fi
+  actual_version=$("${args[@]}" "$image" --version)
+  [[ "$actual_version" == "$expected_version" ]] || \
+    deploy_die "Image smoke test failed: expected_version=$expected_version actual_version=${actual_version:-unavailable}"
+}
+
+deploy_verify_relay_routes() {
+  local base_url=${1%/}
+  local path
+  local status
+  for path in /v1/responses /v1/chat/completions /v1/messages; do
+    status=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' \
+      --max-time 10 --header 'Content-Type: application/json' \
+      --request POST --data '{}' "$base_url$path" || true)
+    if [[ "$status" != "401" ]]; then
+      printf '[error] Relay route probe failed: path=%s expected_status=401 actual_status=%s\n' \
+        "$path" "${status:-unavailable}" >&2
+      return 1
+    fi
+  done
+}
+
+deploy_backup_postgres() {
+  local backup_dir=$1
+  local backup_file="$backup_dir/predeploy-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+  local temp_file="${backup_file}.tmp.$$"
+  mkdir -p "$backup_dir"
+  chmod 700 "$backup_dir"
+  if ! docker exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip >"$temp_file"; then
+    rm -f "$temp_file"
+    return 1
+  fi
+  [[ -s "$temp_file" ]] || {
+    rm -f "$temp_file"
+    return 1
+  }
+  chmod 600 "$temp_file"
+  mv "$temp_file" "$backup_file"
+
+  local backups=("$backup_dir"/predeploy-*.sql.gz)
+  local remove_count=$((${#backups[@]} - 3))
+  local index
+  for ((index = 0; index < remove_count; index++)); do
+    rm -f "${backups[$index]}"
+  done
+  deploy_log "Database backup created: $backup_file"
 }
 
 deploy_env_get() {
@@ -231,13 +295,12 @@ deploy_prepare_env_file() {
   chmod 600 "$timezone_env_file"
   mv "$timezone_env_file" "$env_file"
 
-  deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5
+  deploy_env_migrate_default "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5 10
   deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 750
-  deploy_env_ensure "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5
+  deploy_env_migrate_default "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5 10
   deploy_env_ensure "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 750
   deploy_env_ensure "$env_file" MAX_REQUEST_BODY_MB 128
   deploy_env_migrate_default "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 120 30
-  deploy_env_ensure "$env_file" CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED true
   deploy_env_ensure "$env_file" CODEX_OAUTH_CLIENT_ID app_EMoamEEZ73f0CkXaXp7hrann
   deploy_env_ensure "$env_file" CODEX_OAUTH_REDIRECT_URI http://localhost:1455/auth/callback
   deploy_env_ensure "$env_file" CODEX_OAUTH_SCOPE "openid profile email offline_access"

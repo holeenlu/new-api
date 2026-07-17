@@ -26,6 +26,20 @@ function stableStringify(obj) {
 }
 
 const en = {
+  'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.',
+  'Capacity cycle times': 'Capacity cycle times',
+  'Capacity wait limit (seconds)': 'Capacity wait limit (seconds)',
+  'Disabled by default to avoid amplifying upstream rate limits': 'Disabled by default to avoid amplifying upstream rate limits',
+  'Maximum passes through channels in the same retry pool': 'Maximum passes through channels in the same retry pool',
+  'Maximum retryable failures per OAuth credential before same-tag failover':
+    'Maximum retryable failures per OAuth credential before same-tag failover',
+  'Retry 429 across OAuth accounts': 'Retry 429 across OAuth accounts',
+  'Subscription OAuth retry': 'Subscription OAuth retry',
+  'Total wait budget across all capacity cycles': 'Total wait budget across all capacity cycles',
+  'Upstream retry times': 'Upstream retry times',
+  'Channel tag is required for tag isolation':
+    'Channel tag is required for tag isolation',
   'All requests use the host location profile':
     'All requests use the host location profile',
   'All requests use the proxy egress profile':
@@ -54,6 +68,7 @@ const en = {
   'System VPN or TUN is active; all requests use the proxy egress profile':
     'System VPN or TUN is active; all requests use the proxy egress profile',
   'System-level VPN or TUN': 'System-level VPN or TUN',
+  'Same channel tag': 'Same channel tag',
   Timezone: 'Timezone',
   'Upstream Privacy': 'Upstream Privacy',
   'VPN or proxy egress profile': 'VPN or proxy egress profile',
@@ -62,6 +77,19 @@ const en = {
 const newKeys = {
   en,
   zh: {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      '自动模式仅在具有相同非空标签且数据策略一致的渠道间重试。未设置标签的渠道保持隔离。',
+    'Capacity cycle times': '容量循环次数',
+    'Capacity wait limit (seconds)': '容量等待上限（秒）',
+    'Disabled by default to avoid amplifying upstream rate limits': '默认关闭，避免放大上游限流',
+    'Maximum passes through channels in the same retry pool': '同一重试池内渠道的最大循环轮数',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      '单个 OAuth 凭证触发同标签切换前允许的最大可重试失败次数',
+    'Retry 429 across OAuth accounts': '跨 OAuth 账号重试 429',
+    'Subscription OAuth retry': '订阅 OAuth 重试',
+    'Total wait budget across all capacity cycles': '所有容量循环累计等待预算',
+    'Upstream retry times': '上游重试次数',
+    'Channel tag is required for tag isolation': '按标签隔离时必须填写渠道标签',
     'All requests use the host location profile':
       '所有请求使用宿主网络位置画像',
     'All requests use the proxy egress profile': '所有请求使用代理出口位置画像',
@@ -89,11 +117,26 @@ const newKeys = {
     'System VPN or TUN is active; all requests use the proxy egress profile':
       '系统 VPN 或 TUN 已启用，所有请求使用代理出口画像',
     'System-level VPN or TUN': '系统级 VPN 或 TUN',
+    'Same channel tag': '相同渠道标签',
     Timezone: '时区',
     'Upstream Privacy': '上游隐私',
     'VPN or proxy egress profile': 'VPN 或代理出口画像',
   },
   'zh-TW': {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      '自動模式僅在具有相同非空標籤且資料策略一致的渠道間重試。未設定標籤的渠道保持隔離。',
+    'Capacity cycle times': '容量循環次數',
+    'Capacity wait limit (seconds)': '容量等待上限（秒）',
+    'Disabled by default to avoid amplifying upstream rate limits': '預設關閉，避免放大上游限流',
+    'Maximum passes through channels in the same retry pool': '同一重試池內渠道的最大循環輪數',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      '單一 OAuth 憑證觸發同標籤切換前允許的最大可重試失敗次數',
+    'Retry 429 across OAuth accounts': '跨 OAuth 帳號重試 429',
+    'Subscription OAuth retry': '訂閱 OAuth 重試',
+    'Total wait budget across all capacity cycles': '所有容量循環累計等待預算',
+    'Upstream retry times': '上游重試次數',
+    'Channel tag is required for tag isolation': '按標籤隔離時必須填寫渠道標籤',
+    'Same channel tag': '相同渠道標籤',
     'All requests use the host location profile':
       '所有請求使用主機網路位置設定',
     'All requests use the proxy egress profile': '所有請求使用代理出口位置設定',
@@ -126,6 +169,20 @@ const newKeys = {
     'VPN or proxy egress profile': 'VPN 或代理出口設定',
   },
   fr: {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      'Le mode automatique réessaie les canaux ayant la même étiquette non vide et la même politique de données. Les canaux sans étiquette restent isolés.',
+    'Capacity cycle times': 'Cycles de capacité',
+    'Capacity wait limit (seconds)': 'Limite d’attente de capacité (secondes)',
+    'Disabled by default to avoid amplifying upstream rate limits': 'Désactivé par défaut pour ne pas amplifier les limites en amont',
+    'Maximum passes through channels in the same retry pool': 'Nombre maximal de passages dans le même pool de nouvelle tentative',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      'Nombre maximal d’échecs réessayables par identifiant OAuth avant basculement vers la même étiquette',
+    'Retry 429 across OAuth accounts': 'Réessayer les 429 entre comptes OAuth',
+    'Subscription OAuth retry': 'Nouvelle tentative OAuth d’abonnement',
+    'Total wait budget across all capacity cycles': 'Budget d’attente total pour tous les cycles de capacité',
+    'Upstream retry times': 'Tentatives en amont',
+    'Channel tag is required for tag isolation':
+      'Une étiquette de canal est requise pour l’isolation par étiquette',
     'All requests use the host location profile':
       'Toutes les requêtes utilisent le profil d’emplacement de l’hôte',
     'All requests use the proxy egress profile':
@@ -155,11 +212,26 @@ const newKeys = {
     'System VPN or TUN is active; all requests use the proxy egress profile':
       'Le VPN ou TUN système est actif ; toutes les requêtes utilisent le profil de sortie du proxy',
     'System-level VPN or TUN': 'VPN ou TUN système',
+    'Same channel tag': 'Même étiquette de canal',
     Timezone: 'Fuseau horaire',
     'Upstream Privacy': 'Confidentialité en amont',
     'VPN or proxy egress profile': 'Profil de sortie VPN ou proxy',
   },
   ja: {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      '自動モードでは、同じ空でないタグと一致するデータポリシーを持つチャネルのみ再試行します。タグのないチャネルは分離されたままです。',
+    'Capacity cycle times': '容量サイクル回数',
+    'Capacity wait limit (seconds)': '容量待機上限（秒）',
+    'Disabled by default to avoid amplifying upstream rate limits': '上流のレート制限を増幅しないよう既定では無効です',
+    'Maximum passes through channels in the same retry pool': '同じ再試行プール内の最大巡回回数',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      '同一タグ内で切り替える前の OAuth 認証情報ごとの再試行可能な最大失敗回数',
+    'Retry 429 across OAuth accounts': 'OAuth アカウント間で 429 を再試行',
+    'Subscription OAuth retry': 'サブスクリプション OAuth 再試行',
+    'Total wait budget across all capacity cycles': '全容量サイクルの合計待機時間',
+    'Upstream retry times': '上流再試行回数',
+    'Channel tag is required for tag isolation':
+      'タグ分離にはチャネルタグが必要です',
     'All requests use the host location profile':
       'すべてのリクエストでホスト位置プロファイルを使用します',
     'All requests use the proxy egress profile':
@@ -189,11 +261,26 @@ const newKeys = {
     'System VPN or TUN is active; all requests use the proxy egress profile':
       'システム VPN または TUN が有効なため、すべてのリクエストでプロキシ出口プロファイルを使用します',
     'System-level VPN or TUN': 'システムレベルの VPN または TUN',
+    'Same channel tag': '同じチャネルタグ',
     Timezone: 'タイムゾーン',
     'Upstream Privacy': '上流プライバシー',
     'VPN or proxy egress profile': 'VPN またはプロキシ出口プロファイル',
   },
   ru: {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      'В автоматическом режиме повтор выполняется только по каналам с одинаковым непустым тегом и совпадающей политикой данных. Каналы без тега остаются изолированными.',
+    'Capacity cycle times': 'Число циклов ёмкости',
+    'Capacity wait limit (seconds)': 'Лимит ожидания ёмкости (секунды)',
+    'Disabled by default to avoid amplifying upstream rate limits': 'По умолчанию отключено, чтобы не усиливать ограничения поставщика',
+    'Maximum passes through channels in the same retry pool': 'Максимальное число проходов по каналам одного пула',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      'Максимум повторяемых сбоев для учетных данных OAuth до переключения в той же метке',
+    'Retry 429 across OAuth accounts': 'Повторять 429 между OAuth-аккаунтами',
+    'Subscription OAuth retry': 'Повторы OAuth-подписки',
+    'Total wait budget across all capacity cycles': 'Общий бюджет ожидания всех циклов ёмкости',
+    'Upstream retry times': 'Число повторов поставщика',
+    'Channel tag is required for tag isolation':
+      'Для изоляции по тегу требуется тег канала',
     'All requests use the host location profile':
       'Все запросы используют профиль расположения хоста',
     'All requests use the proxy egress profile':
@@ -223,11 +310,26 @@ const newKeys = {
     'System VPN or TUN is active; all requests use the proxy egress profile':
       'Системный VPN или TUN активен; все запросы используют профиль выхода прокси',
     'System-level VPN or TUN': 'Системный VPN или TUN',
+    'Same channel tag': 'Одинаковый тег канала',
     Timezone: 'Часовой пояс',
     'Upstream Privacy': 'Конфиденциальность вышестоящего соединения',
     'VPN or proxy egress profile': 'Профиль выхода VPN или прокси',
   },
   vi: {
+    'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.':
+      'Chế độ tự động chỉ thử lại các kênh có cùng thẻ không rỗng và chính sách dữ liệu khớp nhau. Kênh không có thẻ vẫn được cô lập.',
+    'Capacity cycle times': 'Số vòng dung lượng',
+    'Capacity wait limit (seconds)': 'Giới hạn chờ dung lượng (giây)',
+    'Disabled by default to avoid amplifying upstream rate limits': 'Mặc định tắt để tránh khuếch đại giới hạn phía thượng nguồn',
+    'Maximum passes through channels in the same retry pool': 'Số lượt tối đa qua các kênh trong cùng nhóm thử lại',
+    'Maximum retryable failures per OAuth credential before same-tag failover':
+      'Số lỗi có thể thử lại tối đa trên mỗi thông tin xác thực OAuth trước khi chuyển trong cùng nhãn',
+    'Retry 429 across OAuth accounts': 'Thử lại 429 giữa các tài khoản OAuth',
+    'Subscription OAuth retry': 'Thử lại OAuth đăng ký',
+    'Total wait budget across all capacity cycles': 'Tổng ngân sách chờ cho mọi vòng dung lượng',
+    'Upstream retry times': 'Số lần thử lại thượng nguồn',
+    'Channel tag is required for tag isolation':
+      'Cần có thẻ kênh để cô lập theo thẻ',
     'All requests use the host location profile':
       'Mọi yêu cầu dùng hồ sơ vị trí máy chủ',
     'All requests use the proxy egress profile':
@@ -256,6 +358,7 @@ const newKeys = {
     'System VPN or TUN is active; all requests use the proxy egress profile':
       'VPN hoặc TUN hệ thống đang hoạt động; mọi yêu cầu dùng hồ sơ đầu ra proxy',
     'System-level VPN or TUN': 'VPN hoặc TUN cấp hệ thống',
+    'Same channel tag': 'Cùng thẻ kênh',
     Timezone: 'Múi giờ',
     'Upstream Privacy': 'Quyền riêng tư phía thượng nguồn',
     'VPN or proxy egress profile': 'Hồ sơ đầu ra VPN hoặc proxy',

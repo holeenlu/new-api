@@ -35,13 +35,15 @@ type ResolvedChannelDataPolicy struct {
 }
 
 type RetryBoundary struct {
-	initialChannelID                      int
-	initialType                           int
-	policy                                ResolvedChannelDataPolicy
-	initialUsesDefaultRetryIsolation      bool
-	allowDefaultSubscriptionOAuthFailover bool
-	usedChannelIDs                        map[int]struct{}
-	usedKeyIndexes                        map[int]map[int]struct{}
+	initialChannelID    int
+	initialType         int
+	initialTag          string
+	policy              ResolvedChannelDataPolicy
+	usedChannelIDs      map[int]struct{}
+	usedKeyIndexes      map[int]map[int]struct{}
+	excludedCredentials map[string]struct{}
+	failedCredentials   map[string]struct{}
+	capacityAttempts    map[string]map[int]map[int]struct{}
 }
 
 func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy {
@@ -82,7 +84,11 @@ func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy 
 		}
 	}
 	if policy.RetryIsolation == "" {
-		policy.RetryIsolation = dto.RetryIsolationChannel
+		if strings.TrimSpace(channel.GetTag()) != "" {
+			policy.RetryIsolation = dto.RetryIsolationTag
+		} else {
+			policy.RetryIsolation = dto.RetryIsolationChannel
+		}
 	}
 	return policy
 }
@@ -110,31 +116,16 @@ func NewRetryBoundary(channel *model.Channel) *RetryBoundary {
 		return nil
 	}
 	return &RetryBoundary{
-		initialChannelID:                 channel.Id,
-		initialType:                      channel.Type,
-		policy:                           ResolveChannelDataPolicy(channel),
-		initialUsesDefaultRetryIsolation: channelUsesDefaultRetryIsolation(channel),
-		usedChannelIDs:                   make(map[int]struct{}),
-		usedKeyIndexes:                   make(map[int]map[int]struct{}),
+		initialChannelID:    channel.Id,
+		initialType:         channel.Type,
+		initialTag:          strings.TrimSpace(channel.GetTag()),
+		policy:              ResolveChannelDataPolicy(channel),
+		usedChannelIDs:      make(map[int]struct{}),
+		usedKeyIndexes:      make(map[int]map[int]struct{}),
+		excludedCredentials: make(map[string]struct{}),
+		failedCredentials:   make(map[string]struct{}),
+		capacityAttempts:    make(map[string]map[int]map[int]struct{}),
 	}
-}
-
-func channelUsesDefaultRetryIsolation(channel *model.Channel) bool {
-	if channel == nil {
-		return false
-	}
-	policy := channel.GetOtherSettings().DataPolicy
-	return policy == nil || policy.RetryIsolation == ""
-}
-
-func (b *RetryBoundary) AllowDefaultSubscriptionOAuthFailover() {
-	if b == nil || !b.initialUsesDefaultRetryIsolation {
-		return
-	}
-	if b.initialType != constant.ChannelTypeCodex && b.initialType != constant.ChannelTypeClaudeCode {
-		return
-	}
-	b.allowDefaultSubscriptionOAuthFailover = true
 }
 
 func (b *RetryBoundary) MarkAttempt(channel *model.Channel, multiKeyIndex ...int) {
@@ -152,6 +143,59 @@ func (b *RetryBoundary) MarkAttempt(channel *model.Channel, multiKeyIndex ...int
 	}
 }
 
+func (b *RetryBoundary) ExcludeCredential(fingerprint string, channelID, keyIndex int) {
+	if b == nil || strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	b.excludedCredentials[fingerprint] = struct{}{}
+	channels := b.capacityAttempts[fingerprint]
+	if channels == nil {
+		channels = make(map[int]map[int]struct{})
+		b.capacityAttempts[fingerprint] = channels
+	}
+	indexes := channels[channelID]
+	if indexes == nil {
+		indexes = make(map[int]struct{})
+		channels[channelID] = indexes
+	}
+	indexes[keyIndex] = struct{}{}
+}
+
+func (b *RetryBoundary) FailCredential(fingerprint string) {
+	if b == nil || strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	b.failedCredentials[fingerprint] = struct{}{}
+	delete(b.excludedCredentials, fingerprint)
+}
+
+// RestartCapacityCycle makes channels skipped only because of local OAuth
+// concurrency available for a later retry cycle. It deliberately retains
+// channels that previously failed for another reason.
+func (b *RetryBoundary) RestartCapacityCycle() bool {
+	if b == nil || len(b.excludedCredentials) == 0 {
+		return false
+	}
+	for fingerprint := range b.excludedCredentials {
+		for channelID, indexes := range b.capacityAttempts[fingerprint] {
+			for keyIndex := range indexes {
+				delete(b.usedKeyIndexes[channelID], keyIndex)
+			}
+			if len(b.usedKeyIndexes[channelID]) == 0 {
+				delete(b.usedKeyIndexes, channelID)
+				delete(b.usedChannelIDs, channelID)
+			}
+		}
+		delete(b.capacityAttempts, fingerprint)
+	}
+	clear(b.excludedCredentials)
+	return true
+}
+
+func (b *RetryBoundary) HasCapacityExclusions() bool {
+	return b != nil && len(b.excludedCredentials) > 0
+}
+
 func (b *RetryBoundary) UsedMultiKeyIndexes(channelID int) map[int]struct{} {
 	if b == nil || len(b.usedKeyIndexes[channelID]) == 0 {
 		return nil
@@ -159,6 +203,30 @@ func (b *RetryBoundary) UsedMultiKeyIndexes(channelID int) map[int]struct{} {
 	result := make(map[int]struct{}, len(b.usedKeyIndexes[channelID]))
 	for index := range b.usedKeyIndexes[channelID] {
 		result[index] = struct{}{}
+	}
+	return result
+}
+
+func (b *RetryBoundary) ExcludedKeyIndexes(channel *model.Channel) map[int]struct{} {
+	if b == nil || channel == nil {
+		return nil
+	}
+	result := b.UsedMultiKeyIndexes(channel.Id)
+	if result == nil {
+		result = make(map[int]struct{})
+	}
+	for index, key := range channel.GetKeys() {
+		fingerprint := SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, index, key)
+		if _, excluded := b.excludedCredentials[fingerprint]; excluded {
+			result[index] = struct{}{}
+			continue
+		}
+		if _, failed := b.failedCredentials[fingerprint]; failed {
+			result[index] = struct{}{}
+		}
+	}
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }
@@ -183,35 +251,67 @@ func (b *RetryBoundary) hasUntriedEnabledKey(channel *model.Channel) bool {
 }
 
 func (b *RetryBoundary) Allows(channel *model.Channel) bool {
-	if b == nil || channel == nil {
+	if b == nil || channel == nil || channel.Status != common.ChannelStatusEnabled {
 		return false
-	}
-	if _, used := b.usedChannelIDs[channel.Id]; used {
-		if !channel.ChannelInfo.IsMultiKey || !b.hasUntriedEnabledKey(channel) {
-			return false
-		}
 	}
 	candidate := ResolveChannelDataPolicy(channel)
 	if candidate.Provider != b.policy.Provider || candidate.Region != b.policy.Region ||
 		candidate.Retention != b.policy.Retention || candidate.Training != b.policy.Training {
 		return false
 	}
-	if b.allowDefaultSubscriptionOAuthFailover &&
-		channelUsesDefaultRetryIsolation(channel) &&
-		channel.Type == b.initialType &&
-		candidate.Endpoint == b.policy.Endpoint {
-		return true
-	}
+	allowedByPolicy := false
 	switch b.policy.RetryIsolation {
 	case dto.RetryIsolationProvider:
-		return candidate.RetryIsolation == dto.RetryIsolationProvider &&
+		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationProvider &&
 			channel.Type == b.initialType && candidate.Endpoint == b.policy.Endpoint
 	case dto.RetryIsolationPolicyGroup:
-		return candidate.RetryIsolation == dto.RetryIsolationPolicyGroup &&
+		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationPolicyGroup &&
 			b.policy.RetryPolicyGroup != "" && candidate.RetryPolicyGroup == b.policy.RetryPolicyGroup
+	case dto.RetryIsolationTag:
+		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationTag &&
+			channel.Type == b.initialType && b.initialTag != "" &&
+			b.initialTag == strings.TrimSpace(channel.GetTag())
 	default:
-		return channel.Id == b.initialChannelID && channel.ChannelInfo.IsMultiKey
+		allowedByPolicy = channel.Id == b.initialChannelID && channel.ChannelInfo.IsMultiKey
 	}
+	if !allowedByPolicy {
+		return false
+	}
+	if b.initialType == constant.ChannelTypeCodex || b.initialType == constant.ChannelTypeClaudeCode {
+		return b.hasEligibleSubscriptionOAuthCredential(channel)
+	}
+	if _, used := b.usedChannelIDs[channel.Id]; used {
+		return channel.ChannelInfo.IsMultiKey && b.hasUntriedEnabledKey(channel)
+	}
+	return true
+}
+
+func (b *RetryBoundary) hasEligibleSubscriptionOAuthCredential(channel *model.Channel) bool {
+	lock := model.GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	keys := channel.GetKeys()
+	if len(keys) == 0 {
+		return false
+	}
+	for index, key := range keys {
+		if channel.ChannelInfo.IsMultiKey {
+			status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
+			if exists && status != common.ChannelStatusEnabled {
+				continue
+			}
+		}
+		fingerprint := SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, index, key)
+		if _, excluded := b.excludedCredentials[fingerprint]; excluded {
+			continue
+		}
+		if _, failed := b.failedCredentials[fingerprint]; failed {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func ApplyRelayDataPolicyHeaders(c *gin.Context, channel *model.Channel, attempt int) {

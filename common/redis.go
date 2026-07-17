@@ -16,6 +16,16 @@ import (
 var RDB *redis.Client
 var RedisEnabled = true
 
+func PingRedis(ctx context.Context) error {
+	if !RedisEnabled {
+		return nil
+	}
+	if RDB == nil {
+		return errors.New("redis is enabled but not initialized")
+	}
+	return RDB.Ping(ctx).Err()
+}
+
 func RedisKeyCacheSeconds() int {
 	return SyncFrequency
 }

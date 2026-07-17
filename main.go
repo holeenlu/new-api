@@ -131,6 +131,15 @@ func main() {
 	// Subscription quota reset task (daily/weekly/monthly/custom)
 	service.StartSubscriptionQuotaResetTask()
 
+	// Subscription OAuth concurrency/cooldown state is process-local. Reclaim
+	// inactive credential fingerprints even when no later OAuth request arrives.
+	subscriptionOAuthJanitorContext, stopSubscriptionOAuthJanitor := context.WithCancel(context.Background())
+	subscriptionOAuthJanitorDone := service.StartSubscriptionOAuthStateJanitor(subscriptionOAuthJanitorContext)
+	defer func() {
+		stopSubscriptionOAuthJanitor()
+		<-subscriptionOAuthJanitorDone
+	}()
+
 	// Report this process as a system instance so the System Info page can show
 	// all currently alive nodes in multi-instance deployments.
 	service.StartSystemInstanceReporter()

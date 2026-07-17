@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import axios, { type AxiosRequestConfig } from 'axios'
+import { t } from 'i18next'
 import { toast } from 'sonner'
 
 import { localizeErrorMessage } from '@/lib/localize-error-message'
@@ -92,7 +93,7 @@ api.interceptors.response.use(
       if (!response.data.success) {
         const msg = localizeErrorMessage(
           response.data.message || response.data,
-          '请求失败'
+          t('Request failed')
         )
         response.data.message = msg
         if (!skipBusiness) toast.error(msg)
@@ -104,7 +105,7 @@ api.interceptors.response.use(
     const skip = error?.config?.skipErrorHandler
     const status = error?.response?.status
     const data = error?.response?.data
-    const msg = localizeErrorMessage(data || error, '请求失败')
+    const msg = localizeErrorMessage(data || error, t('Request failed'))
     if (typeof data === 'string') {
       error.response.data = msg
     } else if (data && typeof data === 'object') {
@@ -133,7 +134,7 @@ api.interceptors.response.use(
       }
 
       if (!skip) {
-        toast.error('会话已过期，请重新登录')
+        toast.error(t('Session expired!'))
       }
     } else if (!skip) {
       toast.error(msg)
