@@ -94,10 +94,12 @@ func CodexAlphaSearch(c *gin.Context) {
 			}
 		}
 
+		if !trackRetryAttempt(c, retryParam, channel) {
+			continue
+		}
 		retryParam.RecordAttempt()
 		addUsedChannel(c, channel.Id)
 		service.ApplyRelayDataPolicyHeaders(c, channel, len(c.GetStringSlice("use_channel")))
-		trackRetryAttempt(c, retryParam, channel)
 		clearStaleRetryAfter(c)
 
 		request := &dto.OpenAIResponsesRequest{Model: originModel}

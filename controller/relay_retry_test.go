@@ -199,3 +199,35 @@ func TestSubscriptionOAuthQuotaExhaustionSwitchesEvenWhen429RetryIsDisabled(t *t
 	require.False(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(backup))
 }
+
+func TestTrackRetryAttemptStopsSelectingCredentialAfterFiveAttempts(t *testing.T) {
+	originalRetries := common.SubscriptionOAuthUpstreamRetryTimes
+	common.SubscriptionOAuthUpstreamRetryTimes = 5
+	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	initial := &model.Channel{
+		Id: 61, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-a","account_id":"attempt-guard"}`,
+	}
+	initial.SetTag("openai-vip")
+	initial.SetOtherSettings(dto.ChannelOtherSettings{})
+	backup := &model.Channel{
+		Id: 62, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-b","account_id":"attempt-backup"}`,
+	}
+	backup.SetTag("openai-vip")
+	backup.SetOtherSettings(dto.ChannelOtherSettings{})
+	common.SetContextKey(c, constant.ContextKeyChannelKey, initial.Key)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
+
+	retryParam := &service.RetryParam{Retry: common.GetPointer(0)}
+	for range 5 {
+		require.True(t, trackRetryAttempt(c, retryParam, initial))
+	}
+	require.False(t, trackRetryAttempt(c, retryParam, initial))
+	require.False(t, retryParam.Boundary.Allows(initial))
+	require.True(t, retryParam.Boundary.Allows(backup))
+}

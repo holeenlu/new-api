@@ -29,6 +29,7 @@ type SubscriptionOAuthAttemptTarget struct {
 }
 
 type subscriptionOAuthCredentialRetry struct {
+	attempts         int
 	failures         int
 	postWriteRetries int
 }
@@ -98,16 +99,35 @@ func (p *RetryParam) ensureSubscriptionOAuthRetryState() *SubscriptionOAuthRetry
 	return p.oauthRetry
 }
 
-func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) {
+// SetSubscriptionOAuthAttempt reserves one request-local attempt for a
+// credential. It is the final guard around every relay path: even if an error
+// path fails before normal retry accounting, the same credential cannot be
+// selected more than the configured per-credential limit.
+func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) bool {
 	state := p.ensureSubscriptionOAuthRetryState()
+	credential := state.credentials[fingerprint]
+	if credential == nil {
+		credential = &subscriptionOAuthCredentialRetry{}
+		state.credentials[fingerprint] = credential
+	}
+	maxAttempts := common.SubscriptionOAuthUpstreamRetryTimes
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	if credential.attempts >= maxAttempts {
+		if p.Boundary != nil {
+			p.Boundary.FailCredential(fingerprint)
+		}
+		state.current = nil
+		return false
+	}
+	credential.attempts++
 	state.current = &SubscriptionOAuthAttemptTarget{
 		ChannelID:   channelID,
 		KeyIndex:    keyIndex,
 		Fingerprint: fingerprint,
 	}
-	if state.credentials[fingerprint] == nil {
-		state.credentials[fingerprint] = &subscriptionOAuthCredentialRetry{}
-	}
+	return true
 }
 
 func (p *RetryParam) SubscriptionOAuthAttemptTarget() *SubscriptionOAuthAttemptTarget {

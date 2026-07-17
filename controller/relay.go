@@ -222,6 +222,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
+		if !trackRetryAttempt(c, retryParam, channel) {
+			continue
+		}
 		retryParam.RecordAttempt()
 		if isSubscriptionOAuth {
 			relayInfo.RetryIndex = retryParam.AttemptIndex()
@@ -231,7 +234,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		addUsedChannel(c, channel.Id)
 		attempt := len(c.GetStringSlice("use_channel"))
 		service.ApplyRelayDataPolicyHeaders(c, channel, attempt)
-		trackRetryAttempt(c, retryParam, channel)
 		clearStaleRetryAfter(c)
 		relayInfo.ResetUpstreamAttemptState()
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
@@ -398,7 +400,7 @@ func applySubscriptionOAuthCapacityFailover(channel *model.Channel, apiError *ty
 	retryParam.HandleSubscriptionOAuthCapacityFailure()
 }
 
-func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) {
+func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) bool {
 	if retryParam.Boundary == nil {
 		retryParam.Boundary = service.NewRetryBoundary(channel)
 		if retryParam.Boundary != nil {
@@ -406,7 +408,7 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 		}
 	}
 	if retryParam.Boundary == nil {
-		return
+		return true
 	}
 	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
 		service.ClearSubscriptionOAuthAttemptMetadata(c)
@@ -417,7 +419,9 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 			keyIndex,
 			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
 		)
-		retryParam.SetSubscriptionOAuthAttempt(channel.Id, keyIndex, fingerprint)
+		if !retryParam.SetSubscriptionOAuthAttempt(channel.Id, keyIndex, fingerprint) {
+			return false
+		}
 		fingerprintPreview := fingerprint
 		if len(fingerprintPreview) > 12 {
 			fingerprintPreview = fingerprintPreview[:12]
@@ -428,9 +432,10 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		retryParam.Boundary.MarkAttempt(channel, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
-		return
+		return true
 	}
 	retryParam.Boundary.MarkAttempt(channel)
+	return true
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
@@ -782,7 +787,7 @@ func RelayTask(c *gin.Context) {
 		}
 
 		addUsedChannel(c, channel.Id)
-		trackRetryAttempt(c, retryParam, channel)
+		_ = trackRetryAttempt(c, retryParam, channel)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
