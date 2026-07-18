@@ -92,8 +92,11 @@ ssh_remote -MNf "$DEPLOY_TARGET"
 SSH_MASTER_ACTIVE=true
 ssh_remote "$DEPLOY_TARGET" "docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1" \
   || deploy_die "Remote Docker is unavailable"
-ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR' && test -f '$REMOTE_DIR/.env' && { mkdir '$REMOTE_LOCK' 2>/dev/null || { find '$REMOTE_LOCK' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$REMOTE_LOCK' && mkdir '$REMOTE_LOCK'; }; }" \
-  || deploy_die "Remote .env is missing or another 174 deployment is active"
+ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR'"
+ssh_remote "$DEPLOY_TARGET" "test -f '$REMOTE_DIR/.env'" \
+  || deploy_die "Remote .env is missing: restore $REMOTE_DIR/.env before deploying 174"
+ssh_remote "$DEPLOY_TARGET" "mkdir '$REMOTE_LOCK' 2>/dev/null || { find '$REMOTE_LOCK' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$REMOTE_LOCK' && mkdir '$REMOTE_LOCK'; }" \
+  || deploy_die "Another 174 deployment is active (or its lock is less than 60 minutes old)"
 
 deploy_log "Uploading 174 configuration and image"
 scp_remote "$ROOT_DIR/$COMPOSE_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$COMPOSE_FILE"

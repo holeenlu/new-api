@@ -88,7 +88,7 @@ if ! ssh_remote "$DEPLOY_TARGET" "test -f '$REMOTE_DIR/.env'"; then
   deploy_log "Initialized the remote CC00-AI runtime environment"
 fi
 ssh_remote "$DEPLOY_TARGET" "mkdir '$REMOTE_LOCK' 2>/dev/null || { find '$REMOTE_LOCK' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$REMOTE_LOCK' && mkdir '$REMOTE_LOCK'; }" \
-  || deploy_die "Another CC00-AI deployment is active"
+  || deploy_die "Another CC00-AI deployment is active (or its lock is less than 60 minutes old)"
 
 deploy_log "Uploading CC00-AI configuration and image"
 scp_remote "$ROOT_DIR/$COMPOSE_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$COMPOSE_FILE"

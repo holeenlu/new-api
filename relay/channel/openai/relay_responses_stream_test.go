@@ -111,6 +111,22 @@ func TestCodexResponsesStreamFlushesPreflightEventsInOrder(t *testing.T) {
 	require.Less(t, strings.Index(body, `event: response.in_progress`), strings.Index(body, `event: response.output_text.delta`))
 }
 
+func TestCodexResponsesStreamNormalizesCollaborationSpawnAgentModel(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.output_item.done","item":{"type":"function_call","name":"spawn_agent","arguments":"{\"model\":\"luna\"}"}}`,
+		`data: {"type":"response.completed","response":{"output":[{"type":"function_call","name":"collaboration__spawn_agent","arguments":"{\"model\":\"terra\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NoError(t, apiError)
+	require.Equal(t, 2, usage.TotalTokens)
+	body := recorder.Body.String()
+	require.Contains(t, body, `\"model\":\"gpt-5.6-luna\"`)
+	require.Contains(t, body, `\"model\":\"gpt-5.6-terra\"`)
+}
+
 func TestCodexResponsesStreamDoesNotRetryCapacityAfterOutput(t *testing.T) {
 	c, recorder, resp, info := newCodexResponsesStreamTest(t,
 		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"call_1","name":"lookup"}}`,
