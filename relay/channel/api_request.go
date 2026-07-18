@@ -96,20 +96,32 @@ var passthroughSkipHeaderNamesLower = map[string]struct{}{
 }
 
 var sensitiveClientNetworkHeaderNamesLower = map[string]struct{}{
-	"cf-connecting-ip":         {},
-	"fastly-client-ip":         {},
-	"fly-client-ip":            {},
-	"forwarded":                {},
-	"true-client-ip":           {},
-	"x-appengine-user-ip":      {},
-	"x-azure-clientip":         {},
-	"x-client-ip":              {},
-	"x-cluster-client-ip":      {},
-	"x-envoy-external-address": {},
-	"x-forwarded-for":          {},
-	"x-original-forwarded-for": {},
-	"x-real-ip":                {},
-	"x-vercel-forwarded-for":   {},
+	"cf-connecting-ip":            {},
+	"cf-ipcountry":                {},
+	"cloudfront-viewer-country":   {},
+	"cloudfront-viewer-city":      {},
+	"cloudfront-viewer-latitude":  {},
+	"cloudfront-viewer-longitude": {},
+	"cloudfront-viewer-time-zone": {},
+	"fastly-client-ip":            {},
+	"fly-client-ip":               {},
+	"forwarded":                   {},
+	"true-client-ip":              {},
+	"x-appengine-user-ip":         {},
+	"x-azure-clientip":            {},
+	"x-client-ip":                 {},
+	"x-cluster-client-ip":         {},
+	"x-envoy-external-address":    {},
+	"x-forwarded-for":             {},
+	"x-original-forwarded-for":    {},
+	"x-real-ip":                   {},
+	"x-vercel-forwarded-for":      {},
+	"x-vercel-ip-city":            {},
+	"x-vercel-ip-country":         {},
+	"x-vercel-ip-country-region":  {},
+	"x-vercel-ip-latitude":        {},
+	"x-vercel-ip-longitude":       {},
+	"x-vercel-ip-timezone":        {},
 }
 
 var headerPassthroughRegexCache sync.Map // map[string]*regexp.Regexp
@@ -181,7 +193,8 @@ func stripSensitiveClientNetworkHeaders(header http.Header) {
 
 func isClaudeCodeOAuthProtectedHeader(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "authorization", "x-api-key", "anthropic-version", "anthropic-beta", "user-agent", "x-app", "host":
+	case "authorization", "x-api-key", "anthropic-version", "anthropic-beta", "user-agent", "x-app", "host",
+		"session-id", "thread-id", "x-client-request-id", "x-session-id":
 		return true
 	default:
 		return false
@@ -191,7 +204,9 @@ func isClaudeCodeOAuthProtectedHeader(name string) bool {
 func isCodexOAuthProtectedHeader(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "authorization", "x-api-key", "chatgpt-account-id", "openai-beta", "originator", "user-agent", "content-type", "host",
-		"x-openai-internal-codex-responses-lite", "x-codex-beta-features":
+		"x-openai-internal-codex-responses-lite", "x-codex-beta-features", "session-id", "thread-id", "x-session-id",
+		"x-client-request-id", "x-codex-parent-thread-id", "x-codex-turn-state", "x-codex-turn-metadata",
+		"x-codex-window-id", "x-codex-installation-id":
 		return true
 	default:
 		return false
@@ -590,16 +605,32 @@ func classifySubscriptionOAuthTransportError(err error, req *http.Request, info 
 	}
 	if req.Context().Err() != nil {
 		return types.NewErrorWithStatusCode(
-			err,
+			errors.New("request canceled before the upstream response completed"),
 			types.ErrorCodeDoRequestFailed,
 			499,
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
 	if isSubscriptionOAuthResponseHeaderTimeout(err, req, info) {
-		return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
+		return types.NewErrorWithStatusCode(errors.New("upstream response timed out"), types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
 	}
-	return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+	return types.NewErrorWithStatusCode(errors.New("upstream connection failed"), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+}
+
+func classifyOrdinaryTransportError(err error, req *http.Request) *types.NewAPIError {
+	if req != nil && req.Context().Err() != nil {
+		return types.NewErrorWithStatusCode(
+			errors.New("request canceled before the upstream response completed"),
+			types.ErrorCodeDoRequestFailed,
+			499,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return types.NewErrorWithStatusCode(errors.New("upstream response timed out"), types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout)
+	}
+	return types.NewErrorWithStatusCode(errors.New("upstream connection failed"), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
@@ -661,7 +692,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			}
 			return nil, transportErr
 		}
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+		return nil, classifyOrdinaryTransportError(err, req)
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")

@@ -344,6 +344,13 @@ func InitResources() error {
 
 	// Initialize options, should after model.InitDB()
 	model.InitOptionMap()
+	if common.UpstreamLocationDiscoveryEnabled {
+		gopool.Go(func() {
+			if _, err := service.RefreshChannelProxyLocationProfiles(context.Background()); err != nil {
+				common.SysLog("failed to discover channel proxy location profiles: " + err.Error())
+			}
+		})
+	}
 
 	// 清理旧的磁盘缓存文件
 	common.CleanupOldCacheFiles()

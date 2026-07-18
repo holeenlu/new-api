@@ -15,6 +15,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -39,7 +40,7 @@ func CodexAlphaSearch(c *gin.Context) {
 
 	var routing struct {
 		Model string `json:"model"`
-		ID    string `json:"id"`
+		Query string `json:"query"`
 	}
 	if err := common.Unmarshal(body, &routing); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(err, types.ErrorCodeInvalidRequest).ToOpenAIError()})
@@ -49,6 +50,13 @@ func CodexAlphaSearch(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(errors.New("model is required"), types.ErrorCodeInvalidRequest).ToOpenAIError()})
 		return
 	}
+	if setting.ShouldCheckPromptSensitive() {
+		if contains, words := service.CheckSensitiveText(routing.Query); contains {
+			logger.LogWarn(c, fmt.Sprintf("request rejected by sensitive word policy (%d matches)", len(words)))
+			c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(errors.New("sensitive words detected"), types.ErrorCodeSensitiveWordsDetected, types.ErrOptionWithSkipRetry()).ToOpenAIError()})
+			return
+		}
+	}
 
 	originModel := strings.TrimSpace(routing.Model)
 	var basePayload map[string]any
@@ -56,12 +64,27 @@ func CodexAlphaSearch(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(err, types.ErrorCodeInvalidRequest).ToOpenAIError()})
 		return
 	}
-	if routing.ID != "" && c.GetHeader("X-Session-ID") == "" {
-		c.Request.Header.Set("X-Session-ID", routing.ID)
-	}
-
 	initialInfo := relaycommon.GenRelayInfoResponses(c, &dto.OpenAIResponsesRequest{Model: originModel})
 	initialInfo.InitChannelMeta(c)
+	initialInfo.Action = "alpha_search"
+	priceData, err := helper.ModelPriceHelperPerCall(c, initialInfo)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry()).ToOpenAIError()})
+		return
+	}
+	initialInfo.PriceData = priceData
+	if !priceData.FreeModel {
+		if billingError := service.PreConsumeBilling(c, priceData.Quota, initialInfo); billingError != nil {
+			c.JSON(billingError.StatusCode, gin.H{"error": billingError.ToOpenAIError()})
+			return
+		}
+	}
+	billingSettled := false
+	defer func() {
+		if !billingSettled && initialInfo.Billing != nil {
+			initialInfo.Billing.Refund(c)
+		}
+	}()
 	retryParam := service.NewRetryParam(c, initialInfo.TokenGroup, originModel, c.Request.URL.Path)
 	var lastError *types.NewAPIError
 	firstAttempt := true
@@ -97,9 +120,9 @@ func CodexAlphaSearch(c *gin.Context) {
 		clearStaleRetryAfter(c)
 
 		request := &dto.OpenAIResponsesRequest{Model: originModel}
-		info := relaycommon.GenRelayInfoResponses(c, request)
-		info.InitChannelMeta(c)
-		info.RetryIndex = retryParam.AttemptIndex()
+		initialInfo.InitChannelMeta(c)
+		initialInfo.RetryIndex = retryParam.AttemptIndex()
+		info := initialInfo
 		if info.ChannelType != constant.ChannelTypeCodex {
 			lastError = types.NewErrorWithStatusCode(
 				errors.New("Codex alpha search requires a ChatGPT Subscription (Codex) channel"),
@@ -132,6 +155,12 @@ func CodexAlphaSearch(c *gin.Context) {
 			_ = resp.Body.Close()
 			if readErr == nil {
 				retryParam.MarkSubscriptionOAuthSuccess()
+				if settleErr := service.SettleBilling(c, info, priceData.Quota); settleErr != nil {
+					lastError = types.NewErrorWithStatusCode(settleErr, types.ErrorCodeUpdateDataError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+					break
+				}
+				billingSettled = true
+				service.LogAlphaSearchConsumption(c, info, priceData.Quota)
 				for _, name := range []string{"Retry-After", "X-Request-ID", "OpenAI-Request-ID"} {
 					if value := resp.Header.Get(name); value != "" {
 						c.Header(name, value)

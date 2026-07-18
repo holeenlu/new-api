@@ -24,7 +24,7 @@ import (
 // transport from prematurely closing the underlying BodyStorage. The returned
 // size is meant to be propagated to http.Request.ContentLength because the
 // type-erased io.Reader prevents net/http from auto-detecting it.
-func NewOutboundJSONBody(data []byte, channelUsesProxy ...bool) (body io.Reader, size int64, closer io.Closer, err error) {
+func NewOutboundJSONBody(data []byte, channelProxy ...string) (body io.Reader, size int64, closer io.Closer, err error) {
 	mayContainLocationData, err := readerMayContainLocationPrivacyData(bytes.NewReader(data))
 	if err != nil {
 		return nil, 0, nil, err
@@ -32,7 +32,7 @@ func NewOutboundJSONBody(data []byte, channelUsesProxy ...bool) (body io.Reader,
 	if !mayContainLocationData {
 		return newOutboundJSONBody(data)
 	}
-	data, _, err = FilterUpstreamLocationData(data, channelUsesProxy...)
+	data, _, err = FilterUpstreamLocationData(data, channelProxy...)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -49,7 +49,7 @@ func newOutboundJSONBody(data []byte) (body io.Reader, size int64, closer io.Clo
 
 // NewPrivacyFilteredPassThroughJSONBody applies the same outbound privacy
 // policy to pass-through requests as converted requests.
-func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUsesProxy ...bool) (body io.Reader, size int64, closer io.Closer, err error) {
+func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelProxy ...string) (body io.Reader, size int64, closer io.Closer, err error) {
 	mayContainLocationData, err := storageMayContainLocationPrivacyData(storage)
 	if err != nil {
 		return nil, 0, nil, err
@@ -61,7 +61,7 @@ func NewPrivacyFilteredPassThroughJSONBody(storage common.BodyStorage, channelUs
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	filtered, changed, err := FilterUpstreamLocationData(data, channelUsesProxy...)
+	filtered, changed, err := FilterUpstreamLocationData(data, channelProxy...)
 	if err != nil {
 		return nil, 0, nil, err
 	}

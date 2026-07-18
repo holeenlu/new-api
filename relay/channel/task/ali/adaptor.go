@@ -156,12 +156,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, errors.Wrap(err, "convert_to_ali_request_failed")
 	}
-	logger.LogJson(c, "ali video request body", aliReq)
-
 	bodyBytes, err := common.Marshal(aliReq)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshal_ali_request_failed")
 	}
+	logger.LogDebug(c, "ali video request body omitted from logs (%d bytes)", len(bodyBytes))
 	return bytes.NewReader(bodyBytes), nil
 }
 

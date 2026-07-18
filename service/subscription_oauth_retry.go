@@ -174,6 +174,9 @@ func (p *RetryParam) HandleSubscriptionOAuthCapacityFailure() {
 	if p.Boundary != nil {
 		p.Boundary.ExcludeCredential(target.Fingerprint, target.ChannelID, target.KeyIndex)
 	}
+	if credential := p.oauthRetry.credentials[target.Fingerprint]; credential != nil && credential.attempts > 0 {
+		credential.attempts--
+	}
 	p.recordCapacityTarget(target)
 	p.oauthRetry.current = nil
 	p.advanceCapacityReplay()

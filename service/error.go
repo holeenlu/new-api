@@ -252,6 +252,9 @@ func ValidateStatusCodeMapping(mapping string) ([]StatusCodeMappingRisk, error) 
 	risks := make([]StatusCodeMappingRisk, 0)
 	for rawFrom, rawTo := range parsed {
 		normalizedFrom := strings.TrimSpace(rawFrom)
+		if normalizedFrom != rawFrom {
+			return nil, fmt.Errorf("source status code must not contain surrounding whitespace: %q", rawFrom)
+		}
 		if len(normalizedFrom) != 3 ||
 			normalizedFrom[0] < '1' || normalizedFrom[0] > '5' ||
 			normalizedFrom[1] < '0' || normalizedFrom[1] > '9' ||

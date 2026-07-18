@@ -121,6 +121,16 @@ func TestEnsureClaudeCodeIdentitySystem(t *testing.T) {
 	require.Equal(t, "more context", blocks[1].GetText())
 }
 
+func TestClaudeCodeRequestDropsClientMetadata(t *testing.T) {
+	request := &dto.ClaudeRequest{Metadata: []byte(`{"user_id":"client-device"}`)}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeClaudeCode}}
+
+	converted, err := (&Adaptor{}).ConvertClaudeRequest(nil, info, request)
+	require.NoError(t, err)
+	got := converted.(*dto.ClaudeRequest)
+	require.Empty(t, got.Metadata)
+}
+
 func TestClaudeCodeOAuthConcurrencySlots(t *testing.T) {
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 900001, 0, "sk-ant-oat01-concurrency")
 	first, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)

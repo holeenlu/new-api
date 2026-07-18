@@ -152,6 +152,7 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
 	if info != nil && info.ChannelType == constant.ChannelTypeClaudeCode {
 		ensureClaudeCodeIdentitySystem(request)
+		request.Metadata = nil
 	}
 	return request, nil
 }
@@ -272,6 +273,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info != nil && info.ChannelType == constant.ChannelTypeClaudeCode {
 		if claudeReq, ok := result.Value.(*dto.ClaudeRequest); ok {
 			ensureClaudeCodeIdentitySystem(claudeReq)
+			claudeReq.Metadata = nil
 		}
 	}
 	return result.Value, nil

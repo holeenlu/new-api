@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -35,14 +36,43 @@ func SanitizeAlphaSearchBody(body []byte) ([]byte, error) {
 	}
 	delete(payload, "prompt_cache_key")
 	delete(payload, "prompt_cache_retention")
+	hadID := sanitizeAlphaSearchClientIdentity(payload, true)
+	if hadID {
+		payload["id"] = uuid.NewString()
+	}
 	return rootcommon.Marshal(payload)
+}
+
+func sanitizeAlphaSearchClientIdentity(values map[string]any, replaceID bool) bool {
+	hadID := false
+	for key, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		normalized = strings.NewReplacer("-", "_", ".", "_").Replace(normalized)
+		switch normalized {
+		case "id":
+			if replaceID {
+				delete(values, key)
+				hadID = true
+			}
+		case "session_id", "sessionid", "thread_id", "threadid", "turn_id", "turnid",
+			"installation_id", "installationid", "device_id", "deviceid", "device_uuid", "deviceuuid",
+			"client_id", "clientid", "client_metadata", "clientmetadata", "x_codex_installation_id",
+			"x_codex_turn_metadata", "x_codex_window_id":
+			delete(values, key)
+		case "metadata":
+			if metadata, ok := value.(map[string]any); ok {
+				sanitizeAlphaSearchClientIdentity(metadata, false)
+			}
+		}
+	}
+	return hadID
 }
 
 func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*http.Response, error) {
 	if c == nil || info == nil {
 		return nil, errors.New("codex alpha search: invalid relay context")
 	}
-	body, _, err := relaycommon.FilterUpstreamLocationData(body, info.ChannelSetting.Proxy != "")
+	body, _, err := relaycommon.FilterUpstreamLocationData(body, info.ChannelSetting.Proxy)
 	if err != nil {
 		return nil, fmt.Errorf("filter Codex alpha search location data: %w", err)
 	}
@@ -78,16 +108,15 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Originator", CodexOAuthOriginator)
 	req.Header.Set("User-Agent", CodexOAuthUserAgent)
-	for _, name := range []string{
-		"Version",
-		"Session_id",
-		"X-Session-ID",
-		"X-Client-Request-Id",
-	} {
-		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
-			req.Header.Set(name, value)
-		}
+	var identity struct {
+		ID string `json:"id"`
 	}
+	_ = rootcommon.Unmarshal(body, &identity)
+	sessionID := strings.TrimSpace(identity.ID)
+	if sessionID == "" {
+		sessionID = uuid.NewString()
+	}
+	req.Header.Set("X-Session-ID", sessionID)
 
 	timeout := time.Duration(rootcommon.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	client, err := service.GetHttpClientWithResponseHeaderTimeout(info.ChannelSetting.Proxy, timeout)

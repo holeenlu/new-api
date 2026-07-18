@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ var (
 	upstreamLocationRefreshMutex   sync.Mutex
 	upstreamHostLocationBaseline   UpstreamLocationProfile
 	upstreamEgressLocationBaseline UpstreamLocationProfile
+	channelProxyLocationProfiles   sync.Map
 )
 
 func initUpstreamLocationSettings() {
@@ -119,6 +121,40 @@ func GetUpstreamLocationProfiles() (UpstreamLocationProfile, UpstreamLocationPro
 	upstreamLocationProfilesMutex.RLock()
 	defer upstreamLocationProfilesMutex.RUnlock()
 	return UpstreamHostLocationSettings, UpstreamEgressLocationSettings
+}
+
+func channelProxyLocationProfileKey(proxyURL string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimSpace(proxyURL))))
+}
+
+func SetChannelProxyLocationProfile(proxyURL string, profile UpstreamLocationProfile) bool {
+	if strings.TrimSpace(proxyURL) == "" || !hasConfiguredLocation(profile) {
+		return false
+	}
+	channelProxyLocationProfiles.Store(channelProxyLocationProfileKey(proxyURL), profile)
+	return true
+}
+
+func GetChannelProxyLocationProfile(proxyURL string) (UpstreamLocationProfile, bool) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return UpstreamLocationProfile{}, false
+	}
+	value, ok := channelProxyLocationProfiles.Load(channelProxyLocationProfileKey(proxyURL))
+	if !ok {
+		return UpstreamLocationProfile{}, false
+	}
+	profile, ok := value.(UpstreamLocationProfile)
+	return profile, ok
+}
+
+func DiscoverChannelProxyLocationProfile(ctx context.Context, client *http.Client) (UpstreamLocationProfile, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := time.Duration(UpstreamLocationDiscoveryTimeout) * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return discoverUpstreamLocationProfile(ctx, client, defaultUpstreamLocationDiscoveryEndpoints)
 }
 
 func GetUpstreamLocationMode() string {

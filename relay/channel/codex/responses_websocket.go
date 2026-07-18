@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -25,7 +26,6 @@ import (
 const (
 	codexResponsesWebSocketSessionKey = "codex_responses_websocket_session"
 	codexResponsesWebSocketBeta       = "responses_websockets=2026-02-06"
-	maxResponsesWebSocketErrorBytes   = 64 << 10
 )
 
 var errCodexResponsesWebSocketUpgradeRequired = errors.New("codex responses websocket upgrade required")
@@ -260,12 +260,11 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 	}
 	info.MarkUpstreamRequestWritten()
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
-	var responseBody []byte
 	if response != nil && response.Body != nil {
-		responseBody, _ = io.ReadAll(io.LimitReader(response.Body, maxResponsesWebSocketErrorBytes+1))
 		response.Body.Close()
 	}
 	if err != nil {
+		logger.LogError(c, "codex responses websocket handshake failed: "+err.Error())
 		if response != nil && response.StatusCode == http.StatusUpgradeRequired {
 			s.fallbackLease = lease
 			return errCodexResponsesWebSocketUpgradeRequired
@@ -274,16 +273,8 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 		if response != nil && response.StatusCode > 0 {
 			info.MarkUpstreamResponseStarted()
 			info.MarkUpstreamFailureResponse()
-			detail := strings.TrimSpace(string(responseBody))
-			if len(responseBody) > maxResponsesWebSocketErrorBytes {
-				detail += " (truncated)"
-			}
-			message := fmt.Errorf("codex responses websocket dial failed: status=%d: %w", response.StatusCode, err)
-			if detail != "" {
-				message = fmt.Errorf("codex responses websocket dial failed: status=%d: %s", response.StatusCode, detail)
-			}
 			apiError := types.NewErrorWithStatusCode(
-				message,
+				fmt.Errorf("codex responses websocket handshake failed with status %d", response.StatusCode),
 				types.ErrorCodeBadResponseStatusCode,
 				response.StatusCode,
 			)
@@ -292,7 +283,7 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 			return apiError
 		}
 		return types.NewErrorWithStatusCode(
-			fmt.Errorf("codex responses websocket dial failed: %w", err),
+			errors.New("codex responses websocket connection failed"),
 			types.ErrorCodeDoRequestFailed,
 			http.StatusBadGateway,
 		)

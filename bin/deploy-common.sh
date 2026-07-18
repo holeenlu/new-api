@@ -117,7 +117,7 @@ deploy_build_image() {
 }
 
 deploy_prune_build_cache() {
-  local mode=${DEPLOY_PRUNE_BUILD_CACHE:-false}
+  local mode=${DEPLOY_PRUNE_BUILD_CACHE:-true}
   if [[ "$mode" == "false" || "$mode" == "0" ]]; then
     return 0
   fi
@@ -128,8 +128,10 @@ deploy_prune_build_cache() {
     return 0
   fi
   [[ "$mode" == "true" || "$mode" == "1" ]] || deploy_die "DEPLOY_PRUNE_BUILD_CACHE must be false, true, or all"
-  deploy_log "Pruning Buildx cache unused for seven days"
-  if ! docker buildx prune --force --filter 'until=168h'; then
+  local keep_storage=${DEPLOY_BUILD_CACHE_KEEP_STORAGE:-20GB}
+  local unused_for=${DEPLOY_BUILD_CACHE_UNUSED_FOR:-24h}
+  deploy_log "Pruning Buildx cache unused for ${unused_for}; keeping at most ${keep_storage}"
+  if ! docker buildx prune --force --filter "until=${unused_for}" --keep-storage "$keep_storage"; then
     deploy_log "Warning: Buildx cache cleanup failed; deployment will continue"
   fi
 }
@@ -313,6 +315,8 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 750
   deploy_env_ensure "$env_file" MAX_REQUEST_BODY_MB 128
   deploy_env_migrate_default "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 120 30
+  deploy_env_ensure "$env_file" CHANNEL_MANAGEMENT_REQUEST_TIMEOUT 30
+  deploy_env_ensure "$env_file" CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED true
   deploy_env_ensure "$env_file" CODEX_OAUTH_CLIENT_ID app_EMoamEEZ73f0CkXaXp7hrann
   deploy_env_ensure "$env_file" CODEX_OAUTH_REDIRECT_URI http://localhost:1455/auth/callback
   deploy_env_ensure "$env_file" CODEX_OAUTH_SCOPE "openid profile email offline_access"

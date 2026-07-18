@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -76,6 +77,12 @@ func TestQuarantineSubscriptionOAuthCredentialDisablesEveryReference(t *testing.
 		},
 	}
 	for _, channel := range channels {
+		channel.SetOtherSettings(dto.ChannelOtherSettings{
+			UpstreamModelMetadata: map[string]dto.UpstreamModelMetadata{
+				"gpt-test": {ContextWindow: 1_000_000, MaxContextWindow: 1_000_000, Complete: true},
+			},
+			UpstreamModelMetadataUpdatedTime: 123,
+		})
 		require.NoError(t, db.Create(channel).Error)
 		require.NoError(t, db.Create(&Ability{
 			Group: channel.Group, Model: "gpt-test", ChannelId: channel.Id, Enabled: true,
@@ -94,17 +101,20 @@ func TestQuarantineSubscriptionOAuthCredentialDisablesEveryReference(t *testing.
 	var single Channel
 	require.NoError(t, db.First(&single, channels[0].Id).Error)
 	require.Equal(t, common.ChannelStatusManuallyDisabled, single.Status)
+	require.Empty(t, single.GetOtherSettings().UpstreamModelMetadata)
 
 	var multi Channel
 	require.NoError(t, db.First(&multi, channels[1].Id).Error)
 	require.Equal(t, common.ChannelStatusEnabled, multi.Status)
 	require.Equal(t, common.ChannelStatusManuallyDisabled, multi.ChannelInfo.MultiKeyStatusList[1])
+	require.Empty(t, multi.GetOtherSettings().UpstreamModelMetadata)
 	_, disabledOtherKey := multi.ChannelInfo.MultiKeyStatusList[0]
 	require.False(t, disabledOtherKey)
 
 	var unrelated Channel
 	require.NoError(t, db.First(&unrelated, channels[2].Id).Error)
 	require.Equal(t, common.ChannelStatusEnabled, unrelated.Status)
+	require.NotEmpty(t, unrelated.GetOtherSettings().UpstreamModelMetadata)
 
 	var singleAbility Ability
 	require.NoError(t, db.Where("channel_id = ?", channels[0].Id).First(&singleAbility).Error)

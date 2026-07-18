@@ -227,25 +227,28 @@ export const ModelPricingEditorPanel = forwardRef<
     })
   }
 
-  const deriveLaneRatio = (
-    lane: LaneKey,
-    price: string,
-    nextPromptPrice = promptPrice,
-    nextLanePrices = lanePrices
-  ) => {
-    const priceNumber = toNumberOrNull(price)
-    if (priceNumber === null) return ''
+  const deriveLaneRatio = useCallback(
+    (
+      lane: LaneKey,
+      price: string,
+      nextPromptPrice = promptPrice,
+      nextLanePrices = lanePrices
+    ) => {
+      const priceNumber = toNumberOrNull(price)
+      if (priceNumber === null) return ''
 
-    if (lane === 'audioOutput') {
-      const audioInputPrice = toNumberOrNull(nextLanePrices.audioInput)
-      if (audioInputPrice === null || audioInputPrice === 0) return ''
-      return formatPricingNumber(priceNumber / audioInputPrice)
-    }
+      if (lane === 'audioOutput') {
+        const audioInputPrice = toNumberOrNull(nextLanePrices.audioInput)
+        if (audioInputPrice === null || audioInputPrice === 0) return ''
+        return formatPricingNumber(priceNumber / audioInputPrice)
+      }
 
-    const inputPrice = toNumberOrNull(nextPromptPrice)
-    if (inputPrice === null || inputPrice === 0) return ''
-    return formatPricingNumber(priceNumber / inputPrice)
-  }
+      const inputPrice = toNumberOrNull(nextPromptPrice)
+      if (inputPrice === null || inputPrice === 0) return ''
+      return formatPricingNumber(priceNumber / inputPrice)
+    },
+    [lanePrices, promptPrice]
+  )
 
   const syncLaneRatios = (
     nextPromptPrice = promptPrice,

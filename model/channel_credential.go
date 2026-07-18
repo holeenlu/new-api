@@ -114,8 +114,9 @@ func QuarantineSubscriptionOAuthCredential(channelType int, fingerprint, reason 
 		if !channelChanged {
 			continue
 		}
+		channel.ClearUpstreamModelMetadata()
 		if err := tx.Model(channel).
-			Select("status", "channel_info", "other_info").
+			Select("status", "channel_info", "other_info", "settings").
 			Updates(channel).Error; err != nil {
 			tx.Rollback()
 			return nil, err

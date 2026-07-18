@@ -140,7 +140,8 @@ func GetClaudeAuthHeader(token string) http.Header {
 }
 
 func GetResponseBody(method, url string, channel *model.Channel, headers http.Header) ([]byte, error) {
-	return GetResponseBodyWithContext(context.Background(), method, url, channel, headers, 0)
+	timeout := time.Duration(common.ChannelManagementRequestTimeout) * time.Second
+	return GetResponseBodyWithContext(context.Background(), method, url, channel, headers, timeout)
 }
 
 func GetResponseBodyWithContext(ctx context.Context, method, url string, channel *model.Channel, headers http.Header, timeout time.Duration) ([]byte, error) {

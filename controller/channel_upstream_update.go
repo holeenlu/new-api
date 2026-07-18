@@ -259,14 +259,18 @@ func collectPendingUpstreamModelChangesFromModels(
 	return normalizeModelNames(pendingAdd), normalizeModelNames(pendingRemove)
 }
 
-func collectPendingUpstreamModelChanges(ctx context.Context, channel *model.Channel, settings dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
-	upstreamModels, err := fetchChannelUpstreamModelIDs(ctx, channel)
+func collectPendingUpstreamModelChanges(ctx context.Context, channel *model.Channel, settings *dto.ChannelOtherSettings) (pendingAddModels []string, pendingRemoveModels []string, err error) {
+	catalog, err := fetchChannelUpstreamModelCatalog(ctx, channel)
 	if err != nil {
 		return nil, nil, err
 	}
+	if catalog.Metadata != nil {
+		settings.UpstreamModelMetadata = catalog.Metadata
+		settings.UpstreamModelMetadataUpdatedTime = common.GetTimestamp()
+	}
 	pendingAddModels, pendingRemoveModels = collectPendingUpstreamModelChangesFromModels(
 		channel.GetModels(),
-		upstreamModels,
+		catalog.IDs,
 		settings.UpstreamModelUpdateIgnoredModels,
 		normalizeChannelModelMapping(channel),
 	)
@@ -284,14 +288,14 @@ func getUpstreamModelUpdateMinCheckIntervalSeconds() int64 {
 	return interval
 }
 
-func fetchCodexUpstreamModelIDs(
+func fetchCodexUpstreamModelCatalog(
 	ctx context.Context,
 	channelID int,
 	keyIndex int,
 	baseURL string,
 	key string,
 	proxyURL string,
-) ([]string, error) {
+) ([]codex.UpstreamModel, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -317,19 +321,66 @@ func fetchCodexUpstreamModelIDs(
 	if err != nil {
 		return nil, err
 	}
-	return codex.FetchUpstreamModels(ctx, client, baseURL, key)
+	return codex.FetchUpstreamModelCatalog(ctx, client, baseURL, key)
 }
 
-func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) ([]string, error) {
-	if channel == nil {
-		return nil, errors.New("channel is nil")
+func fetchCodexUpstreamModelIDs(
+	ctx context.Context,
+	channelID int,
+	keyIndex int,
+	baseURL string,
+	key string,
+	proxyURL string,
+) ([]string, error) {
+	catalog, err := fetchCodexUpstreamModelCatalog(ctx, channelID, keyIndex, baseURL, key, proxyURL)
+	if err != nil {
+		return nil, err
 	}
-	if channel.Type == constant.ChannelTypeCodex {
-		key, keyIndex, apiErr := channel.GetNextEnabledKey()
+	models := make([]string, 0, len(catalog))
+	for _, item := range catalog {
+		models = append(models, item.Name())
+	}
+	return normalizeModelNames(models), nil
+}
+
+type channelUpstreamModelCatalog struct {
+	IDs      []string
+	Metadata map[string]dto.UpstreamModelMetadata
+}
+
+func fetchCodexChannelUpstreamModelCatalog(ctx context.Context, channel *model.Channel) (channelUpstreamModelCatalog, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout := time.Duration(common.ChannelManagementRequestTimeout) * time.Second; timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	keys := channel.GetKeys()
+	if len(keys) == 0 {
+		return channelUpstreamModelCatalog{}, errors.New("渠道没有可用密钥")
+	}
+
+	credentialCatalogs := make([]map[string]dto.UpstreamModelMetadata, 0, len(keys))
+	allModels := make([]string, 0)
+	seenModels := make(map[string]struct{})
+	seenCredentials := make(map[string]struct{})
+	var firstErr error
+
+	for keyIndex := range keys {
+		key, apiErr := channel.GetEnabledKeyAt(keyIndex)
 		if apiErr != nil {
-			return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+			continue
 		}
-		models, err := fetchCodexUpstreamModelIDs(
+		fingerprint := service.SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, keyIndex, key)
+		if _, exists := seenCredentials[fingerprint]; exists {
+			continue
+		}
+		seenCredentials[fingerprint] = struct{}{}
+
+		upstreamCatalog, err := fetchCodexUpstreamModelCatalog(
 			ctx,
 			channel.Id,
 			keyIndex,
@@ -338,11 +389,77 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 			channel.GetSetting().Proxy,
 		)
 		if err != nil {
-			return nil, applySubscriptionOAuthModelFetchError(channel, key, err)
+			err = applySubscriptionOAuthModelFetchError(channel, key, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
-		return normalizeModelNames(models), nil
+
+		metadataByModel := make(map[string]dto.UpstreamModelMetadata, len(upstreamCatalog))
+		for _, item := range upstreamCatalog {
+			name := item.Name()
+			if name == "" {
+				continue
+			}
+			metadataByModel[name] = item.Metadata()
+			if _, exists := seenModels[name]; !exists {
+				seenModels[name] = struct{}{}
+				allModels = append(allModels, name)
+			}
+		}
+		credentialCatalogs = append(credentialCatalogs, metadataByModel)
 	}
 
+	// A partial credential scan is not a trustworthy model catalog. Returning
+	// it could make the UI or patrol task mistake an unreachable account for an
+	// upstream model deletion.
+	if firstErr != nil {
+		return channelUpstreamModelCatalog{}, firstErr
+	}
+	if len(credentialCatalogs) == 0 {
+		return channelUpstreamModelCatalog{}, errors.New("渠道没有已启用的 OAuth 凭证")
+	}
+
+	metadata := make(map[string]dto.UpstreamModelMetadata, len(allModels))
+	for _, name := range allModels {
+		profile := dto.UpstreamModelMetadata{Complete: true}
+		for _, credentialCatalog := range credentialCatalogs {
+			credentialProfile, exists := credentialCatalog[name]
+			if !exists || !credentialProfile.Complete {
+				profile.Complete = false
+				continue
+			}
+			if profile.ContextWindow == 0 || credentialProfile.ContextWindow < profile.ContextWindow {
+				profile.ContextWindow = credentialProfile.ContextWindow
+			}
+			if profile.MaxContextWindow == 0 || credentialProfile.MaxContextWindow < profile.MaxContextWindow {
+				profile.MaxContextWindow = credentialProfile.MaxContextWindow
+			}
+		}
+		if profile.ContextWindow == 0 || profile.MaxContextWindow < profile.ContextWindow {
+			profile.Complete = false
+		}
+		metadata[name] = profile
+	}
+
+	return channelUpstreamModelCatalog{
+		IDs:      normalizeModelNames(allModels),
+		Metadata: metadata,
+	}, nil
+}
+
+func fetchChannelUpstreamModelCatalog(ctx context.Context, channel *model.Channel) (channelUpstreamModelCatalog, error) {
+	if channel == nil {
+		return channelUpstreamModelCatalog{}, errors.New("channel is nil")
+	}
+	if channel.Type == constant.ChannelTypeCodex {
+		return fetchCodexChannelUpstreamModelCatalog(ctx, channel)
+	}
+	return fetchNonCodexUpstreamModelCatalog(ctx, channel)
+}
+
+func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Channel) (channelUpstreamModelCatalog, error) {
 	baseURL := constant.ChannelBaseURLs[channel.Type]
 	if channel.GetBaseURL() != "" {
 		baseURL = channel.GetBaseURL()
@@ -352,24 +469,39 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 		key := strings.TrimSpace(strings.Split(channel.Key, "\n")[0])
 		models, err := ollama.FetchOllamaModels(baseURL, key)
 		if err != nil {
-			return nil, err
+			return channelUpstreamModelCatalog{}, err
 		}
-		return normalizeModelNames(lo.Map(models, func(item ollama.OllamaModel, _ int) string {
-			return item.Name
-		})), nil
+		return channelUpstreamModelCatalog{
+			IDs: normalizeModelNames(lo.Map(models, func(item ollama.OllamaModel, _ int) string {
+				return item.Name
+			})),
+			Metadata: map[string]dto.UpstreamModelMetadata{},
+		}, nil
 	}
 
 	if channel.Type == constant.ChannelTypeGemini {
 		key, _, apiErr := channel.GetNextEnabledKey()
 		if apiErr != nil {
-			return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+			return channelUpstreamModelCatalog{}, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
 		}
 		key = strings.TrimSpace(key)
-		models, err := gemini.FetchGeminiModels(baseURL, key, channel.GetSetting().Proxy)
+		models, err := gemini.FetchGeminiModelCatalog(ctx, baseURL, key, channel.GetSetting().Proxy)
 		if err != nil {
-			return nil, err
+			return channelUpstreamModelCatalog{}, err
 		}
-		return normalizeModelNames(models), nil
+		ids := make([]string, 0, len(models))
+		metadata := make(map[string]dto.UpstreamModelMetadata)
+		for _, upstreamModel := range models {
+			name := strings.TrimSpace(upstreamModel.ID)
+			if name == "" {
+				continue
+			}
+			ids = append(ids, name)
+			if upstreamModel.Metadata.Valid() {
+				metadata[name] = upstreamModel.Metadata
+			}
+		}
+		return channelUpstreamModelCatalog{IDs: normalizeModelNames(ids), Metadata: metadata}, nil
 	}
 
 	var url string
@@ -400,7 +532,7 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 
 	key, keyIndex, apiErr := channel.GetNextEnabledKey()
 	if apiErr != nil {
-		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+		return channelUpstreamModelCatalog{}, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
 	}
 	key = strings.TrimSpace(key)
 	lease, err := acquireSubscriptionOAuthManagementCapacity(
@@ -411,7 +543,7 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 		key,
 	)
 	if err != nil {
-		return nil, err
+		return channelUpstreamModelCatalog{}, err
 	}
 	if lease != nil {
 		defer lease.Release()
@@ -419,31 +551,34 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 
 	headers, err := buildFetchModelsHeaders(channel, key)
 	if err != nil {
-		return nil, err
+		return channelUpstreamModelCatalog{}, err
 	}
 
-	timeout := time.Duration(0)
-	if channel.Type == constant.ChannelTypeClaudeCode {
-		timeout = time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
-	}
+	timeout := time.Duration(common.ChannelManagementRequestTimeout) * time.Second
 	body, err := GetResponseBodyWithContext(ctx, http.MethodGet, url, channel, headers, timeout)
 	if err != nil {
-		return nil, applySubscriptionOAuthModelFetchError(channel, key, err)
+		return channelUpstreamModelCatalog{}, applySubscriptionOAuthModelFetchError(channel, key, err)
 	}
 
 	var result OpenAIModelsResponse
 	if err := common.Unmarshal(body, &result); err != nil {
-		return nil, err
+		return channelUpstreamModelCatalog{}, err
 	}
 
-	ids := lo.Map(result.Data, func(item OpenAIModel, _ int) string {
-		if channel.Type == constant.ChannelTypeGemini {
-			return strings.TrimPrefix(item.ID, "models/")
+	ids := make([]string, 0, len(result.Data))
+	metadata := make(map[string]dto.UpstreamModelMetadata)
+	for _, item := range result.Data {
+		name := strings.TrimSpace(item.ID)
+		if name == "" {
+			continue
 		}
-		return item.ID
-	})
+		ids = append(ids, name)
+		if profile := item.UpstreamMetadata(); profile.Valid() {
+			metadata[name] = profile
+		}
+	}
 
-	return normalizeModelNames(ids), nil
+	return channelUpstreamModelCatalog{IDs: normalizeModelNames(ids), Metadata: metadata}, nil
 }
 
 func applySubscriptionOAuthModelFetchError(channel *model.Channel, key string, err error) error {
@@ -499,9 +634,10 @@ func checkAndPersistChannelUpstreamModelUpdates(
 		}
 	}
 
-	pendingAddModels, pendingRemoveModels, fetchErr := collectPendingUpstreamModelChanges(ctx, channel, *settings)
+	pendingAddModels, pendingRemoveModels, fetchErr := collectPendingUpstreamModelChanges(ctx, channel, settings)
 	settings.UpstreamModelUpdateLastCheckTime = now
 	if fetchErr != nil {
+		settings.ClearUpstreamModelMetadata()
 		if err = updateChannelUpstreamModelSettings(channel, *settings, false); err != nil {
 			return false, 0, err
 		}

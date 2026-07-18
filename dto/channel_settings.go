@@ -104,6 +104,24 @@ const (
 	AwsKeyTypeApiKey AwsKeyType = "api_key"
 )
 
+// UpstreamModelMetadata is the last verified model capability advertised by
+// an upstream credential. Complete is false when one or more enabled
+// credentials could not confirm the same capability.
+const MaxUpstreamModelContextWindow = 10_000_000
+
+type UpstreamModelMetadata struct {
+	ContextWindow    int  `json:"context_window,omitempty"`
+	MaxContextWindow int  `json:"max_context_window,omitempty"`
+	Complete         bool `json:"complete,omitempty"`
+}
+
+func (m UpstreamModelMetadata) Valid() bool {
+	return m.Complete && m.ContextWindow > 0 &&
+		m.ContextWindow <= MaxUpstreamModelContextWindow &&
+		m.MaxContextWindow >= m.ContextWindow &&
+		m.MaxContextWindow <= MaxUpstreamModelContextWindow
+}
+
 type ChannelOtherSettings struct {
 	AzureResponsesVersion                 string                `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType         `json:"vertex_key_type,omitempty"` // "json" or "api_key"
@@ -123,8 +141,18 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastDetectedModels []string              `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
-	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
-	DataPolicy                            *ChannelDataPolicy    `json:"data_policy,omitempty"`
+	UpstreamModelMetadata                 map[string]UpstreamModelMetadata `json:"upstream_model_metadata,omitempty"`
+	UpstreamModelMetadataUpdatedTime      int64                            `json:"upstream_model_metadata_updated_time,omitempty"`
+	AdvancedCustom                        *AdvancedCustomConfig            `json:"advanced_custom,omitempty"`
+	DataPolicy                            *ChannelDataPolicy               `json:"data_policy,omitempty"`
+}
+
+func (s *ChannelOtherSettings) ClearUpstreamModelMetadata() {
+	if s == nil {
+		return
+	}
+	s.UpstreamModelMetadata = nil
+	s.UpstreamModelMetadataUpdatedTime = 0
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

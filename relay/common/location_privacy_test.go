@@ -146,23 +146,44 @@ func TestFilterUpstreamLocationDataAutoSelectsHostOrProxyProfile(t *testing.T) {
 	rootcommon.UpstreamSystemProxyEnabled = false
 	rootcommon.UpstreamHostLocationSettings = rootcommon.UpstreamLocationProfile{Country: "CN", City: "Beijing"}
 	rootcommon.UpstreamEgressLocationSettings = rootcommon.UpstreamLocationProfile{Country: "US", City: "Los Angeles"}
+	proxyURL := "http://proxy.example:8080"
+	require.True(t, rootcommon.SetChannelProxyLocationProfile(proxyURL, rootcommon.UpstreamLocationProfile{Country: "JP", City: "Tokyo"}))
 	input := []byte(`{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"SG"}}]}`)
 
-	hostOut, hostChanged, err := FilterUpstreamLocationData(input, false)
+	hostOut, hostChanged, err := FilterUpstreamLocationData(input)
 	require.NoError(t, err)
 	require.True(t, hostChanged)
 	require.JSONEq(t, `{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"CN","city":"Beijing"}}]}`, string(hostOut))
 
-	proxyOut, proxyChanged, err := FilterUpstreamLocationData(input, true)
+	proxyOut, proxyChanged, err := FilterUpstreamLocationData(input, proxyURL)
 	require.NoError(t, err)
 	require.True(t, proxyChanged)
-	require.JSONEq(t, `{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US","city":"Los Angeles"}}]}`, string(proxyOut))
+	require.JSONEq(t, `{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"JP","city":"Tokyo"}}]}`, string(proxyOut))
 
 	rootcommon.UpstreamSystemProxyEnabled = true
-	systemProxyOut, systemProxyChanged, err := FilterUpstreamLocationData(input, false)
+	systemProxyOut, systemProxyChanged, err := FilterUpstreamLocationData(input)
 	require.NoError(t, err)
 	require.True(t, systemProxyChanged)
-	require.JSONEq(t, string(proxyOut), string(systemProxyOut))
+	require.JSONEq(t, `{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US","city":"Los Angeles"}}]}`, string(systemProxyOut))
+}
+
+func TestFilterUpstreamLocationDataSanitizesDirectLocationFields(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+
+	out, changed, err := FilterUpstreamLocationData([]byte(`{
+		"model":"gpt-5",
+		"country":"CN",
+		"city":"Shanghai",
+		"latitude":31.2,
+		"timezone":"Asia/Shanghai",
+		"lat_lng":{"latitude":31.2,"longitude":121.4},
+		"metadata":{"latlng":{"latitude":31.2,"longitude":121.4}}
+	}`))
+
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.JSONEq(t, `{"model":"gpt-5","metadata":{}}`, string(out))
 }
 
 func restoreLocationSettings(t *testing.T) {

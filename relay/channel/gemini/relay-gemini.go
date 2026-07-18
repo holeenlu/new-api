@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -478,13 +480,23 @@ type GeminiModelsResponse struct {
 	NextPageToken string            `json:"nextPageToken"`
 }
 
-func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
+const maxGeminiModelsBodyBytes = 1 << 20
+
+type UpstreamModel struct {
+	ID       string
+	Metadata dto.UpstreamModelMetadata
+}
+
+func FetchGeminiModelCatalog(ctx context.Context, baseURL, apiKey, proxyURL string) ([]UpstreamModel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	client, err := service.GetHttpClientWithProxy(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP客户端失败: %v", err)
 	}
 
-	allModels := make([]string, 0)
+	allModels := make([]UpstreamModel, 0)
 	nextPageToken := ""
 	maxPages := 100 // Safety limit to prevent infinite loops
 
@@ -494,8 +506,8 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			url = fmt.Sprintf("%s?pageToken=%s", url, nextPageToken)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		request, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		request, err := http.NewRequestWithContext(requestCtx, "GET", url, nil)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("创建请求失败: %v", err)
@@ -510,17 +522,20 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 		}
 
 		if response.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(response.Body)
+			body, _ := io.ReadAll(io.LimitReader(response.Body, maxGeminiModelsBodyBytes+1))
 			response.Body.Close()
 			cancel()
 			return nil, fmt.Errorf("服务器返回错误 %d；响应正文已省略 (%d bytes)", response.StatusCode, len(body))
 		}
 
-		body, err := io.ReadAll(response.Body)
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxGeminiModelsBodyBytes+1))
 		response.Body.Close()
 		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("读取响应失败: %v", err)
+		}
+		if len(body) > maxGeminiModelsBodyBytes {
+			return nil, fmt.Errorf("Gemini 模型响应超过 %d bytes", maxGeminiModelsBodyBytes)
 		}
 
 		var modelsResponse GeminiModelsResponse
@@ -534,7 +549,13 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 				continue
 			}
 			modelName := strings.TrimPrefix(modelNameValue, "models/")
-			allModels = append(allModels, modelName)
+			if modelName == "" {
+				continue
+			}
+			allModels = append(allModels, UpstreamModel{
+				ID:       modelName,
+				Metadata: geminiModelMetadata(model.InputTokenLimit),
+			})
 		}
 
 		nextPageToken = modelsResponse.NextPageToken
@@ -542,6 +563,45 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			break
 		}
 	}
+	if nextPageToken != "" {
+		return nil, fmt.Errorf("Gemini 模型分页超过 %d 页", maxPages)
+	}
 
 	return allModels, nil
+}
+
+func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
+	catalog, err := FetchGeminiModelCatalog(context.Background(), baseURL, apiKey, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(catalog))
+	for _, model := range catalog {
+		models = append(models, model.ID)
+	}
+	return models, nil
+}
+
+func geminiModelMetadata(value interface{}) dto.UpstreamModelMetadata {
+	var inputTokenLimit int
+	switch limit := value.(type) {
+	case float64:
+		if !math.IsNaN(limit) && !math.IsInf(limit, 0) && limit == math.Trunc(limit) &&
+			limit > 0 && limit <= float64(dto.MaxUpstreamModelContextWindow) {
+			inputTokenLimit = int(limit)
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(limit))
+		if err == nil && parsed > 0 && parsed <= dto.MaxUpstreamModelContextWindow {
+			inputTokenLimit = parsed
+		}
+	}
+	if inputTokenLimit == 0 {
+		return dto.UpstreamModelMetadata{}
+	}
+	return dto.UpstreamModelMetadata{
+		ContextWindow:    inputTokenLimit,
+		MaxContextWindow: inputTokenLimit,
+		Complete:         true,
+	}
 }

@@ -292,7 +292,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			continue
 		}
-		if !shouldRetry(c, newAPIError, retryTimes-retryParam.GetRetry()) {
+		if !shouldRetryOrdinaryRelay(c, relayInfo, newAPIError, retryTimes-retryParam.GetRetry()) {
 			break
 		}
 		retryParam.IncreaseRetry()
@@ -308,6 +308,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
 	}
+}
+
+func shouldRetryOrdinaryRelay(c *gin.Context, info *relaycommon.RelayInfo, apiError *types.NewAPIError, retryTimes int) bool {
+	if !shouldRetry(c, apiError, retryTimes) || c == nil || c.Writer == nil || c.Writer.Written() {
+		return false
+	}
+	written, responseStarted := info.UpstreamAttemptState()
+	return !written && !responseStarted
 }
 
 func shouldContinueSubscriptionOAuthRetry(

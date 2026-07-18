@@ -713,6 +713,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 }
 
 func setMultiKeyStatus(channel *Channel, keyIndex, status int, reason string) {
+	channel.ClearUpstreamModelMetadata()
 	if channel.ChannelInfo.MultiKeyStatusList == nil {
 		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 	}
@@ -884,6 +885,20 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
 	if err != nil {
 		return err
+	}
+	if modelMapping != nil {
+		var channels []Channel
+		if err = DB.Select("id", "settings").Where("tag = ?", updatedTag).Find(&channels).Error; err != nil {
+			return err
+		}
+		for i := range channels {
+			channels[i].ClearUpstreamModelMetadata()
+			if err = DB.Model(&Channel{}).
+				Where("id = ?", channels[i].Id).
+				Update("settings", channels[i].OtherSettings).Error; err != nil {
+				return err
+			}
+		}
 	}
 	if shouldReCreateAbilities {
 		channels, err := GetChannelsByTag(updatedTag, false, false)
@@ -1069,6 +1084,15 @@ func (channel *Channel) SetOtherSettings(setting dto.ChannelOtherSettings) {
 		return
 	}
 	channel.OtherSettings = string(settingBytes)
+}
+
+func (channel *Channel) ClearUpstreamModelMetadata() {
+	if channel == nil {
+		return
+	}
+	settings := channel.GetOtherSettings()
+	settings.ClearUpstreamModelMetadata()
+	channel.SetOtherSettings(settings)
 }
 
 func (channel *Channel) GetParamOverride() map[string]interface{} {

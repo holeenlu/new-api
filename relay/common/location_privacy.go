@@ -59,7 +59,7 @@ func isLocationPrivacyCandidateKey(key string) bool {
 // FilterUpstreamLocationData applies the outbound privacy policy only to
 // protocol-defined location containers and metadata. Prompt text and tool
 // arguments are deliberately left untouched.
-func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, bool, error) {
+func FilterUpstreamLocationData(data []byte, channelProxy ...string) ([]byte, bool, error) {
 	mode := rootcommon.GetUpstreamLocationMode()
 	var request map[string]interface{}
 	if err := rootcommon.Unmarshal(data, &request); err != nil {
@@ -75,7 +75,11 @@ func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, 
 		}
 		return filtered, true, nil
 	}
-	profile, replaceLocation := selectUpstreamLocationProfile(mode, len(channelUsesProxy) > 0 && channelUsesProxy[0])
+	proxyURL := ""
+	if len(channelProxy) > 0 {
+		proxyURL = strings.TrimSpace(channelProxy[0])
+	}
+	profile, replaceLocation := selectUpstreamLocationProfile(mode, proxyURL)
 
 	changed := sanitizeRequestLocation(request, replaceLocation, profile)
 	if !changed {
@@ -88,15 +92,23 @@ func FilterUpstreamLocationData(data []byte, channelUsesProxy ...bool) ([]byte, 
 	return filtered, true, nil
 }
 
-func selectUpstreamLocationProfile(mode string, channelUsesProxy bool) (rootcommon.UpstreamLocationProfile, bool) {
+func selectUpstreamLocationProfile(mode string, channelProxy string) (rootcommon.UpstreamLocationProfile, bool) {
 	hostProfile, egressProfile := rootcommon.GetUpstreamLocationProfiles()
 	switch mode {
 	case rootcommon.UpstreamLocationModeHost:
 		return hostProfile, true
 	case rootcommon.UpstreamLocationModeEgress:
+		if channelProxy != "" {
+			profile, _ := rootcommon.GetChannelProxyLocationProfile(channelProxy)
+			return profile, true
+		}
 		return egressProfile, true
 	case rootcommon.UpstreamLocationModeAuto:
-		if rootcommon.UpstreamSystemProxyEnabled || channelUsesProxy {
+		if channelProxy != "" {
+			profile, _ := rootcommon.GetChannelProxyLocationProfile(channelProxy)
+			return profile, true
+		}
+		if rootcommon.UpstreamSystemProxyEnabled {
 			return egressProfile, true
 		}
 		return hostProfile, true
@@ -177,8 +189,7 @@ func sanitizeMetadataNetworkData(metadata map[string]interface{}) bool {
 
 func sanitizeRequestLocation(request map[string]interface{}, replaceLocation bool, profile rootcommon.UpstreamLocationProfile) bool {
 	changed := false
-	if _, exists := request["inference_geo"]; exists {
-		delete(request, "inference_geo")
+	if sanitizeDirectLocationValues(request, replaceLocation, profile) {
 		changed = true
 	}
 	if sanitizeLocationField(request, "user_location", replaceLocation, profile) {
@@ -212,17 +223,49 @@ func sanitizeRequestLocation(request map[string]interface{}, replaceLocation boo
 			}
 		}
 	}
-	for key := range request {
-		if _, sensitive := sensitiveNetworkMetadataKeys[normalizeSensitiveMetadataKey(key)]; sensitive {
-			delete(request, key)
-			changed = true
-		}
-	}
 	if requests, ok := request["requests"].([]interface{}); ok {
 		for _, rawRequest := range requests {
 			if nested, valid := rawRequest.(map[string]interface{}); valid && sanitizeRequestLocation(nested, replaceLocation, profile) {
 				changed = true
 			}
+		}
+	}
+	return changed
+}
+
+func sanitizeDirectLocationValues(values map[string]interface{}, replaceLocation bool, profile rootcommon.UpstreamLocationProfile) bool {
+	changed := false
+	for key := range values {
+		normalized := normalizeSensitiveMetadataKey(key)
+		if _, sensitive := sensitiveNetworkMetadataKeys[normalized]; sensitive {
+			delete(values, key)
+			changed = true
+			continue
+		}
+		if field, sensitive := sensitiveLocationMetadataKeys[normalized]; sensitive {
+			replacement, include := profileLocationMetadataValue(field, replaceLocation, profile)
+			if include {
+				values[key] = replacement
+			} else {
+				delete(values, key)
+			}
+			changed = true
+			continue
+		}
+		switch normalized {
+		case "inference_geo":
+			delete(values, key)
+			changed = true
+		case "lat_lng", "latlng":
+			if replaceLocation && profile.Latitude != nil && profile.Longitude != nil {
+				values[key] = map[string]interface{}{
+					"latitude":  *profile.Latitude,
+					"longitude": *profile.Longitude,
+				}
+			} else {
+				delete(values, key)
+			}
+			changed = true
 		}
 	}
 	return changed
@@ -301,6 +344,17 @@ func sanitizeMetadataLocation(metadata map[string]interface{}, replaceLocation b
 			continue
 		}
 		switch normalized {
+		case "lat_lng", "latlng":
+			if replaceLocation && profile.Latitude != nil && profile.Longitude != nil {
+				metadata[key] = map[string]interface{}{
+					"latitude":  *profile.Latitude,
+					"longitude": *profile.Longitude,
+				}
+			} else {
+				delete(metadata, key)
+			}
+			changed = true
+			continue
 		case "geo", "geolocation", "location", "user_location":
 			if replaceLocation {
 				replacement := profileTextLocation(profile)

@@ -26,6 +26,7 @@ const (
 
 type ResolvedChannelDataPolicy struct {
 	Provider         string
+	ProviderIdentity string
 	Region           string
 	Retention        string
 	Training         string
@@ -63,11 +64,13 @@ func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy 
 
 	policy.Provider = constant.GetChannelTypeName(channel.Type)
 	policy.Endpoint = normalizedUpstreamEndpoint(channel.GetBaseURL())
+	policy.ProviderIdentity = "endpoint:" + policy.Endpoint
 	settings := channel.GetOtherSettings().DataPolicy
 	if settings != nil {
 		validRetryPolicy := settings.Validate() == nil
 		if value := strings.TrimSpace(settings.Provider); value != "" {
 			policy.Provider = value
+			policy.ProviderIdentity = "declared:" + strings.ToLower(value)
 		}
 		if value := strings.TrimSpace(settings.Region); value != "" {
 			policy.Region = value
@@ -283,7 +286,7 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 		return false
 	}
 	candidate := ResolveChannelDataPolicy(channel)
-	if candidate.Provider != b.policy.Provider || candidate.Region != b.policy.Region ||
+	if candidate.ProviderIdentity != b.policy.ProviderIdentity || candidate.Region != b.policy.Region ||
 		candidate.Retention != b.policy.Retention || candidate.Training != b.policy.Training {
 		return false
 	}

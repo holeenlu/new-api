@@ -30,6 +30,12 @@ var openAIModels []dto.OpenAIModels
 var openAIModelsMap map[string]dto.OpenAIModels
 var channelId2Models map[int][]string
 
+var defaultCodexClientModelMetadata = dto.UpstreamModelMetadata{
+	ContextWindow:    272_000,
+	MaxContextWindow: 1_000_000,
+	Complete:         true,
+}
+
 func init() {
 	// https://platform.openai.com/docs/models/model-endpoint-compatibility
 	for i := 0; i < constant.APITypeDummy; i++ {
@@ -278,7 +284,15 @@ func ListModels(c *gin.Context, modelType int) {
 	}
 	if modelType == constant.ChannelTypeOpenAI {
 		if _, isCodexClient := c.Request.URL.Query()["client_version"]; isCodexClient {
-			c.JSON(http.StatusOK, buildCodexClientModelCatalog(userOpenAiModels))
+			metadata, metadataErr := model.GetEnabledModelUpstreamMetadata(
+				userModelNames,
+				ownerGroups,
+			)
+			if metadataErr != nil {
+				common.SysLog(fmt.Sprintf("GetEnabledModelUpstreamMetadata error: %v", metadataErr))
+				metadata = nil
+			}
+			c.JSON(http.StatusOK, buildCodexClientModelCatalog(userOpenAiModels, metadata))
 			return
 		}
 	}
@@ -321,10 +335,11 @@ func ListModels(c *gin.Context, modelType int) {
 	}
 }
 
-func buildCodexClientModelCatalog(models []dto.OpenAIModels) gin.H {
+func buildCodexClientModelCatalog(models []dto.OpenAIModels, metadata map[string]dto.UpstreamModelMetadata) gin.H {
 	catalog := make([]gin.H, 0, len(models))
 	for index, item := range models {
 		webSocketCapable := strings.EqualFold(strings.TrimSpace(item.OwnedBy), "codex")
+		profile := resolveClientModelMetadata(item.Id, webSocketCapable, metadata)
 		entry := gin.H{
 			"slug":                    item.Id,
 			"display_name":            item.Id,
@@ -341,8 +356,8 @@ func buildCodexClientModelCatalog(models []dto.OpenAIModels) gin.H {
 			"priority":                     1000 + index,
 			"prefer_websockets":            webSocketCapable,
 			"input_modalities":             []string{"text", "image"},
-			"context_window":               272000,
-			"max_context_window":           1000000,
+			"context_window":               profile.ContextWindow,
+			"max_context_window":           profile.MaxContextWindow,
 			"supports_parallel_tool_calls": false,
 			"supports_search_tool":         webSocketCapable,
 		}
@@ -352,6 +367,19 @@ func buildCodexClientModelCatalog(models []dto.OpenAIModels) gin.H {
 		catalog = append(catalog, entry)
 	}
 	return gin.H{"models": catalog}
+}
+
+func resolveClientModelMetadata(modelName string, codexModel bool, upstream map[string]dto.UpstreamModelMetadata) dto.UpstreamModelMetadata {
+	if profile, exists := upstream[modelName]; exists && profile.Valid() {
+		return profile
+	}
+	if profile, exists := model.GetOfficialModelMetadata(modelName); exists {
+		return profile
+	}
+	if codexModel {
+		return defaultCodexClientModelMetadata
+	}
+	return model.ConservativeModelMetadata()
 }
 
 func ChannelListModels(c *gin.Context) {

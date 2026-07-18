@@ -86,6 +86,36 @@ export function parseHttpStatusCodeRules(
   }
 }
 
+export function excludeHttpStatusCodes(
+  parsed: ParsedHttpStatusCodeRules,
+  excludedCodes: ReadonlySet<number>
+): ParsedHttpStatusCodeRules {
+  if (!parsed.ok || excludedCodes.size === 0) return parsed
+
+  const ranges = parsed.ranges.flatMap((range) => {
+    let segments: StatusCodeRange[] = [{ ...range }]
+    for (const excluded of excludedCodes) {
+      segments = segments.flatMap((segment) => {
+        if (excluded < segment.start || excluded > segment.end) return [segment]
+        const next: StatusCodeRange[] = []
+        if (segment.start < excluded) {
+          next.push({ start: segment.start, end: excluded - 1 })
+        }
+        if (excluded < segment.end) {
+          next.push({ start: excluded + 1, end: segment.end })
+        }
+        return next
+      })
+    }
+    return segments
+  })
+  const merged = mergeRanges(ranges)
+  const tokens = merged.map((range) =>
+    range.start === range.end ? `${range.start}` : `${range.start}-${range.end}`
+  )
+  return { ...parsed, ranges: merged, tokens, normalized: tokens.join(',') }
+}
+
 function parseToken(token: string): StatusCodeRange | null {
   const cleaned = token.trim().replace(/\s/g, '')
   if (!cleaned) return null

@@ -28,11 +28,19 @@ import (
 )
 
 type OpenAIModel struct {
-	ID         string         `json:"id"`
-	Object     string         `json:"object"`
-	Created    int64          `json:"created"`
-	OwnedBy    string         `json:"owned_by"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	ID               string         `json:"id"`
+	Object           string         `json:"object"`
+	Created          int64          `json:"created"`
+	OwnedBy          string         `json:"owned_by"`
+	ContextWindow    int            `json:"context_window"`
+	MaxContextWindow int            `json:"max_context_window"`
+	ContextLength    int            `json:"context_length"`
+	MaxInputTokens   int            `json:"max_input_tokens"`
+	InputTokenLimit  int            `json:"inputTokenLimit"`
+	Capabilities     struct {
+		MaxInputTokens int `json:"max_input_tokens"`
+	} `json:"capabilities"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
 	Permission []struct {
 		ID                 string `json:"id"`
 		Object             string `json:"object"`
@@ -54,6 +62,35 @@ type OpenAIModel struct {
 type OpenAIModelsResponse struct {
 	Data    []OpenAIModel `json:"data"`
 	Success bool          `json:"success"`
+}
+
+func (m OpenAIModel) UpstreamMetadata() dto.UpstreamModelMetadata {
+	contextWindow := m.ContextWindow
+	if contextWindow == 0 {
+		contextWindow = m.ContextLength
+	}
+	if contextWindow == 0 {
+		contextWindow = m.MaxInputTokens
+	}
+	if contextWindow == 0 {
+		contextWindow = m.InputTokenLimit
+	}
+	if contextWindow == 0 {
+		contextWindow = m.Capabilities.MaxInputTokens
+	}
+	maxContextWindow := m.MaxContextWindow
+	if maxContextWindow == 0 {
+		maxContextWindow = contextWindow
+	}
+	metadata := dto.UpstreamModelMetadata{
+		ContextWindow:    contextWindow,
+		MaxContextWindow: maxContextWindow,
+		Complete:         true,
+	}
+	if !metadata.Valid() {
+		return dto.UpstreamModelMetadata{}
+	}
+	return metadata
 }
 
 func parseStatusFilter(statusParam string) int {
@@ -245,8 +282,14 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	ids, err := fetchChannelUpstreamModelIDs(c.Request.Context(), channel)
+	catalog, err := fetchChannelUpstreamModelCatalog(c.Request.Context(), channel)
 	if err != nil {
+		settings := channel.GetOtherSettings()
+		settings.ClearUpstreamModelMetadata()
+		if persistErr := updateChannelUpstreamModelSettings(channel, settings, false); persistErr != nil {
+			common.ApiError(c, persistErr)
+			return
+		}
 		response := gin.H{
 			"success": false,
 			"message": fmt.Sprintf("获取模型列表失败: %s", err.Error()),
@@ -258,11 +301,20 @@ func FetchUpstreamModels(c *gin.Context) {
 		c.JSON(http.StatusOK, response)
 		return
 	}
+	if catalog.Metadata != nil {
+		settings := channel.GetOtherSettings()
+		settings.UpstreamModelMetadata = catalog.Metadata
+		settings.UpstreamModelMetadataUpdatedTime = common.GetTimestamp()
+		if err := updateChannelUpstreamModelSettings(channel, settings, false); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    ids,
+		"data":    catalog.IDs,
 	})
 }
 
@@ -1003,6 +1055,42 @@ type ChannelStatusBatchRequest struct {
 	Status int   `json:"status"`
 }
 
+func reconcileChannelUpstreamModelMetadata(
+	channel *model.Channel,
+	originChannel *model.Channel,
+	requestData map[string]any,
+) {
+	if channel == nil || originChannel == nil {
+		return
+	}
+
+	originSettings := originChannel.GetOtherSettings()
+	settings := originSettings
+	_, settingsSubmitted := requestData["settings"]
+	if settingsSubmitted {
+		settings = channel.GetOtherSettings()
+		settings.UpstreamModelMetadata = originSettings.UpstreamModelMetadata
+		settings.UpstreamModelMetadataUpdatedTime = originSettings.UpstreamModelMetadataUpdatedTime
+	}
+
+	_, typeSubmitted := requestData["type"]
+	_, keySubmitted := requestData["key"]
+	_, baseURLSubmitted := requestData["base_url"]
+	_, modelMappingSubmitted := requestData["model_mapping"]
+	metadataInvalidated :=
+		(typeSubmitted && channel.Type != originChannel.Type) ||
+		(keySubmitted && channel.Key != "" && channel.Key != originChannel.Key) ||
+		(baseURLSubmitted && channel.GetBaseURL() != originChannel.GetBaseURL()) ||
+		(modelMappingSubmitted && channel.GetModelMapping() != originChannel.GetModelMapping())
+	if metadataInvalidated {
+		settings.ClearUpstreamModelMetadata()
+	}
+
+	if settingsSubmitted || metadataInvalidated {
+		channel.SetOtherSettings(settings)
+	}
+}
+
 func UpdateChannel(c *gin.Context) {
 	channel := PatchChannel{}
 	rawBody, err := c.GetRawData()
@@ -1156,6 +1244,7 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
+	reconcileChannelUpstreamModelMetadata(&channel.Channel, originChannel, requestData)
 	err = channel.Update()
 	if err != nil {
 		common.ApiError(c, err)
@@ -1795,6 +1884,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {
@@ -1837,6 +1927,7 @@ func ManageMultiKeys(c *gin.Context) {
 		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
 			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
 		}
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {
@@ -1861,6 +1952,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {
@@ -1908,6 +2000,7 @@ func ManageMultiKeys(c *gin.Context) {
 			})
 			return
 		}
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {
@@ -1988,6 +2081,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {
@@ -2056,6 +2150,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ClearUpstreamModelMetadata()
 
 		err = channel.Update()
 		if err != nil {

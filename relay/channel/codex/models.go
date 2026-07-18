@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/service"
 )
 
@@ -19,19 +20,50 @@ const (
 	maxCodexModelsBodyBytes  = 1 << 20
 )
 
-type upstreamModel struct {
-	Slug  string `json:"slug"`
-	ID    string `json:"id"`
-	Model string `json:"model"`
+type UpstreamModel struct {
+	Slug             string `json:"slug"`
+	ID               string `json:"id"`
+	Model            string `json:"model"`
+	ContextWindow    int    `json:"context_window"`
+	MaxContextWindow int    `json:"max_context_window"`
 }
 
 type upstreamModelsResponse struct {
-	Models []upstreamModel `json:"models"`
-	Data   []upstreamModel `json:"data"`
+	Models []UpstreamModel `json:"models"`
+	Data   []UpstreamModel `json:"data"`
 }
 
-// FetchUpstreamModels returns the models available to this ChatGPT account.
-func FetchUpstreamModels(ctx context.Context, client *http.Client, baseURL string, rawKey string) ([]string, error) {
+func (m UpstreamModel) Name() string {
+	for _, name := range []string{m.Slug, m.ID, m.Model} {
+		if name = strings.TrimSpace(name); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func (m UpstreamModel) Metadata() dto.UpstreamModelMetadata {
+	contextWindow := m.ContextWindow
+	maxContextWindow := m.MaxContextWindow
+	if contextWindow <= 0 || contextWindow > dto.MaxUpstreamModelContextWindow {
+		return dto.UpstreamModelMetadata{}
+	}
+	if maxContextWindow == 0 {
+		maxContextWindow = contextWindow
+	}
+	if maxContextWindow < contextWindow || maxContextWindow > dto.MaxUpstreamModelContextWindow {
+		return dto.UpstreamModelMetadata{}
+	}
+	return dto.UpstreamModelMetadata{
+		ContextWindow:    contextWindow,
+		MaxContextWindow: maxContextWindow,
+		Complete:         true,
+	}
+}
+
+// FetchUpstreamModelCatalog returns the complete model records advertised by
+// this ChatGPT account. Duplicate names are collapsed conservatively.
+func FetchUpstreamModelCatalog(ctx context.Context, client *http.Client, baseURL string, rawKey string) ([]UpstreamModel, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -99,24 +131,44 @@ func FetchUpstreamModels(ctx context.Context, client *http.Client, baseURL strin
 	if len(models) == 0 {
 		models = payload.Data
 	}
-	result := make([]string, 0, len(models))
-	seen := make(map[string]struct{}, len(models))
-	for _, model := range models {
-		name := strings.TrimSpace(model.Slug)
-		if name == "" {
-			name = strings.TrimSpace(model.ID)
-		}
-		if name == "" {
-			name = strings.TrimSpace(model.Model)
-		}
+	result := make([]UpstreamModel, 0, len(models))
+	indexes := make(map[string]int, len(models))
+	for _, item := range models {
+		name := item.Name()
 		if name == "" {
 			continue
 		}
-		if _, ok := seen[name]; ok {
+		item.Slug = name
+		metadata := item.Metadata()
+		item.ContextWindow = metadata.ContextWindow
+		item.MaxContextWindow = metadata.MaxContextWindow
+		if index, ok := indexes[name]; ok {
+			existing := result[index].Metadata()
+			if !existing.Complete || !metadata.Complete {
+				result[index].ContextWindow = 0
+				result[index].MaxContextWindow = 0
+			} else {
+				result[index].ContextWindow = min(existing.ContextWindow, metadata.ContextWindow)
+				result[index].MaxContextWindow = min(existing.MaxContextWindow, metadata.MaxContextWindow)
+			}
 			continue
 		}
-		seen[name] = struct{}{}
-		result = append(result, name)
+		indexes[name] = len(result)
+		result = append(result, item)
 	}
 	return result, nil
+}
+
+// FetchUpstreamModels preserves the existing names-only API used by model
+// synchronization while the richer catalog is cached separately.
+func FetchUpstreamModels(ctx context.Context, client *http.Client, baseURL string, rawKey string) ([]string, error) {
+	catalog, err := FetchUpstreamModelCatalog(ctx, client, baseURL, rawKey)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(catalog))
+	for _, item := range catalog {
+		models = append(models, item.Name())
+	}
+	return models, nil
 }

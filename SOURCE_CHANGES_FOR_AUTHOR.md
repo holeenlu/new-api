@@ -97,7 +97,7 @@ web/default/src/features/channels/api.ts
 
 文件：`relay/channel/codex/adaptor.go`
 
-新增客户端请求头透传：
+客户端身份类请求头不再透传：
 
 ```text
 session-id
@@ -107,6 +107,14 @@ x-codex-parent-thread-id
 x-codex-turn-state
 x-codex-turn-metadata
 x-codex-window-id
+X-Session-ID
+X-Codex-Installation-ID
+```
+
+这些值即使通过 Header 通配、正则透传或 `{client_header:...}` 配置也会被 OAuth
+保护规则拦截。仅保留不承载客户端身份的能力标志：
+
+```text
 x-openai-memgen-request
 x-openai-subagent
 x-responsesapi-include-timing-metrics
@@ -135,7 +143,11 @@ x-codex-beta-features: remote_compaction_v2
 - `tool_choice: "auto"`；
 - `text: {"verbosity":"low"}`；
 - `reasoning.context: "all_turns"`；
-- 与客户端会话一致的 session/thread/turn/window 元数据；客户端未提供时由服务端生成。
+- 由网关为每个请求动态生成的 session/thread/turn/window/installation 元数据。
+
+客户端传入的 `client_metadata` 不会进入上游：普通 Codex 请求直接删除该可选字段，
+Lite 请求使用网关生成的最小 metadata 完整替换，避免设备 UUID、安装 ID、位置和客户端
+会话标识随订阅 OAuth 身份发送。Claude Code OAuth 同样删除客户端 `metadata.user_id`。
 
 Lite 请求还必须满足：
 
@@ -165,13 +177,22 @@ GET /v1/responses  (WebSocket Upgrade)
 
 - Alpha search 通过当前 API Key 的分组和模型规则选择 Codex OAuth 渠道，转发至
   `/backend-api/codex/alpha/search`，恢复 Responses Lite 的 `web.run` 搜索；
-- 搜索请求移除仅用于本地路由的 `prompt_cache_key` 和
-  `prompt_cache_retention`，保留非认证会话 Header；客户端提供的
-  `X-OpenAI-Actor-Authorization` 不会转发，避免覆盖 OAuth 账号身份边界；
+- 搜索请求移除仅用于本地路由的 `prompt_cache_key`、
+  `prompt_cache_retention` 以及客户端 session/thread/turn/device/client metadata；客户端
+  `id` 会替换为网关随机 ID，并作为该请求的 `X-Session-ID` 使用。客户端提供的会话 Header
+  和 `X-OpenAI-Actor-Authorization` 均不会转发；
 - Responses WebSocket 会话固定同一 OAuth 渠道和模型，使用上游
   `responses_websockets=2026-02-06` 协议；
 - `/v1/models?client_version=...` 返回 Codex 客户端兼容目录，并仅为实际由 Codex
-  渠道承载的模型声明 `prefer_websockets: true` 和搜索能力；
+  渠道承载的模型声明 `prefer_websockets: true` 和搜索能力；各启用 OAuth 凭证从上游模型
+  目录取得 context window，按渠道和可路由分组取共同最小值。Gemini 和 OpenAI 兼容上游目录若
+  返回 `inputTokenLimit`、`context_window` 或 `context_length`，也会以相同方式缓存和聚合。能力目录
+  采用三层优先级：全部可路由渠道均确认的上游实测值、维护在 `model/official_model_metadata.go` 中的
+  官方公开规格、保守默认值。Claude Code 等未提供窗口元数据的渠道因此使用官方规格，而不会套用
+  Codex 的默认值。任一渠道无法确认或数据越界时不使用部分实测结果，回退官方规格或默认值。
+  未收录的普通模型默认按 128K 返回；未收录的 Codex 模型保留原有 272K / 1M 客户端兼容回退。
+  已验证目录缓存到渠道 `settings`；OAuth 凭证、渠道类型、上游地址、模型映射或多 Key 启用集合变化时
+  立即清除缓存，等待下一次手动抓取或渠道级巡检重新确认；
 - `response.create` 和 `response.append` 均进入既有鉴权、模型限制、计费、隐私和
   错误处理链；同一会话固定渠道，避免 OAuth 身份在会话中途漂移；
 - 上游 WebSocket 事件按客户端协议实时返回；上游明确返回 `426 Upgrade Required`
@@ -212,12 +233,21 @@ Context json.RawMessage `json:"context,omitempty"`
 - `controller/channel-test.go`
 - `controller/channel.go`
 - `controller/channel_upstream_update.go`
+- `controller/model.go`
+- `dto/channel_settings.go`
+- `model/channel_model_metadata.go`
+- `model/official_model_metadata.go`
+- `relay/channel/codex/models.go`
+- `relay/channel/gemini/relay-gemini.go`
 
 Codex 渠道测试强制使用 stream 模式。定时自动测试是否执行完全由后台渠道健康检查中的
 “定时渠道测试”设置控制，不在 Compose、环境变量或渠道类型判断中额外硬编码排除。
 适配器仅在配置 `CODEX_MODEL_LIST` 时返回该显式限制列表；管理端手动抓取模型和上游模型巡检调用
-`/backend-api/codex/models`，按当前 ChatGPT 账号返回实际可用模型。模型抓取继承请求或任务
-Context，并受到订阅 OAuth 超时限制，不再使用不可取消的 `context.Background()`。
+`/backend-api/codex/models`，逐一检查渠道内所有启用且去重后的 ChatGPT OAuth 凭证，聚合实际
+可用模型及 context window；任一凭证失败时整次目录抓取失败，不返回可能导致误删模型的部分目录。
+模型抓取继承请求或任务 Context，并受到 `CHANNEL_MANAGEMENT_REQUEST_TIMEOUT`（默认 30 秒）的
+整次请求总超时约束，不再使用不可取消的 `context.Background()`，也不会因多 Key 串行检查把
+总等待时间放大为凭证数乘以 30 秒。
 上游价格同步明确排除 Codex 与 Claude Code OAuth 渠道。
 
 ### 1.8 Codex 使用量界面
@@ -329,7 +359,7 @@ x-app: cli
 - 本地并发保护在 HTTP/SSE、Responses WebSocket 和 Alpha Search 路径统一返回专用、可重试的
   `oauth_channel_concurrency_limit` 503。并发槽饱和时使用 `Retry-After: 1`，凭证处于冷却时返回向上取整后的真实剩余冷却秒数；该错误只写运行日志，不进入持久化错误日志；
 - 达到并发上限后排除的是 OAuth 凭证指纹，而非整个渠道；相同凭证配置在其他渠道或其他分组时共享同一并发、节奏与冷却状态，多 Key 渠道仍可继续使用其他未饱和账号；订阅 OAuth 的自动安全默认值固定在本次请求首次选中的实际分组，并限定相同渠道类型与兼容数据处理策略，渠道标签仅作为管理元数据；
-- 订阅 OAuth 独立配置上游重试次数、容量循环次数、容量累计等待上限和 429 跨账号重试。默认分别为 5、5、5 秒和关闭；本地容量切换不消耗上游重试额度；429 始终按上游 `Retry-After`（最长 15 分钟，缺失时 30 秒）冷却当前凭证，关闭开关时将错误返回客户端，打开时立即切换已冻结实际分组内的备用账号，不在原账号上重复放大 429；
+- 订阅 OAuth 独立配置上游重试次数、容量循环次数、容量累计等待上限和 429 跨账号重试。默认分别为 5、5、5 秒和关闭；并发槽申请失败会归还本次凭证尝试计数，不消耗上游失败预算；429 始终按上游 `Retry-After`（最长 15 分钟，缺失时 30 秒）冷却当前凭证，关闭开关时将错误返回客户端，打开时立即切换已冻结实际分组内的备用账号，不在原账号上重复放大 429；
 - 每个 OAuth 凭证拥有独立的 5 次可重试上游失败预算，并在实际 Relay 入口另设同值的凭证选择硬上限；即使某条异常路径没有进入正常失败计数，同一请求也不能选择同一凭证超过 5 次。耗尽后该凭证在当前请求中不可再次选择，并进入短暂冷却和单探针半开放恢复，再立即切换已冻结实际分组内的下一凭证；没有合规备用凭证时停止循环并返回最后一个真实上游错误；恢复状态使用代际校验，旧请求的迟到成功不能清除新一轮冷却；恢复探测的结果确认与并发槽释放在同一临界区完成，不会短暂重新打开冷却；可能已发送但没有明确失败响应的请求最多额外重试一次，且仍受 5 次总失败预算约束；下游已经输出或客户端取消后禁止重试；
 - 订阅 OAuth 上游错误按语义统一为 `oauth_unauthorized`（401 凭证无效）、`oauth_forbidden`（403 权限拒绝）、`upstream_account_disabled`（账号或组织停用）、`upstream_quota_exhausted`（余额或额度耗尽）、`upstream_rate_limited`（临时限流）和 `model_not_supported`（模型不可用）；额度识别覆盖上游 error code 及中英文常见错误文本，不再把所有 429 混为同一种故障；
 - OAuth `401/403`、账号或组织停用、余额或额度耗尽会立即在当前请求中排除凭证，并在一次数据库事务中隔离该凭证的全部渠道引用：单 Key 渠道整体禁用，多 Key 渠道只禁用匹配索引，同时异步通知所有已启用的管理员和根管理员；后续用户请求不能再选择该凭证，管理员修复或重新授权后需手动启用。额度耗尽即使以 429 返回，也不受“429 跨账号重试”开关限制，会切换已冻结实际分组内渠道类型和数据策略兼容的备用账号；普通临时 429 仍只按 Retry-After 冷却，默认返回客户端；模型不支持只在当前模型请求中排除该凭证，不会误伤该账号的其他模型；显式指定渠道及已开始下游输出的请求仍禁止切换；
@@ -337,12 +367,12 @@ x-app: cli
 - 管理员手动渠道测试保留适配器返回的结构化状态码、错误代码、上游状态和重试信息，并在测试结束时确认恢复探针结果，避免将真实 400/429/503 包装成通用 500 或让半开放并发槽长期占用；
 - 每个服务实例运行独立的凭证状态条件清理器，每 10 分钟从数据库读取当前 Codex/Claude Code 渠道仍引用的凭证指纹；仍被任一渠道引用的有效指纹即使长期没有请求也保留状态。只有凭证轮换、渠道删除或渠道类型变更后不再被数据库引用的旧指纹，且至少空闲 1 小时、没有活动租约、恢复探测、未结束冷却或节流预约时才回收；回收只删除进程内并发/冷却状态，不修改数据库渠道、OAuth 凭证或标签组；数据库查询失败时整轮清理失败关闭；回收先在状态锁内标记 retired，再按指针匹配从共享 Map 删除，并发请求发现 retired 后重新加载，避免同一凭证被拆成两套并发计数；
 - 容量池全部饱和时执行包含首次扫描在内的 5 轮凭证检查，采用约 250ms、500ms、1s、2s 的带抖动退避，累计等待不超过 5 秒；第一轮按优先级和权重确定凭证顺序，后续轮次稳定复用该顺序，实现 A→B→C→A；上游失败路径由有限凭证集合及每凭证预算自然终止，不再使用会截断后续凭证预算的隐藏总尝试数和 45 秒软限制；
-- Alpha Search 使用与普通 Relay 相同的订阅 OAuth 重试预算、RetryBoundary、模型映射和渠道数据策略；
+- Alpha Search 使用与普通 Relay 相同的订阅 OAuth 重试预算、RetryBoundary、模型映射和渠道数据策略，并在重试前按单次调用完成一次预扣、成功后一次结算和消费日志记录；搜索正文不进入日志；
   WebSocket 只在首次上游 WebSocket 握手成功或 HTTP 回退响应完整成功后固定渠道，使内部 Relay 能在会话固定前选择合规备用凭证；成功重试前
   清除前一失败尝试的 `Retry-After`，避免 `200` 响应携带过期重试指令；
 - 重试候选已排除本请求尝试过的渠道时，先尝试当前最高优先级中仍可用的渠道，再降到下一优先级，
   不会因为重试次数直接跳过同优先级备用渠道；
-- 上游 5xx、504、524 在下游尚未输出时按当前凭证累计重试；当前凭证预算耗尽后只在已冻结实际分组内按渠道类型和兼容数据策略跨渠道切换，成功后将渠道亲和性更新到最终成功渠道；
+- 普通渠道仅在请求尚未写入上游且下游尚未输出时自动重试，避免连接重置造成重复执行；订阅 OAuth 的明确失败响应仍受独立凭证预算保护。原始 504/524 始终禁止自动重试，只有管理员明确映射为其他可重试状态码并完成高风险确认后才按映射策略处理；
 - Codex Responses 流会在首个实际输出前暂存 `response.created`、`response.in_progress` 等生命周期事件，暂存上限为 64 KB，首个有效输出等待上限为 30 秒。预检完成前不向客户端发送 SSE 保活、失败账号的生命周期事件或 `X-Codex-Turn-State`；超时时终止当前上游尝试，以可重试的 `502/do_request_failed` 交由现有安全策略切换候选凭证，不触发真实 504 的全局禁止重试规则。若此时收到 `Selected model is at capacity` / `model_at_capacity`，网关会记录结构化 `model_at_capacity` 错误并在已冻结实际分组内切换备用凭证。该专用切换不依赖“429 跨 OAuth 账号重试”开关，也不会禁用或冷却凭证；如果上游在此阶段以 HTTP/2 `INTERNAL_ERROR`、连接重置等方式中断流，网关会返回可重试的 `502/do_request_failed` 并切换候选凭证。一旦正文、工具调用等实际输出已经提交，或预检字节达到上限，则禁止重试，只转发错误并把流异常写入用量日志，避免重复输出和重复计费；
 - 定时推理测试由后台渠道健康检查开关统一控制；上游价格同步跳过订阅 OAuth 渠道。
 
@@ -445,7 +475,7 @@ web/default/src/lib/localize-error-message.test.ts
 - Codex Wham 用量请求路径、认证 Header、重置请求体及响应大小限制；
 - 多 Key 随机与轮询重试排除本请求已使用 Key；
 - Codex/Claude Code 凭证级单实例并发租约、HTTP/WebSocket/Alpha Search 统一 503 错误契约、凭证级排除、成功重试 Header 清理和非持久化容量日志策略；
-- 上游错误正文不进入日志、数据库错误或客户端响应；
+- 上游请求正文、响应正文和 SSE 内容不进入运行日志或数据库错误；客户端仅接收结构化上游错误摘要，不接收网络地址、代理拓扑或 WebSocket 握手正文；
 - 前端传输错误、供应商错误、流终止原因和本地 OAuth 凭证容量状态统一显示为简体中文，本地容量错误不再误标为“上游原文”。
 
 ## 6. 部署和验证
@@ -456,20 +486,23 @@ web/default/src/lib/localize-error-message.test.ts
 ```text
 本机测试  docker-compose.local.yml                       bin/deploy-local.sh
 174 正式  docker-compose.server-174.137.56.226.yml       bin/deploy-174.137.56.226.sh
-192 正式  docker-compose.server-192.168.11.12.yml        bin/deploy-192.168.11.12.sh
+192.168.11.12  docker-compose.server-192.168.11.12.yml   bin/deploy-192.168.11.12.sh
+192.168.172.80 docker-compose.server-192.168.172.80.yml  bin/deploy-192.168.172.80.sh
 ```
 
 三份 Compose 都完整声明 new-api、PostgreSQL、Redis、网络、卷、健康检查和该目标需要的代理，不依赖
-`docker-compose.yml` 或已删除的 `docker-compose.deploy.yml`。174 独立包含 HTTPS Caddy，192 独立包含
+`docker-compose.yml` 或已删除的 `docker-compose.deploy.yml`。174 独立包含 HTTPS Caddy，两台 192 独立包含
 3000 端口代理，本机只监听 `127.0.0.1:3000`。三份文件采用相同字段顺序和命名规范，但修改其中一份
 不会改变其他目标。首次使用新脚本成功校验独立 Compose 后，会删除该服务器部署目录中不再使用的
 基础 Compose、覆盖 Compose 和旧公共远程脚本，保留 `.env`、数据、日志、备份和目标配置。
 
 `bin/deploy-local.sh` 负责本机 `linux/amd64` 构建、镜像版本冒烟检查、本机数据库备份、本机持久测试
 环境更新和三个 Relay 路由检查；它只维护 `http://127.0.0.1:3000` 的测试环境，不生成正式发布制品。
-Buildx 缓存默认保留，方便后续增量构建。
+Buildx 缓存默认在每次成功构建后清理 24 小时未使用的数据，并以 20GB 为默认保留上限；可通过
+`DEPLOY_PRUNE_BUILD_CACHE`、`DEPLOY_BUILD_CACHE_UNUSED_FOR` 和 `DEPLOY_BUILD_CACHE_KEEP_STORAGE`
+调整，设置 `DEPLOY_PRUNE_BUILD_CACHE=false` 才会完全关闭清理。
 
-两支正式服务器脚本分别配置自己的 SSH、目录、Compose、Caddy、镜像标签、回滚标签和公网验收，
+三支正式服务器脚本分别配置自己的 SSH、目录、Compose、Caddy、镜像标签、回滚标签和公网验收，
 只复用 `bin/deploy-common.sh` 中无服务器状态的构建、校验和环境文件工具；已删除旧的参数化
 `bin/deploy-remote.sh`。每个正式入口都会在本机以当前源码独立构建自己的 `linux/amd64` 镜像，
 构建在服务器外完成，随后只传输该服务器 Compose、Caddyfile 和本次临时压缩镜像；不依赖
@@ -533,10 +566,10 @@ Codex OAuth 的应用参数通过 `CODEX_OAUTH_CLIENT_ID`、`CODEX_OAUTH_REDIREC
   大请求直接复用原 `BodyStorage`，避免磁盘缓存正文重新读入堆内存并放大；
 - `UPSTREAM_LOCATION_MODE=strip` 为默认值，删除 OpenAI、Claude、Gemini 协议中的用户位置、经纬度及 metadata/client_metadata 中的 IP 和位置字段；
 - `UPSTREAM_LOCATION_MODE=auto` 根据真实网络路径选择画像：渠道配置代理或 `UPSTREAM_SYSTEM_PROXY_ENABLED=true` 时使用 VPN/代理出口画像，否则使用宿主网络出口画像；两套画像可分别由 `UPSTREAM_EGRESS_LOCATION_*` 和 `UPSTREAM_HOST_LOCATION_*` 显式配置；
-- `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径和已启用的系统代理/VPN 路径检查 ChatGPT、Claude 连通性；两者均可建立 HTTP 连接后，通过 Cloudflare trace 获取该路径的实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度。显式环境变量始终优先，探测只补充空字段；探测失败不会放行客户端位置；
+- `UPSTREAM_LOCATION_DISCOVERY_ENABLED=true` 时，服务启动会分别通过直连路径、系统代理/VPN 以及每个渠道独立代理检查 ChatGPT、Claude 连通性；每个不同渠道代理使用独立的内存出口画像，不再共享系统代理画像。连通后通过 Cloudflare trace 获取实际公网 IP，并使用 `ipwho.is` 补充国家、地区、城市、时区和经纬度；探测失败不会放行客户端位置；
 - `UPSTREAM_LOCATION_MODE=egress` 仅在客户端原本提供位置的协议位置上，改写为通过 `UPSTREAM_EGRESS_LOCATION_*` 配置的最终 VPN/代理出口位置，而不是宿主机物理位置；配置缺失时失败关闭并删除原字段；旧的 `relay` 和 `RELAY_LOCATION_*` 仍作为兼容别名；
 - `UPSTREAM_LOCATION_MODE=client` 明确允许客户端正文位置透传，但客户端真实 IP 无论位于 Header 还是协议 metadata 都仍禁止发送；
-- `Forwarded`、`X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP` 以及常见 CDN/代理客户端 IP Header 被加入强制出站禁止名单，通配、正则和显式 Header Override 均不能绕过；
+- `Forwarded`、`X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP`、`CF-IPCountry`、CloudFront Viewer 和 Vercel IP 位置 Header 被加入强制出站禁止名单，通配、正则和显式 Header Override 均不能绕过；
 - 中转服务器不伪造或添加自己的 `X-Forwarded-For`，模型服务商通过连接来源自然看到中转服务器出口 IP；
 - 国内宿主机通过 VPN、SOCKS5 或 HTTP 代理访问上游时，上游自然看到代理出口 IP；代理必须禁止自行追加客户端或宿主机的 `Forwarded`/`X-Forwarded-For`，否则该 Header 是在离开应用后由代理新增，应用无法再次清理；
 - Root 控制面板的“系统设置 → 操作设置 → 上游隐私”可保存位置转发模式，并展示系统级 VPN/TUN 状态、自动选择规则、宿主画像和代理出口画像；模式保存到数据库并在运行时热更新、多节点按既有 Option 同步周期传播，`UPSTREAM_LOCATION_MODE` 仅作为数据库尚未配置时的启动默认值；画像数据来自当前进程加载的显式环境变量及启动探测结果，不暴露代理 URL 或凭证；
@@ -600,13 +633,21 @@ Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth clien
 
 如果上游返回 `OAuth authentication is currently not allowed for this organization.`，表示 Token 已被识别，但所属 Anthropic 组织不允许 OAuth API 访问。该限制无法由网关 Header 或重试逻辑绕过。
 
-### 9.9 已提交的数据库备份包含生产敏感数据
+### 9.9 已确认的审计排除项
+
+以下两项已经由项目负责人确认，不再作为后续代码审计、发布阻断或待修复问题重复报告：
+
+1. Git 历史中的生产数据库备份属于已知历史风险。当前工作树已删除相关文件，但不再要求本项目通过
+   重写既有 Git 历史解决，也不在后续审计中重复提出凭据轮换或历史清理要求；
+2. 普通管理员与 Root 可以互相列出、查看完整 Key、编辑和删除对方创建的特权 API Key，这是明确的
+   业务授权。现有 `getManageableToken` 行为及对应回归测试按产品策略保留，不再按角色层级越权报告。
+
+上述排除仅针对这两个已确认事项，不放宽其他凭据日志脱敏、普通用户令牌隔离、数据库备份进入工作树、
+认证授权或角色权限问题的审计标准。
+
+历史背景：
 
 `backups/nextcode-20260715/local-before-nextcode.dump` 和
 `backups/nextcode-20260715/remote-new-api.sql` 已被提交到 Git 历史。后者包含
 `channels`、`tokens`、`options`、`users` 与 `custom_oauth_providers` 等表的导出，字段范围内包含
 渠道密钥、API Key、OAuth client secret、访问令牌、用户认证和运行配置等敏感数据的可能载体。
-
-这是高优先级源码安全问题：应立即停止在仓库中保留此类备份，将两个文件从当前分支和所有可访问 Git
-历史中移除，加入忽略规则，并轮换可能已暴露的渠道 Key、API Key、OAuth client secret、用户访问
-令牌及数据库凭据。仅删除工作树文件不足以消除已克隆、镜像或缓存中的历史泄露风险。

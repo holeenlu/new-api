@@ -554,6 +554,16 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const changedFieldsText = changedFieldTokens
     .map((field) => t(CHANNEL_FIELD_LABELS[field] ?? field))
     .join(', ')
+  const statusCodeRiskConfirmed =
+    isManage &&
+    props.isAdmin &&
+    other?.op?.params?.status_code_risk_confirmed === true
+  const statusCodeRiskMappings =
+    isManage &&
+    props.isAdmin &&
+    Array.isArray(other?.op?.params?.status_code_risk_mappings)
+      ? other.op.params.status_code_risk_mappings.map(String).join(', ')
+      : ''
   const showManageAuditSection =
     isManage && props.isAdmin && (operationText != null || auditRoute != null)
 
@@ -919,6 +929,19 @@ export function DetailsDialog(props: DetailsDialogProps) {
               <DetailRow
                 label={t('Changed Fields')}
                 value={changedFieldsText}
+              />
+            )}
+            {statusCodeRiskConfirmed && (
+              <DetailRow
+                label={t('High-risk operation confirmation')}
+                value={t('Yes')}
+              />
+            )}
+            {statusCodeRiskMappings !== '' && (
+              <DetailRow
+                label={t('Status Code Mapping')}
+                value={statusCodeRiskMappings}
+                mono
               />
             )}
             {auditRoute?.method && auditRoute?.route && (

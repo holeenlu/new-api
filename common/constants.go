@@ -195,6 +195,7 @@ var RelayIdleConnTimeout int // unit is second
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 var SubscriptionOAuthResponseHeaderTimeout int // unit is second
+var ChannelManagementRequestTimeout int        // unit is second
 
 const (
 	UpstreamLocationModeStrip  = "strip"

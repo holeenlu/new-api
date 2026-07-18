@@ -202,6 +202,9 @@ func RefreshUpstreamLocationProfiles(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if _, proxyErr := service.RefreshChannelProxyLocationProfiles(c.Request.Context()); proxyErr != nil {
+		common.SysLog("failed to refresh one or more channel proxy location profiles: " + proxyErr.Error())
+	}
 
 	data := upstreamLocationRefreshResponse{
 		Host:   newUpstreamLocationRefreshRouteResult(report.Host),

@@ -33,6 +33,8 @@ services:
 #      - LOG_SQL_CLICKHOUSE_TTL_DAYS=0 # OPTIONAL: ClickHouse log retention days. Unset or 0 disables automatic deletion; set to e.g. 30 to keep 30 days
       - REDIS_CONN_STRING=redis://:123456@redis:6379 # ⚠️ IMPORTANT: Change the password in production!
       - TZ=UTC
+      - CHANNEL_MANAGEMENT_REQUEST_TIMEOUT=${CHANNEL_MANAGEMENT_REQUEST_TIMEOUT:-30}
+      - CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED=${CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED:-true}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,postgres,redis,new-api}

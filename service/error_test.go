@@ -106,6 +106,7 @@ func TestValidateStatusCodeMappingRejectsInvalidCodes(t *testing.T) {
 		`{"+504":500}`,
 		`{"500":600}`,
 		`{"500":"not-a-status"}`,
+		`{" 504 ":500}`,
 		`[]`,
 	} {
 		_, err := ValidateStatusCodeMapping(mapping)

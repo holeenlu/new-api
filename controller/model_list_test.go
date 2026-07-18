@@ -184,7 +184,13 @@ func decodeUserModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder)
 func TestBuildCodexClientModelCatalogDeclaresWebSocketCapability(t *testing.T) {
 	response := buildCodexClientModelCatalog([]dto.OpenAIModels{
 		{Id: "gpt-5.6-sol", OwnedBy: "codex"},
-		{Id: "gpt-5.5", OwnedBy: "openai"},
+		{Id: "claude-opus-4-6-high", OwnedBy: "claude"},
+	}, map[string]dto.UpstreamModelMetadata{
+		"gpt-5.6-sol": {
+			ContextWindow:    1_000_000,
+			MaxContextWindow: 1_000_000,
+			Complete:         true,
+		},
 	})
 	models, ok := response["models"].([]gin.H)
 	require.True(t, ok)
@@ -193,6 +199,41 @@ func TestBuildCodexClientModelCatalogDeclaresWebSocketCapability(t *testing.T) {
 	require.Equal(t, true, models[0]["supports_search_tool"])
 	require.Equal(t, false, models[1]["prefer_websockets"])
 	require.Equal(t, "gpt-5.6-sol", models[0]["slug"])
+	require.Equal(t, 1_000_000, models[0]["context_window"])
+	require.Equal(t, 1_000_000, models[0]["max_context_window"])
+	require.Equal(t, 200_000, models[1]["context_window"])
+}
+
+func TestBuildCodexClientModelCatalogPrefersLiveMetadataOverOfficialCatalog(t *testing.T) {
+	response := buildCodexClientModelCatalog([]dto.OpenAIModels{
+		{Id: "claude-opus-4-6", OwnedBy: "claude"},
+	}, map[string]dto.UpstreamModelMetadata{
+		"claude-opus-4-6": {
+			ContextWindow:    400_000,
+			MaxContextWindow: 400_000,
+			Complete:         true,
+		},
+	})
+	models := response["models"].([]gin.H)
+
+	require.Equal(t, 400_000, models[0]["context_window"])
+	require.Equal(t, 400_000, models[0]["max_context_window"])
+}
+
+func TestBuildCodexClientModelCatalogFallsBackForIncompleteMetadata(t *testing.T) {
+	response := buildCodexClientModelCatalog([]dto.OpenAIModels{
+		{Id: "gpt-5.6-sol", OwnedBy: "codex"},
+	}, map[string]dto.UpstreamModelMetadata{
+		"gpt-5.6-sol": {
+			ContextWindow:    1_000_000,
+			MaxContextWindow: 1_000_000,
+			Complete:         false,
+		},
+	})
+	models := response["models"].([]gin.H)
+
+	require.Equal(t, 272_000, models[0]["context_window"])
+	require.Equal(t, 1_000_000, models[0]["max_context_window"])
 }
 
 func TestGetUserModelsFiltersByRequestedGroup(t *testing.T) {

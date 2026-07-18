@@ -61,6 +61,21 @@ func TestShouldRetryKeepsTimeoutRetryDisabledForOtherChannels(t *testing.T) {
 	require.False(t, shouldRetry(c, err, 1))
 }
 
+func TestOrdinaryRelayRetryStopsAfterUpstreamWrite(t *testing.T) {
+	original := operation_setting.AutomaticRetryStatusCodeRanges
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 500, End: 503}}
+	t.Cleanup(func() { operation_setting.AutomaticRetryStatusCodeRanges = original })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeOpenAI)
+	apiError := types.NewOpenAIError(errors.New("connection reset"), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+	info := &relaycommon.RelayInfo{}
+
+	require.True(t, shouldRetryOrdinaryRelay(c, info, apiError, 1))
+	info.MarkUpstreamRequestWritten()
+	require.False(t, shouldRetryOrdinaryRelay(c, info, apiError, 1))
+}
+
 func TestShouldRetryCodexLocalConcurrencyLimit(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Set("channel_type", constant.ChannelTypeCodex)

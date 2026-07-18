@@ -82,7 +82,21 @@ func TestClassifySubscriptionOAuthTransportError(t *testing.T) {
 			require.NotNil(t, got)
 			require.Equal(t, test.wantStatus, got.StatusCode)
 			require.Equal(t, test.wantSkip, types.IsSkipRetryError(got))
+			require.NotContains(t, got.Error(), test.err.Error())
 		})
+	}
+}
+
+func TestSensitiveLocationHeadersAreNeverPassedThrough(t *testing.T) {
+	for _, name := range []string{
+		"CF-IPCountry",
+		"CloudFront-Viewer-Country",
+		"CloudFront-Viewer-City",
+		"X-Vercel-IP-Country",
+		"X-Vercel-IP-Latitude",
+		"X-Vercel-IP-Timezone",
+	} {
+		require.True(t, shouldSkipPassthroughHeader(name), name)
 	}
 }
 
@@ -306,6 +320,7 @@ func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testin
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	ctx.Request.Header.Set("User-Agent", "untrusted-client")
 	ctx.Request.Header.Set("Anthropic-Beta", "untrusted-beta")
+	ctx.Request.Header.Set("Session-Id", "client-session")
 	ctx.Request.Header.Set("X-Trace-Id", "trace-123")
 
 	info := &relaycommon.RelayInfo{
@@ -322,6 +337,7 @@ func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testin
 	require.Equal(t, "trace-123", headers["x-trace-id"])
 	require.NotContains(t, headers, "user-agent")
 	require.NotContains(t, headers, "anthropic-beta")
+	require.NotContains(t, headers, "session-id")
 }
 
 func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {

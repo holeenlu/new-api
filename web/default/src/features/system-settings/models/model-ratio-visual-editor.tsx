@@ -50,7 +50,7 @@ import { Button } from '@/components/ui/button'
 import { combineBillingExpr } from '@/features/pricing/lib/billing-expr'
 import { useMediaQuery } from '@/hooks'
 
-import { safeJsonParse } from '../utils/json-parser'
+import { safeJsonParse, tryJsonParse } from '../utils/json-parser'
 import type { PricingMode } from './model-pricing-core'
 import {
   ModelPricingEditorPanel,
@@ -112,6 +112,22 @@ export type ModelRatioPricingPatch = Pick<
   | 'billingMode'
   | 'billingExpr'
 >
+
+function parsePricingMap<T extends Record<string, unknown>>(
+  value: string
+): T | null {
+  if (value.trim() === '') return {} as T
+  const parsed = tryJsonParse<T>(value)
+  if (
+    !parsed.success ||
+    parsed.data === null ||
+    typeof parsed.data !== 'object' ||
+    Array.isArray(parsed.data)
+  ) {
+    return null
+  }
+  return parsed.data
+}
 
 const STORAGE_KEY = 'model-ratio-column-visibility'
 
@@ -494,46 +510,36 @@ const ModelRatioVisualEditorComponent = forwardRef<
 
   const persistPricingData = useCallback(
     (data: ModelRatioData, targetNames: string[] = [data.name]) => {
-      const priceMap = safeJsonParse<Record<string, number>>(modelPrice, {
-        fallback: {},
-        silent: true,
-      })
-      const ratioMap = safeJsonParse<Record<string, number>>(modelRatio, {
-        fallback: {},
-        silent: true,
-      })
-      const cacheMap = safeJsonParse<Record<string, number>>(cacheRatio, {
-        fallback: {},
-        silent: true,
-      })
-      const createCacheMap = safeJsonParse<Record<string, number>>(
-        createCacheRatio,
-        { fallback: {}, silent: true }
-      )
-      const completionMap = safeJsonParse<Record<string, number>>(
-        completionRatio,
-        { fallback: {}, silent: true }
-      )
-      const imageMap = safeJsonParse<Record<string, number>>(imageRatio, {
-        fallback: {},
-        silent: true,
-      })
-      const audioMap = safeJsonParse<Record<string, number>>(audioRatio, {
-        fallback: {},
-        silent: true,
-      })
-      const audioCompletionMap = safeJsonParse<Record<string, number>>(
-        audioCompletionRatio,
-        { fallback: {}, silent: true }
-      )
-      const billingModeMap = safeJsonParse<Record<string, string>>(
-        billingMode,
-        { fallback: {}, silent: true }
-      )
-      const billingExprMap = safeJsonParse<Record<string, string>>(
-        billingExpr,
-        { fallback: {}, silent: true }
-      )
+      const priceMap = parsePricingMap<Record<string, number>>(modelPrice)
+      const ratioMap = parsePricingMap<Record<string, number>>(modelRatio)
+      const cacheMap = parsePricingMap<Record<string, number>>(cacheRatio)
+      const createCacheMap =
+        parsePricingMap<Record<string, number>>(createCacheRatio)
+      const completionMap =
+        parsePricingMap<Record<string, number>>(completionRatio)
+      const imageMap = parsePricingMap<Record<string, number>>(imageRatio)
+      const audioMap = parsePricingMap<Record<string, number>>(audioRatio)
+      const audioCompletionMap =
+        parsePricingMap<Record<string, number>>(audioCompletionRatio)
+      const billingModeMap =
+        parsePricingMap<Record<string, string>>(billingMode)
+      const billingExprMap =
+        parsePricingMap<Record<string, string>>(billingExpr)
+      if (
+        !priceMap ||
+        !ratioMap ||
+        !cacheMap ||
+        !createCacheMap ||
+        !completionMap ||
+        !imageMap ||
+        !audioMap ||
+        !audioCompletionMap ||
+        !billingModeMap ||
+        !billingExprMap
+      ) {
+        toast.error(t('Invalid JSON format'))
+        return null
+      }
 
       const setIfPresent = (
         target: Record<string, number>,
@@ -629,6 +635,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       billingMode,
       billingExpr,
       onChange,
+      t,
     ]
   )
 
@@ -657,9 +664,10 @@ const ModelRatioVisualEditorComponent = forwardRef<
 
     // Persist to the source model too, so targets never carry pricing the
     // source itself would lose if the editor draft were abandoned.
-    persistPricingData(sourceData, [
+    const patch = persistPricingData(sourceData, [
       ...new Set([sourceData.name, ...targetNames]),
     ])
+    if (!patch) return
     table.resetRowSelection()
     toast.success(
       t('Applied {{name}} pricing to {{count}} models', {
@@ -690,6 +698,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
         const data = await editorPanelRef.current.commitDraft()
         if (!data) return null
         const patch = persistPricingData(data)
+        if (!patch) return null
         setEditData(data)
         return patch
       },

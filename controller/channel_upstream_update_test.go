@@ -85,6 +85,19 @@ func TestGetResponseBodyWithContextRejectsOversizedSuccessBody(t *testing.T) {
 	require.ErrorContains(t, err, "management response exceeds")
 }
 
+func TestOpenAIModelUpstreamMetadataReadsAnthropicCapabilities(t *testing.T) {
+	metadata := OpenAIModel{
+		ID: "claude-sonnet-5",
+	}
+	metadata.Capabilities.MaxInputTokens = 1_000_000
+
+	profile := metadata.UpstreamMetadata()
+
+	require.True(t, profile.Valid())
+	require.Equal(t, 1_000_000, profile.ContextWindow)
+	require.Equal(t, 1_000_000, profile.MaxContextWindow)
+}
+
 func TestSubscriptionOAuthModelFetchErrorQuarantinesCredential(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	previousMemoryCache := common.MemoryCacheEnabled
@@ -118,6 +131,36 @@ func TestSubscriptionOAuthModelFetchErrorQuarantinesCredential(t *testing.T) {
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, 0, key)
 	_, capacityErr := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
 	require.True(t, service.IsSubscriptionOAuthCapacityError(capacityErr))
+}
+
+func TestCodexModelCatalogRejectsPartialCredentialScan(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer good-token" {
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.4","context_window":1000000}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"temporary upstream failure"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	channel := &model.Channel{
+		Id:      980010,
+		Type:    constant.ChannelTypeCodex,
+		BaseURL: &server.URL,
+		Keys: []string{
+			`{"access_token":"good-token","account_id":"good-account"}`,
+			`{"access_token":"bad-token","account_id":"bad-account"}`,
+		},
+		ChannelInfo: model.ChannelInfo{IsMultiKey: true},
+	}
+
+	catalog, err := fetchCodexChannelUpstreamModelCatalog(context.Background(), channel)
+
+	require.Error(t, err)
+	require.Empty(t, catalog.IDs)
+	require.Nil(t, catalog.Metadata)
 }
 
 func TestBuildFetchModelsHeadersRejectsInvalidClaudeCodeToken(t *testing.T) {
@@ -225,7 +268,7 @@ func TestModelUpdateScheduleFollowsEnabledChannelSettings(t *testing.T) {
 	require.False(t, modelUpdateHandler{}.Enabled())
 }
 
-func TestModelUpdateScheduleIgnoresLegacyEnvironmentSwitch(t *testing.T) {
+func TestModelUpdateScheduleRequiresEnvironmentAndChannelSwitches(t *testing.T) {
 	t.Setenv("CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED", "false")
 	db := setupModelListControllerTestDB(t)
 	channel := &model.Channel{
@@ -237,7 +280,7 @@ func TestModelUpdateScheduleIgnoresLegacyEnvironmentSwitch(t *testing.T) {
 		UpstreamModelUpdateCheckEnabled: true,
 	})
 	require.NoError(t, db.Create(channel).Error)
-	require.True(t, modelUpdateHandler{}.Enabled())
+	require.False(t, modelUpdateHandler{}.Enabled())
 }
 
 func TestNormalizeChannelModelMapping(t *testing.T) {
@@ -335,6 +378,166 @@ func TestShouldSendUpstreamModelUpdateNotification(t *testing.T) {
 	require.True(t, shouldSendUpstreamModelUpdateNotification(baseTime+10000, 0, 4))
 	require.True(t, shouldSendUpstreamModelUpdateNotification(baseTime+90000, 7, 0))
 	require.True(t, shouldSendUpstreamModelUpdateNotification(baseTime+90001, 0, 0))
+}
+
+func TestFetchCodexChannelUpstreamModelCatalogUsesMinimumAcrossCredentials(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Chatgpt-Account-Id") {
+		case "account-a":
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.6-sol","context_window":1000000,"max_context_window":1000000}]}`))
+		case "account-b":
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.6-sol","context_window":800000,"max_context_window":900000}]}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	channel := &model.Channel{
+		Id:      100,
+		Type:    constant.ChannelTypeCodex,
+		BaseURL: common.GetPointer(server.URL),
+		Key: strings.Join([]string{
+			`{"access_token":"token-a","account_id":"account-a"}`,
+			`{"access_token":"token-b","account_id":"account-b"}`,
+		}, "\n"),
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusEnabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+	}
+
+	catalog, err := fetchCodexChannelUpstreamModelCatalog(context.Background(), channel)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"gpt-5.6-sol"}, catalog.IDs)
+	require.Equal(t, dto.UpstreamModelMetadata{
+		ContextWindow:    800_000,
+		MaxContextWindow: 900_000,
+		Complete:         true,
+	}, catalog.Metadata["gpt-5.6-sol"])
+}
+
+func TestFetchCodexChannelUpstreamModelCatalogMarksMissingMetadataIncomplete(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Chatgpt-Account-Id") == "account-c" {
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.6-sol","context_window":1000000,"max_context_window":1000000}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.6-sol"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	channel := &model.Channel{
+		Id:      101,
+		Type:    constant.ChannelTypeCodex,
+		BaseURL: common.GetPointer(server.URL),
+		Key: strings.Join([]string{
+			`{"access_token":"token-c","account_id":"account-c"}`,
+			`{"access_token":"token-d","account_id":"account-d"}`,
+		}, "\n"),
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusEnabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+	}
+
+	catalog, err := fetchCodexChannelUpstreamModelCatalog(context.Background(), channel)
+
+	require.NoError(t, err)
+	require.False(t, catalog.Metadata["gpt-5.6-sol"].Complete)
+}
+
+func TestReconcileChannelUpstreamModelMetadataPreservesCacheForUnrelatedSettings(t *testing.T) {
+	origin := &model.Channel{Id: 102, Type: constant.ChannelTypeCodex, Key: "original-key"}
+	origin.SetOtherSettings(dto.ChannelOtherSettings{
+		AllowSpeed: true,
+		UpstreamModelMetadata: map[string]dto.UpstreamModelMetadata{
+			"gpt-5.6-sol": {ContextWindow: 1_000_000, MaxContextWindow: 1_000_000, Complete: true},
+		},
+		UpstreamModelMetadataUpdatedTime: 123,
+	})
+	incoming := &model.Channel{Id: 102, Type: constant.ChannelTypeCodex}
+	incoming.SetOtherSettings(dto.ChannelOtherSettings{AllowSpeed: false})
+
+	reconcileChannelUpstreamModelMetadata(incoming, origin, map[string]any{"settings": incoming.OtherSettings})
+
+	settings := incoming.GetOtherSettings()
+	require.False(t, settings.AllowSpeed)
+	require.Equal(t, int64(123), settings.UpstreamModelMetadataUpdatedTime)
+	require.True(t, settings.UpstreamModelMetadata["gpt-5.6-sol"].Valid())
+}
+
+func TestReconcileChannelUpstreamModelMetadataClearsCacheForRoutingIdentityChange(t *testing.T) {
+	originMapping := `{"codex":"gpt-5.6-sol"}`
+	newMapping := `{"codex":"gpt-5.6-terra"}`
+	origin := &model.Channel{Id: 103, Type: constant.ChannelTypeCodex, Key: "original-key", ModelMapping: &originMapping}
+	origin.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelMetadata: map[string]dto.UpstreamModelMetadata{
+			"gpt-5.6-sol": {ContextWindow: 1_000_000, MaxContextWindow: 1_000_000, Complete: true},
+		},
+		UpstreamModelMetadataUpdatedTime: 123,
+	})
+	incoming := &model.Channel{Id: 103, Type: constant.ChannelTypeCodex, ModelMapping: &newMapping}
+
+	reconcileChannelUpstreamModelMetadata(incoming, origin, map[string]any{"model_mapping": newMapping})
+
+	settings := incoming.GetOtherSettings()
+	require.Nil(t, settings.UpstreamModelMetadata)
+	require.Zero(t, settings.UpstreamModelMetadataUpdatedTime)
+}
+
+func TestOpenAIModelUpstreamMetadataAcceptsContextLength(t *testing.T) {
+	metadata := OpenAIModel{ID: "provider-model", ContextLength: 400_000}.UpstreamMetadata()
+
+	require.True(t, metadata.Valid())
+	require.Equal(t, 400_000, metadata.ContextWindow)
+	require.Equal(t, 400_000, metadata.MaxContextWindow)
+}
+
+func TestFailedCodexCatalogRefreshClearsCachedMetadata(t *testing.T) {
+	service.InitHttpClient()
+	db := setupModelListControllerTestDB(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"temporary upstream failure"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeCodex,
+		Name:    "codex-metadata-refresh",
+		Key:     `{"access_token":"token-a","account_id":"account-a"}`,
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer(server.URL),
+		Models:  "gpt-5.6-sol",
+		Group:   "default",
+	}
+	settings := dto.ChannelOtherSettings{
+		UpstreamModelMetadata: map[string]dto.UpstreamModelMetadata{
+			"gpt-5.6-sol": {ContextWindow: 1_000_000, MaxContextWindow: 1_000_000, Complete: true},
+		},
+		UpstreamModelMetadataUpdatedTime: 123,
+	}
+	channel.SetOtherSettings(settings)
+	require.NoError(t, db.Create(channel).Error)
+
+	_, _, err := checkAndPersistChannelUpstreamModelUpdates(context.Background(), channel, &settings, true, false)
+
+	require.Error(t, err)
+	var persisted model.Channel
+	require.NoError(t, db.First(&persisted, channel.Id).Error)
+	persistedSettings := persisted.GetOtherSettings()
+	require.Empty(t, persistedSettings.UpstreamModelMetadata)
+	require.Zero(t, persistedSettings.UpstreamModelMetadataUpdatedTime)
 }
 
 func TestDetectAllChannelUpstreamModelUpdatesRejectsExistingActiveTask(t *testing.T) {

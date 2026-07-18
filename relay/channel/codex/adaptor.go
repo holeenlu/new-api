@@ -26,13 +26,6 @@ type Adaptor struct {
 }
 
 var codexClientHeaders = []string{
-	"session-id",
-	"thread-id",
-	"x-client-request-id",
-	"x-codex-parent-thread-id",
-	"x-codex-turn-state",
-	"x-codex-turn-metadata",
-	"x-codex-window-id",
 	"x-openai-memgen-request",
 	"x-openai-subagent",
 	"x-responsesapi-include-timing-metrics",
@@ -62,39 +55,15 @@ func getOrCreateCodexResponsesMetadata(c *gin.Context) (*codexChannelTestMetadat
 			}
 		}
 	}
-	var sessionID, threadID, windowID, suppliedTurnMetadata string
-	if c != nil {
-		sessionID = strings.TrimSpace(c.GetHeader("session-id"))
-		threadID = strings.TrimSpace(c.GetHeader("thread-id"))
-		windowID = strings.TrimSpace(c.GetHeader("x-codex-window-id"))
-		suppliedTurnMetadata = strings.TrimSpace(c.GetHeader("x-codex-turn-metadata"))
-	}
-	if sessionID == "" {
-		sessionID = uuid.NewString()
-	}
-	if threadID == "" {
-		threadID = sessionID
-	}
-	if windowID == "" {
-		windowID = sessionID + ":0"
-	}
+	sessionID := uuid.NewString()
+	threadID := sessionID
+	windowID := sessionID + ":0"
 	metadata := &codexChannelTestMetadata{
 		SessionID:      sessionID,
 		ThreadID:       threadID,
 		TurnID:         uuid.NewString(),
 		InstallationID: uuid.NewString(),
 		WindowID:       windowID,
-	}
-	if supplied := suppliedTurnMetadata; supplied != "" {
-		var suppliedMetadata map[string]any
-		if err := common.Unmarshal([]byte(supplied), &suppliedMetadata); err == nil {
-			if value, ok := suppliedMetadata["turn_id"].(string); ok && strings.TrimSpace(value) != "" {
-				metadata.TurnID = strings.TrimSpace(value)
-			}
-			if value, ok := suppliedMetadata["installation_id"].(string); ok && strings.TrimSpace(value) != "" {
-				metadata.InstallationID = strings.TrimSpace(value)
-			}
-		}
 	}
 	turnMetadata, err := common.Marshal(map[string]any{
 		"installation_id":         metadata.InstallationID,
@@ -348,32 +317,22 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		}
 	}
 	setCodexResponsesLiteEnabled(c, useLite)
+	// Never relay client-provided device, account, or session metadata through a
+	// subscription OAuth identity. Lite requests receive gateway-generated
+	// metadata below; standard requests omit the optional field entirely.
+	request.ClientMetadata = nil
 	if useLite {
 		metadata, err := getOrCreateCodexResponsesMetadata(c)
 		if err != nil {
 			return nil, err
 		}
-		clientMetadata := make(map[string]any)
-		if trimmed := strings.TrimSpace(string(request.ClientMetadata)); trimmed != "" && trimmed != "null" {
-			if err := common.Unmarshal(request.ClientMetadata, &clientMetadata); err != nil {
-				return nil, types.NewErrorWithStatusCode(
-					errors.New("Codex Responses Lite requires client_metadata to be a JSON object"),
-					types.ErrorCodeInvalidRequest,
-					http.StatusBadRequest,
-					types.ErrOptionWithSkipRetry(),
-				)
-			}
-		}
-		generatedMetadata := map[string]any{
+		clientMetadata := map[string]any{
 			"session_id":              metadata.SessionID,
 			"thread_id":               metadata.ThreadID,
 			"turn_id":                 metadata.TurnID,
 			"x-codex-installation-id": metadata.InstallationID,
 			"x-codex-turn-metadata":   metadata.TurnMetadata,
 			"x-codex-window-id":       metadata.WindowID,
-		}
-		for key, value := range generatedMetadata {
-			clientMetadata[key] = value
 		}
 		clientMetadataJSON, err := common.Marshal(clientMetadata)
 		if err != nil {

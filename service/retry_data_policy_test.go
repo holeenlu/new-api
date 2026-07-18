@@ -276,6 +276,37 @@ func TestNonSubscriptionRetryBoundaryTagIsolationRequiresMatchingTagAndDataPolic
 	assert.False(t, boundary.Allows(matching))
 }
 
+func TestDefaultTagIsolationDoesNotCrossUnknownEndpoints(t *testing.T) {
+	initial := retryPolicyChannel(1, constant.ChannelTypeOpenAI, "https://reseller-a.example/v1", nil)
+	initial.SetTag("shared-tag")
+	sameEndpoint := retryPolicyChannel(2, constant.ChannelTypeOpenAI, "https://reseller-a.example/v1/", nil)
+	sameEndpoint.SetTag("shared-tag")
+	differentEndpoint := retryPolicyChannel(3, constant.ChannelTypeOpenAI, "https://reseller-b.example/v1", nil)
+	differentEndpoint.SetTag("shared-tag")
+
+	boundary := NewRetryBoundary(initial, "default")
+	boundary.MarkAttempt(initial)
+
+	assert.True(t, boundary.Allows(sameEndpoint))
+	assert.False(t, boundary.Allows(differentEndpoint))
+}
+
+func TestCapacityFailureDoesNotConsumeCredentialAttemptBudget(t *testing.T) {
+	originalRetries := common.SubscriptionOAuthUpstreamRetryTimes
+	common.SubscriptionOAuthUpstreamRetryTimes = 1
+	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
+
+	channel := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
+	channel.Key = `{"access_token":"token","account_id":"capacity-account"}`
+	boundary := NewRetryBoundary(channel, "default")
+	fingerprint := SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, 0, channel.Key)
+	retryParam := &RetryParam{Boundary: boundary}
+
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
+	retryParam.HandleSubscriptionOAuthCapacityFailure()
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
+}
+
 func TestRetryBoundaryExcludesDuplicateChannelsUsingFailedCredential(t *testing.T) {
 	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
 	initial.Key = `{"access_token":"token-a","account_id":"shared-account"}`

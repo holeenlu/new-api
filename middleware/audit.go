@@ -176,7 +176,9 @@ func finishAdminAudit(c *gin.Context, writer *auditResponseWriter) {
 	}
 
 	gopool.Go(func() {
-		model.RecordOperationAuditLog(operatorId, content, ip, action, opParams, adminInfo, auditInfo)
+		if err := model.RecordOperationAuditLog(operatorId, content, ip, action, opParams, adminInfo, auditInfo); err != nil {
+			common.SysLog("failed to record fallback operation audit log: " + err.Error())
+		}
 	})
 }
 

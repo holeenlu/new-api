@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -21,7 +22,14 @@ import (
 func TestSanitizeAlphaSearchBodyRemovesLocalCacheRoutingFields(t *testing.T) {
 	body, err := SanitizeAlphaSearchBody([]byte(`{"query":"hello","model":"gpt-5.6-sol","id":"session-1","prompt_cache_key":"local","prompt_cache_retention":"24h"}`))
 	require.NoError(t, err)
-	require.JSONEq(t, `{"query":"hello","model":"gpt-5.6-sol","id":"session-1"}`, string(body))
+	var payload map[string]any
+	require.NoError(t, rootcommon.Unmarshal(body, &payload))
+	require.Equal(t, "hello", payload["query"])
+	require.Equal(t, "gpt-5.6-sol", payload["model"])
+	require.NotEqual(t, "session-1", payload["id"])
+	require.NotEmpty(t, payload["id"])
+	require.NotContains(t, payload, "prompt_cache_key")
+	require.NotContains(t, payload, "prompt_cache_retention")
 }
 
 func TestSanitizeAlphaSearchBodyRejectsInvalidJSON(t *testing.T) {
@@ -42,6 +50,8 @@ func TestDoAlphaSearchUsesCodexOAuthAccount(t *testing.T) {
 		require.Equal(t, "account-id", r.Header.Get("ChatGPT-Account-ID"))
 		require.Equal(t, CodexOAuthOriginator, r.Header.Get("Originator"))
 		require.Empty(t, r.Header.Get("X-OpenAI-Actor-Authorization"))
+		require.NotEmpty(t, r.Header.Get("X-Session-ID"))
+		require.NotEqual(t, "client-session", r.Header.Get("X-Session-ID"))
 		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		require.JSONEq(t, `{"model":"gpt-5.6-sol","query":"hello"}`, string(body))
@@ -53,6 +63,7 @@ func TestDoAlphaSearchUsesCodexOAuthAccount(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/alpha/search", nil)
 	c.Request.Header.Set("X-OpenAI-Actor-Authorization", "Bearer client-controlled-token")
+	c.Request.Header.Set("X-Session-ID", "client-session")
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
 		ChannelId:      980003,
 		ChannelType:    constant.ChannelTypeCodex,
@@ -67,6 +78,30 @@ func TestDoAlphaSearchUsesCodexOAuthAccount(t *testing.T) {
 	payload, err := ReadAlphaSearchResponse(resp)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"results":[]}`, string(payload))
+}
+
+func TestSanitizeAlphaSearchBodyReplacesClientIdentity(t *testing.T) {
+	body, err := SanitizeAlphaSearchBody([]byte(`{
+		"model":"gpt-5.4",
+		"query":"hello",
+		"id":"client-session",
+		"Session-Id":"client-session",
+		"deviceUuid":"client-device",
+		"client_metadata":{"country":"CN"},
+		"metadata":{"device.uuid":"nested-device","safe":"kept"}
+	}`))
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, rootcommon.Unmarshal(body, &payload))
+	require.NotEqual(t, "client-session", payload["id"])
+	require.NotEmpty(t, payload["id"])
+	require.NotContains(t, payload, "Session-Id")
+	require.NotContains(t, payload, "deviceUuid")
+	require.NotContains(t, payload, "client_metadata")
+	metadata := payload["metadata"].(map[string]any)
+	require.NotContains(t, metadata, "device.uuid")
+	require.Equal(t, "kept", metadata["safe"])
 }
 
 func TestDoAlphaSearchReturnsTypedLocalConcurrencyLimit(t *testing.T) {

@@ -44,7 +44,10 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import { parseHttpStatusCodeRules } from '@/lib/http-status-code-rules'
+import {
+  excludeHttpStatusCodes,
+  parseHttpStatusCodeRules,
+} from '@/lib/http-status-code-rules'
 
 import {
   SettingsForm,
@@ -64,6 +67,13 @@ const numericString = z.string().refine((value) => {
 }, 'Enter a non-negative number or leave empty')
 
 const channelTestModes = ['scheduled_all', 'passive_recovery'] as const
+const alwaysSkippedRetryStatusCodes = new Set([504, 524])
+
+const parseAutomaticRetryStatusCodes = (value: unknown) =>
+  excludeHttpStatusCodes(
+    parseHttpStatusCodeRules(value),
+    alwaysSkippedRetryStatusCodes
+  )
 type ChannelTestMode = (typeof channelTestModes)[number]
 
 const routingReliabilitySchema = z
@@ -106,7 +116,7 @@ const routingReliabilitySchema = z
       })
     }
 
-    const retryParsed = parseHttpStatusCodeRules(
+    const retryParsed = parseAutomaticRetryStatusCodes(
       values.AutomaticRetryStatusCodes
     )
     if (!retryParsed.ok) {
@@ -217,7 +227,7 @@ const normalizeDefaults = (
   AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
     defaults.AutomaticDisableStatusCodes ?? ''
   ).normalized,
-  AutomaticRetryStatusCodes: parseHttpStatusCodeRules(
+  AutomaticRetryStatusCodes: parseAutomaticRetryStatusCodes(
     defaults.AutomaticRetryStatusCodes ?? ''
   ).normalized,
   'monitor_setting.auto_test_channel_enabled':
@@ -249,7 +259,7 @@ const normalizeFormValues = (
   AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
     values.AutomaticDisableStatusCodes
   ).normalized,
-  AutomaticRetryStatusCodes: parseHttpStatusCodeRules(
+  AutomaticRetryStatusCodes: parseAutomaticRetryStatusCodes(
     values.AutomaticRetryStatusCodes
   ).normalized,
   'monitor_setting.auto_test_channel_enabled':
@@ -296,7 +306,7 @@ export function RoutingReliabilitySection({
     [autoDisableStatusCodes]
   )
   const autoRetryParsed = useMemo(
-    () => parseHttpStatusCodeRules(autoRetryStatusCodes),
+    () => parseAutomaticRetryStatusCodes(autoRetryStatusCodes),
     [autoRetryStatusCodes]
   )
 

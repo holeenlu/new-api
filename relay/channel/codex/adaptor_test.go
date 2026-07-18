@@ -76,9 +76,10 @@ func TestCodexResponsesLiteProductionRequest(t *testing.T) {
 		},
 	}
 	request := dto.OpenAIResponsesRequest{
-		Reasoning: &dto.Reasoning{Effort: "high", Summary: "auto"},
-		Include:   json.RawMessage(`["message.output_text.logprobs"]`),
-		Tools:     json.RawMessage(`[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"}]`),
+		Reasoning:      &dto.Reasoning{Effort: "high", Summary: "auto"},
+		Include:        json.RawMessage(`["message.output_text.logprobs"]`),
+		Tools:          json.RawMessage(`[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"}]`),
+		ClientMetadata: json.RawMessage(`{"device_uuid":"client-device","country":"CN"}`),
 	}
 
 	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, request)
@@ -96,16 +97,18 @@ func TestCodexResponsesLiteProductionRequest(t *testing.T) {
 
 	var clientMetadata map[string]any
 	require.NoError(t, common.Unmarshal(got.ClientMetadata, &clientMetadata))
-	require.Equal(t, "session-123", clientMetadata["session_id"])
-	require.Equal(t, "thread-456", clientMetadata["thread_id"])
-	require.Equal(t, "window-789", clientMetadata["x-codex-window-id"])
+	require.NotEqual(t, "session-123", clientMetadata["session_id"])
+	require.NotEqual(t, "thread-456", clientMetadata["thread_id"])
+	require.NotEqual(t, "window-789", clientMetadata["x-codex-window-id"])
+	require.NotContains(t, clientMetadata, "device_uuid")
+	require.NotContains(t, clientMetadata, "country")
 
 	headers := make(http.Header)
 	require.NoError(t, (&Adaptor{}).SetupRequestHeader(c, &headers, info))
 	require.Equal(t, "true", headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
 	require.Equal(t, "remote_compaction_v2", headers.Get("X-Codex-Beta-Features"))
-	require.Equal(t, "session-123", headers.Get("Session-Id"))
-	require.Equal(t, "thread-456", headers.Get("Thread-Id"))
+	require.Equal(t, clientMetadata["session_id"], headers.Get("Session-Id"))
+	require.Equal(t, clientMetadata["thread_id"], headers.Get("Thread-Id"))
 }
 
 func TestCodexResponsesLiteRejectsNonStreamRequest(t *testing.T) {
@@ -200,11 +203,28 @@ func TestSetupRequestHeaderDoesNotForwardProtectedCodexClientHeaders(t *testing.
 	require.NoError(t, err)
 	require.Empty(t, headers.Get("X-Codex-Beta-Features"))
 	require.Empty(t, headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
-	require.Equal(t, "session-123", headers.Get("Session-Id"))
+	require.Empty(t, headers.Get("Session-Id"))
 	require.Equal(t, "Bearer access-token", headers.Get("Authorization"))
 	require.Equal(t, "account-id", headers.Get("Chatgpt-Account-Id"))
 	require.Equal(t, CodexOAuthUserAgent, headers.Get("User-Agent"))
 	require.Equal(t, CodexOAuthOriginator, headers.Get("Originator"))
+}
+
+func TestCodexStandardRequestDropsClientMetadata(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	stream := true
+	request := dto.OpenAIResponsesRequest{
+		Model:          "gpt-5.4",
+		Stream:         &stream,
+		ClientMetadata: json.RawMessage(`{"device_uuid":"client-device","session_id":"client-session"}`),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex}}
+
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, request)
+	require.NoError(t, err)
+	got := converted.(dto.OpenAIResponsesRequest)
+	require.Empty(t, got.ClientMetadata)
 }
 
 func TestCodexOAuthPacingHonorsContextCancellation(t *testing.T) {
