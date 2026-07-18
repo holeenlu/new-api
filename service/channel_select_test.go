@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -172,13 +173,20 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 }
 
 func TestSubscriptionOAuthCapacityReplayPreservesCredentialOrder(t *testing.T) {
-	retryParam := &RetryParam{}
+	boundary := NewRetryBoundary(&model.Channel{
+		Id:     1,
+		Type:   constant.ChannelTypeCodex,
+		Status: common.ChannelStatusEnabled,
+		Group:  "default",
+	}, "default")
+	require.NotNil(t, boundary)
+	retryParam := &RetryParam{Boundary: boundary}
 	for index, fingerprint := range []string{"credential-a", "credential-b", "credential-c"} {
 		retryParam.SetSubscriptionOAuthAttempt(index+1, 0, fingerprint)
 		retryParam.handleSubscriptionOAuthCapacityFailure()
 	}
 
-	require.True(t, retryParam.startCapacityReplay())
+	require.True(t, retryParam.RestartSubscriptionOAuthCapacityCycle())
 	for index, fingerprint := range []string{"credential-a", "credential-b", "credential-c"} {
 		target := retryParam.SubscriptionOAuthAttemptTarget()
 		require.NotNil(t, target)

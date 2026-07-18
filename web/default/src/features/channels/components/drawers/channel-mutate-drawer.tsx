@@ -130,10 +130,8 @@ import { useAuthStore } from '@/stores/auth-store'
 import {
   getAllModels,
   getChannel,
-  getChannelKey,
   getGroups,
   getPrefillGroups,
-  refreshCodexCredential,
 } from '../../api'
 import {
   ADD_MODE_OPTIONS,
@@ -145,6 +143,7 @@ import {
   FIELD_PLACEHOLDERS,
   MODEL_FETCHABLE_TYPES,
 } from '../../constants'
+import { useChannelCredentialActions } from '../../hooks/use-channel-credential-actions'
 import { useChannelEditorFormState } from '../../hooks/use-channel-editor-form-state'
 import { useChannelModelActions } from '../../hooks/use-channel-model-actions'
 import { useChannelMutateForm } from '../../hooks/use-channel-mutate-form'
@@ -166,7 +165,6 @@ import {
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
 } from '../../lib'
-import { getChannelErrorMessage } from '../../lib/channel-error-messages'
 import {
   collectInvalidStatusCodeEntries,
   collectNewDisallowedStatusCodeRedirects,
@@ -621,11 +619,7 @@ export function ChannelMutateDrawer({
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
   const canRevealChannelKey = currentUser?.role === ROLE.SUPER_ADMIN
-  const [channelKey, setChannelKey] = useState<string | null>(null)
-  const [isChannelKeyLoading, setIsChannelKeyLoading] = useState(false)
   const [codexOAuthDialogOpen, setCodexOAuthDialogOpen] = useState(false)
-  const [isCodexCredentialRefreshing, setIsCodexCredentialRefreshing] =
-    useState(false)
   const initialModelsRef = useRef<string[]>([])
   const initialModelMappingRef = useRef<string>('')
   const initialStatusCodeMappingRef = useRef<string>('')
@@ -698,14 +692,24 @@ export function ChannelMutateDrawer({
     switchMethod: switchVerificationMethod,
   } = useSecureVerification()
 
+  const {
+    channelKey,
+    isChannelKeyLoading,
+    isCodexCredentialRefreshing,
+    refreshCodexCredential: handleRefreshCodexCredential,
+    resetChannelKey,
+    revealChannelKey: handleRevealKey,
+  } = useChannelCredentialActions({
+    channelId,
+    queryClient,
+    withVerification,
+  })
+
   useEffect(() => {
-    if (!open) {
-      setChannelKey(null)
-      setIsChannelKeyLoading(false)
-    } else if (channelId) {
-      setChannelKey(null)
+    if (!open || channelId) {
+      resetChannelKey()
     }
-  }, [open, channelId])
+  }, [channelId, open, resetChannelKey])
 
   // Check if this is a multi-key channel
   const isMultiKeyChannel =
@@ -1344,68 +1348,6 @@ export function ChannelMutateDrawer({
       )
     }
   }
-
-  const fetchChannelKey = useCallback(async () => {
-    if (!channelId) {
-      throw new Error('Channel is not selected')
-    }
-
-    setIsChannelKeyLoading(true)
-    try {
-      const res = await getChannelKey(channelId)
-      if (!res.success) {
-        throw new Error(res.message || t('Failed to fetch channel key'))
-      }
-
-      const keyValue = res.data?.key ?? ''
-      setChannelKey(keyValue)
-      toast.success(t('Channel key unlocked'))
-      return res
-    } finally {
-      setIsChannelKeyLoading(false)
-    }
-  }, [channelId, t])
-
-  const handleRevealKey = useCallback(async () => {
-    if (!channelId) return
-
-    try {
-      await withVerification(fetchChannelKey, {
-        preferredMethod: 'passkey',
-        title: 'Verify to view channel key',
-        description:
-          'Use Passkey or 2FA to confirm your identity before revealing this channel key.',
-      })
-    } catch (error) {
-      if (error instanceof Error) {
-        toast.error(error.message)
-      }
-    }
-  }, [channelId, withVerification, fetchChannelKey])
-
-  const handleRefreshCodexCredential = useCallback(async () => {
-    if (!channelId) return
-    setIsCodexCredentialRefreshing(true)
-    try {
-      const res = await refreshCodexCredential(channelId)
-      if (!res.success) {
-        throw new Error(
-          getChannelErrorMessage(
-            res.error_code,
-            res.message || t('Failed to refresh credential')
-          )
-        )
-      }
-      toast.success(t('Credential refreshed'))
-      queryClient.invalidateQueries({
-        queryKey: channelsQueryKeys.detail(channelId),
-      })
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('Refresh failed'))
-    } finally {
-      setIsCodexCredentialRefreshing(false)
-    }
-  }, [channelId, queryClient, t])
 
   const {
     addPrefillGroup: handleAddPrefillGroup,

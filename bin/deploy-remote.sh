@@ -98,11 +98,13 @@ if [[ "$backup_enabled" == true || "$backup_enabled" == 1 ]]; then
   backup="backups/predeploy-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
   docker exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip >"$backup"
   chmod 600 "$backup"
-  mapfile -t backups < <(find backups -maxdepth 1 -name 'predeploy-*.sql.gz' -type f | sort)
+  shopt -s nullglob
+  backups=(backups/predeploy-*.sql.gz)
   while ((${#backups[@]} > 3)); do
     rm -f "${backups[0]}"
     backups=("${backups[@]:1}")
   done
+  shopt -u nullglob
 fi
 
 if [[ -n "$("${compose[@]}" ps -q "$proxy_service")" ]]; then
