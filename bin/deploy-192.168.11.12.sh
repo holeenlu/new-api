@@ -170,9 +170,7 @@ trap finish EXIT
 rm -f docker-compose.yml docker-compose.deploy.yml bin/deploy-common.sh bin/deploy-remote.sh
 rmdir bin 2>/dev/null || true
 for dependency in redis postgres; do
-  if ! docker inspect "$dependency" >/dev/null 2>&1; then
-    "${compose[@]}" up -d --no-build "$dependency"
-  fi
+  "${compose[@]}" up -d --no-build "$dependency"
   wait_healthy "$dependency" 30
 done
 
@@ -258,6 +256,13 @@ done
 "${compose[@]}" exec -T "$3" caddy reload --config /etc/caddy/Caddyfile </dev/null >/dev/null
 REMOTE_ROLLBACK
   deploy_die "192 deployment verification failed"
+fi
+
+if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
+  deploy_log "Pruning dangling new-api Docker images on 192"
+  if ! ssh_remote "$DEPLOY_TARGET" "docker image prune --force --filter 'label=org.opencontainers.image.title=new-api'"; then
+    deploy_log "Warning: 192 dangling image cleanup failed"
+  fi
 fi
 
 deploy_log "192 deployment completed: version=$APP_VERSION start_time=$REMOTE_START_TIME"

@@ -195,6 +195,21 @@ func InitOptionMap() {
 func loadOptionsFromDatabase() {
 	options, _ := AllOption()
 	for _, option := range options {
+		if option.Key == "AutomaticRetryStatusCodes" {
+			normalized, err := operation_setting.NormalizeAutomaticRetryStatusCodes(option.Value)
+			if err != nil {
+				common.SysLog("failed to normalize automatic retry status codes: " + err.Error())
+				continue
+			}
+			if normalized != option.Value {
+				if err := DB.Model(&Option{}).
+					Where(&Option{Key: option.Key}).
+					Update("value", normalized).Error; err != nil {
+					common.SysLog("failed to persist normalized automatic retry status codes: " + err.Error())
+				}
+				option.Value = normalized
+			}
+		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
@@ -223,11 +238,21 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	normalizedValues := make(map[string]string, len(values))
 	for key, value := range values {
+		if key == "AutomaticRetryStatusCodes" {
+			normalized, err := operation_setting.NormalizeAutomaticRetryStatusCodes(value)
+			if err != nil {
+				return err
+			}
+			value = normalized
+		}
 		if err := validateOptionValue(key, value); err != nil {
 			return err
 		}
+		normalizedValues[key] = value
 	}
+	values = normalizedValues
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
 			option := Option{Key: k}

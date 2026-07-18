@@ -5,28 +5,33 @@ set -Eeuo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT_DIR/bin/deploy-common.sh"
 
-DEPLOY_TARGET=root@174.137.56.226
-REMOTE_DIR=/opt/newapi-proxy
-COMPOSE_FILE=docker-compose.server-174.137.56.226.yml
-CADDY_FILE=Caddyfile.174.137.56.226
-PROXY_SERVICE=caddy
-TARGET_IMAGE=new-api:release-174
-ROLLBACK_IMAGE=new-api:rollback-174
-HEALTH_URL=https://nextcode.buildtoconnect.com/api/status
+DEPLOY_TARGET=kdanmobile@192.168.172.80
+DEPLOY_SSH_KEY=${DEPLOY_SSH_KEY:-$HOME/.ssh/new-api-cc00-ai-deploy}
+REMOTE_DIR=/home/kdanmobile/newapi-proxy
+COMPOSE_FILE=docker-compose.server-192.168.172.80.yml
+CADDY_FILE=Caddyfile.192.168.172.80
+PROXY_SERVICE=gateway
+TARGET_IMAGE=new-api:release-cc00-ai
+ROLLBACK_IMAGE=new-api:rollback-cc00-ai
+HEALTH_URL=http://192.168.172.80:3000/api/status
 
-BUILD_IMAGE=new-api:build-174-amd64
+BUILD_IMAGE=new-api:build-cc00-ai-amd64
 NO_CACHE=${NO_CACHE:-false}
 DEPLOY_BUILD_ATTEMPTS=${DEPLOY_BUILD_ATTEMPTS:-2}
 GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 GOPROXY_FALLBACK=${GOPROXY_FALLBACK:-https://proxy.golang.org,direct}
-LOCAL_ARCHIVE=$(mktemp "${TMPDIR:-/tmp}/new-api-release-174.XXXXXX")
-REMOTE_ARCHIVE=/tmp/new-api-release-174-$$.tar.gz
-REMOTE_LOCK=$REMOTE_DIR/.deploy-lock-174
-REMOTE_STATE=$REMOTE_DIR/.deploy-state-174.env
-CONTROL_PATH=/tmp/new-api-174-ssh-${UID}-$$
-ASKPASS_SCRIPT=""
+LOCAL_ARCHIVE=$(mktemp "${TMPDIR:-/tmp}/new-api-release-cc00-ai.XXXXXX")
+INITIAL_ENV_FILE=""
+REMOTE_ARCHIVE=/tmp/new-api-release-cc00-ai-$$.tar.gz
+REMOTE_LOCK=$REMOTE_DIR/.deploy-lock-cc00-ai
+REMOTE_STATE=$REMOTE_DIR/.deploy-state-cc00-ai.env
+CONTROL_PATH=/tmp/new-api-cc00-ai-ssh-${UID}-$$
 SSH_MASTER_ACTIVE=false
+[[ -r "$DEPLOY_SSH_KEY" ]] || deploy_die "Missing SSH deployment key: $DEPLOY_SSH_KEY; run bin/setup-ssh-key-192.168.172.80.sh once"
 SSH_OPTIONS=(
+  -i "$DEPLOY_SSH_KEY"
+  -o IdentitiesOnly=yes
+  -o BatchMode=yes
   -o StrictHostKeyChecking=accept-new
   -o ConnectTimeout=15
   -o ControlMaster=auto
@@ -34,29 +39,11 @@ SSH_OPTIONS=(
   -o ControlPath="$CONTROL_PATH"
 )
 
-if [[ -n "${SSHPASS:-}" ]]; then
-  export SSH_DEPLOY_PASSWORD=$SSHPASS
-  unset SSHPASS
-  ASKPASS_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/new-api-174-askpass.XXXXXX")
-  chmod 700 "$ASKPASS_SCRIPT"
-  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$SSH_DEPLOY_PASSWORD"' >"$ASKPASS_SCRIPT"
-fi
-
 ssh_remote() {
-  if [[ -n "$ASKPASS_SCRIPT" ]]; then
-    DISPLAY="${DISPLAY:-new-api-deploy}" SSH_ASKPASS="$ASKPASS_SCRIPT" SSH_ASKPASS_REQUIRE=force \
-      command ssh "${SSH_OPTIONS[@]}" "$@"
-    return
-  fi
   command ssh "${SSH_OPTIONS[@]}" "$@"
 }
 
 scp_remote() {
-  if [[ -n "$ASKPASS_SCRIPT" ]]; then
-    DISPLAY="${DISPLAY:-new-api-deploy}" SSH_ASKPASS="$ASKPASS_SCRIPT" SSH_ASKPASS_REQUIRE=force \
-      command scp "${SSH_OPTIONS[@]}" "$@"
-    return
-  fi
   command scp "${SSH_OPTIONS[@]}" "$@"
 }
 
@@ -65,13 +52,13 @@ cleanup() {
     ssh_remote "$DEPLOY_TARGET" "rm -f '$REMOTE_ARCHIVE'; rmdir '$REMOTE_LOCK' 2>/dev/null || true" >/dev/null 2>&1 || true
     ssh_remote -O exit "$DEPLOY_TARGET" >/dev/null 2>&1 || true
   fi
-  rm -f "$ASKPASS_SCRIPT" "$CONTROL_PATH" "$LOCAL_ARCHIVE"
+  rm -f "$CONTROL_PATH" "$LOCAL_ARCHIVE" "$INITIAL_ENV_FILE"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 deploy_ensure_docker_cli
-deploy_require_commands docker ssh scp gzip curl git sed awk tail
+deploy_require_commands docker ssh scp gzip curl git sed awk tail od tr
 docker info >/dev/null 2>&1 || deploy_die "Local Docker daemon is unavailable"
 docker buildx version >/dev/null 2>&1 || deploy_die "Local docker buildx is unavailable"
 for file in "$ROOT_DIR/$COMPOSE_FILE" "$ROOT_DIR/$CADDY_FILE"; do
@@ -80,27 +67,35 @@ done
 
 APP_VERSION=$(deploy_build_version "$ROOT_DIR")
 deploy_build_image "$ROOT_DIR" "$BUILD_IMAGE" linux/amd64 "$APP_VERSION" "$GOPROXY" "$GOPROXY_FALLBACK" "$NO_CACHE" \
-  || deploy_die "174 local source build failed"
+  || deploy_die "CC00-AI local source build failed"
 deploy_assert_image_platform "$BUILD_IMAGE" linux/amd64
 deploy_assert_image_runs "$BUILD_IMAGE" "$APP_VERSION" linux/amd64
 docker save "$BUILD_IMAGE" | gzip >"$LOCAL_ARCHIVE"
-[[ -s "$LOCAL_ARCHIVE" ]] || deploy_die "174 image archive is empty"
+[[ -s "$LOCAL_ARCHIVE" ]] || deploy_die "CC00-AI image archive is empty"
 ARCHIVE_SHA256=$(deploy_file_sha256 "$LOCAL_ARCHIVE")
 
-deploy_log "Connecting to 174.137.56.226"
+deploy_log "Connecting to CC00-AI (192.168.172.80)"
 ssh_remote -MNf "$DEPLOY_TARGET"
 SSH_MASTER_ACTIVE=true
 ssh_remote "$DEPLOY_TARGET" "docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1" \
   || deploy_die "Remote Docker is unavailable"
-ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR' && test -f '$REMOTE_DIR/.env' && { mkdir '$REMOTE_LOCK' 2>/dev/null || { find '$REMOTE_LOCK' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$REMOTE_LOCK' && mkdir '$REMOTE_LOCK'; }; }" \
-  || deploy_die "Remote .env is missing or another 174 deployment is active"
+ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR'"
+if ! ssh_remote "$DEPLOY_TARGET" "test -f '$REMOTE_DIR/.env'"; then
+  INITIAL_ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/new-api-cc00-ai-env.XXXXXX")
+  deploy_prepare_env_file "$INITIAL_ENV_FILE"
+  scp_remote "$INITIAL_ENV_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/.env"
+  ssh_remote "$DEPLOY_TARGET" "chmod 600 '$REMOTE_DIR/.env'"
+  deploy_log "Initialized the remote CC00-AI runtime environment"
+fi
+ssh_remote "$DEPLOY_TARGET" "mkdir '$REMOTE_LOCK' 2>/dev/null || { find '$REMOTE_LOCK' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$REMOTE_LOCK' && mkdir '$REMOTE_LOCK'; }" \
+  || deploy_die "Another CC00-AI deployment is active"
 
-deploy_log "Uploading 174 configuration and image"
+deploy_log "Uploading CC00-AI configuration and image"
 scp_remote "$ROOT_DIR/$COMPOSE_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$COMPOSE_FILE"
 scp_remote "$ROOT_DIR/$CADDY_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$CADDY_FILE"
 scp_remote "$LOCAL_ARCHIVE" "$DEPLOY_TARGET:$REMOTE_ARCHIVE"
 
-deploy_log "Deploying 174 application"
+deploy_log "Deploying CC00-AI application"
 ssh_remote "$DEPLOY_TARGET" "bash -s -- '$REMOTE_DIR' '$COMPOSE_FILE' '$PROXY_SERVICE' '$REMOTE_ARCHIVE' '$BUILD_IMAGE' '$TARGET_IMAGE' '$ROLLBACK_IMAGE' '$ARCHIVE_SHA256' '$APP_VERSION' '$REMOTE_STATE' '${DEPLOY_DATABASE_BACKUP_ENABLED:-true}'" <<'REMOTE_DEPLOY'
 set -Eeuo pipefail
 
@@ -161,7 +156,7 @@ reload_proxy() {
 
 rollback() {
   [[ "$rollback_available" == true ]] || return 1
-  echo "[deploy] Restoring previous 174 image" >&2
+  echo "[deploy] Restoring previous CC00-AI image" >&2
   docker tag "$rollback_image" "$target_image"
   "${compose[@]}" up -d --no-build --no-deps --force-recreate --remove-orphans new-api
   wait_status
@@ -173,7 +168,7 @@ finish() {
   trap - EXIT
   rm -f "$archive"
   if ((status != 0)) && [[ "$switched" == true ]]; then
-    rollback || echo "[deploy] Warning: 174 rollback failed" >&2
+    rollback || echo "[deploy] Warning: CC00-AI rollback failed" >&2
   fi
   exit "$status"
 }
@@ -232,10 +227,10 @@ version=$(printf '%s' "$status_json" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
 printf 'ARCHIVE_SHA256=%s\nAPP_VERSION=%s\nSTART_TIME=%s\n' "$expected_sha" "$version" "$start_time" >"$state_file"
 chmod 600 "$state_file"
 switched=false
-echo "[deploy] 174 container ready: version=$version start_time=$start_time"
+echo "[deploy] CC00-AI container ready: version=$version start_time=$start_time"
 REMOTE_DEPLOY
 REMOTE_START_TIME=$(ssh_remote "$DEPLOY_TARGET" "sed -n 's/^START_TIME=//p' '$REMOTE_STATE'")
-deploy_log "Verifying 174 public endpoint"
+deploy_log "Verifying CC00-AI public endpoint"
 version=""
 start_time=""
 for ((attempt = 1; attempt <= 30; attempt++)); do
@@ -249,7 +244,7 @@ for ((attempt = 1; attempt <= 30; attempt++)); do
 done
 if [[ "$version" != "$APP_VERSION" || "$start_time" != "$REMOTE_START_TIME" ]] || \
   ! deploy_verify_relay_routes "${HEALTH_URL%/api/status}"; then
-  deploy_log "174 public verification failed; restoring rollback image"
+  deploy_log "CC00-AI public verification failed; restoring rollback image"
   ssh_remote "$DEPLOY_TARGET" "bash -s -- '$REMOTE_DIR' '$COMPOSE_FILE' '$PROXY_SERVICE' '$TARGET_IMAGE' '$ROLLBACK_IMAGE'" <<'REMOTE_ROLLBACK'
 set -Eeuo pipefail
 cd "$1"
@@ -269,14 +264,14 @@ done
 "${compose[@]}" up -d --no-build --no-deps "$3" >/dev/null
 "${compose[@]}" exec -T "$3" caddy reload --config /etc/caddy/Caddyfile </dev/null >/dev/null
 REMOTE_ROLLBACK
-  deploy_die "174 deployment verification failed"
+  deploy_die "CC00-AI deployment verification failed"
 fi
 
 if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
-  deploy_log "Pruning dangling new-api Docker images on 174"
+  deploy_log "Pruning dangling new-api Docker images on CC00-AI"
   if ! ssh_remote "$DEPLOY_TARGET" "docker image prune --force --filter 'label=org.opencontainers.image.title=new-api'"; then
-    deploy_log "Warning: 174 dangling image cleanup failed"
+    deploy_log "Warning: CC00-AI dangling image cleanup failed"
   fi
 fi
 
-deploy_log "174 deployment completed: version=$APP_VERSION start_time=$REMOTE_START_TIME"
+deploy_log "CC00-AI deployment completed: version=$APP_VERSION start_time=$REMOTE_START_TIME"

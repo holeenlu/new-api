@@ -20,12 +20,15 @@ For commercial licensing, please contact support@quantumnous.com
 const DEFAULT_ERROR_MESSAGE = '请求失败'
 
 const ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
+  model_at_capacity: '所选模型当前容量不足，网关将尝试同分组内的备用渠道。',
   model_not_supported:
     'OAuth 账号无法使用此模型，请获取上游模型列表或选择其他模型。',
   oauth_forbidden: 'OAuth 账号无权访问此资源，请检查订阅状态和账号权限。',
   oauth_unauthorized: 'OAuth 凭证无效或已过期，请重新授权或刷新渠道凭证。',
-  upstream_account_disabled: '上游账号或组织已被停用，相关 OAuth 凭证已隔离，请联系管理员。',
-  upstream_quota_exhausted: '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。',
+  upstream_account_disabled:
+    '上游账号或组织已被停用，相关 OAuth 凭证已隔离，请联系管理员。',
+  upstream_quota_exhausted:
+    '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。',
   upstream_rate_limited: '上游账号触发临时频率限制，请稍后重试。',
 }
 
@@ -70,6 +73,7 @@ const EXACT_MESSAGES: Readonly<Record<string, string>> = {
   'content not found.': '未找到内容',
   'session expired!': '会话已过期，请重新登录',
   'connection closed': '连接已关闭',
+  timeout: '上游流等待超时',
   'network connection failed or server not responding':
     '网络连接失败或服务器未响应',
   'error parsing response data': '解析响应数据失败',
@@ -112,6 +116,19 @@ function replaceKnownErrorText(message: string): string {
   )
   localized = localized.replaceAll(/\bcontext canceled\b/gi, '请求上下文已取消')
   localized = localized.replaceAll(/\bclient_gone\b/gi, '客户端已断开')
+  localized = localized.replaceAll(/\bscanner_error\b/gi, '上游流读取错误')
+  localized = localized.replaceAll(
+    /\bupstream stream produced no semantic output within\s+([^,\n}]+)/gi,
+    '上游流在 $1 内未产生有效输出'
+  )
+  localized = localized.replaceAll(
+    /\bupstream stream failed before output:\s*/gi,
+    '上游流在产生有效输出前中断：'
+  )
+  localized = localized.replaceAll(
+    /\bstream error:\s*stream ID\s+(\d+);\s*INTERNAL_ERROR;\s*received from peer\b/gi,
+    '上游 HTTP/2 流异常：流 ID $1，对端返回内部错误'
+  )
   localized = localized.replaceAll(
     /\bconnection reset by peer\b/gi,
     '上游重置了连接'
@@ -158,12 +175,24 @@ function replaceKnownErrorText(message: string): string {
     '当前调用方式不支持此模型$1'
   )
   localized = localized.replaceAll(
+    /\bSelected model is at capacity\.?(?:\s*Please try a different model\.?)?/gi,
+    '所选模型当前容量不足，请稍后重试或选择其他模型。'
+  )
+  localized = localized.replaceAll(
     /\bOAuth authentication is currently not allowed for this organization\.?/gi,
     '当前组织不允许使用 OAuth 身份验证'
   )
   localized = localized.replaceAll(
     /\bconcurrency limit reached;?\s*retry later\.?/gi,
     '已达到并发限制，请稍后重试'
+  )
+  localized = localized.replaceAll(
+    /\bsubscription OAuth credential is busy;?\s*retry after\s*(\d+)\s*seconds?:?\s*/gi,
+    '订阅 OAuth 凭证正忙，请在 $1 秒后重试：'
+  )
+  localized = localized.replaceAll(
+    /\bsubscription OAuth credential is temporarily unavailable\b/gi,
+    '订阅 OAuth 凭证暂时不可用'
   )
   localized = localized.replaceAll(
     /\brate limit(?:ed| error)?\b/gi,

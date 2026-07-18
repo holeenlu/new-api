@@ -71,7 +71,11 @@ const routingReliabilitySchema = z
     RetryTimes: z.coerce.number().min(0).max(10),
     SubscriptionOAuthUpstreamRetryTimes: z.coerce.number().int().min(0).max(10),
     SubscriptionOAuthCapacityCycleTimes: z.coerce.number().int().min(0).max(10),
-    SubscriptionOAuthCapacityWaitSeconds: z.coerce.number().int().min(0).max(30),
+    SubscriptionOAuthCapacityWaitSeconds: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .max(30),
     SubscriptionOAuthRetry429: z.boolean(),
     ChannelDisableThreshold: numericString,
     AutomaticDisableChannelEnabled: z.boolean(),
@@ -407,7 +411,7 @@ export function RoutingReliabilitySection({
                     </FormControl>
                     <FormDescription>
                       {t(
-                        'Maximum retryable failures per OAuth credential before same-tag failover',
+                        'Maximum retryable failures per OAuth credential before same-group failover'
                       )}
                     </FormDescription>
                     <FormMessage />
@@ -429,7 +433,9 @@ export function RoutingReliabilitySection({
                       />
                     </FormControl>
                     <FormDescription>
-                      {t('Maximum passes through channels in the same retry pool')}
+                      {t(
+                        'Maximum passes through channels in the same retry pool'
+                      )}
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -462,9 +468,13 @@ export function RoutingReliabilitySection({
                 render={({ field }) => (
                   <SettingsSwitchItem>
                     <SettingsSwitchContent>
-                      <FormLabel>{t('Retry 429 across OAuth accounts')}</FormLabel>
+                      <FormLabel>
+                        {t('Retry 429 across OAuth accounts')}
+                      </FormLabel>
                       <FormDescription>
-                        {t('Disabled by default to avoid amplifying upstream rate limits')}
+                        {t(
+                          'Disabled by default to avoid amplifying upstream rate limits'
+                        )}
                       </FormDescription>
                     </SettingsSwitchContent>
                     <FormControl>

@@ -14,6 +14,7 @@ import (
 	rootcommon "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/pkg/oauthcred"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -247,16 +248,7 @@ func BuildClaudeCodeOAuthHeaders(key string) (http.Header, error) {
 }
 
 func ParseClaudeCodeOAuthToken(key string) (string, error) {
-	token := strings.TrimSpace(key)
-	token = strings.TrimPrefix(token, "export ")
-	token = strings.TrimPrefix(token, "CLAUDE_CODE_OAUTH_TOKEN=")
-	token = strings.TrimSpace(token)
-	if len(token) >= 2 {
-		if (token[0] == '"' && token[len(token)-1] == '"') ||
-			(token[0] == '\'' && token[len(token)-1] == '\'') {
-			token = token[1 : len(token)-1]
-		}
-	}
+	token := oauthcred.NormalizeClaudeCodeToken(key)
 	if token == "" {
 		return "", errors.New("claude code channel: CLAUDE_CODE_OAUTH_TOKEN is required")
 	}

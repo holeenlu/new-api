@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -23,8 +24,33 @@ func TestShouldRetrySubscriptionOAuthTransientError(t *testing.T) {
 	c.Set("channel_type", constant.ChannelTypeCodex)
 	err := types.NewOpenAIError(errors.New("upstream timed out"), types.ErrorCodeBadResponseStatusCode, 524)
 
+	require.False(t, shouldRetry(c, err, 1))
+	require.False(t, shouldRetry(c, err, 0))
+}
+
+func TestShouldRetrySubscriptionOAuthTimeoutMappingRequiresExplicitOverride(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	err := types.NewOpenAIError(errors.New("upstream timed out"), types.ErrorCodeBadResponseStatusCode, 503)
+	err.UpstreamStatusCode = 524
+
 	require.True(t, shouldRetry(c, err, 1))
-	require.True(t, shouldRetry(c, err, 0))
+
+	err.StatusCode = http.StatusBadRequest
+	require.False(t, shouldRetry(c, err, 1))
+}
+
+func TestShouldRetrySubscriptionOAuthBadResponseBodyNeverReplays(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	err := types.NewOpenAIError(
+		errors.New("invalid upstream response body"),
+		types.ErrorCodeBadResponseBody,
+		http.StatusInternalServerError,
+	)
+	err.UpstreamStatusCode = http.StatusInternalServerError
+
+	require.False(t, shouldRetry(c, err, 1))
 }
 
 func TestShouldRetryKeepsTimeoutRetryDisabledForOtherChannels(t *testing.T) {
@@ -49,6 +75,21 @@ func TestShouldRetryCodexLocalConcurrencyLimit(t *testing.T) {
 	require.False(t, types.IsRecordErrorLog(err))
 }
 
+func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	service.DisableSubscriptionOAuthRetry(c)
+	retryParam := &service.RetryParam{}
+	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a")
+	apiError := types.NewOpenAIError(
+		errors.New("upstream websocket closed"),
+		types.ErrorCodeDoRequestFailed,
+		http.StatusBadGateway,
+	)
+
+	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
+}
+
 func TestClearStaleRetryAfter(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -59,6 +100,25 @@ func TestClearStaleRetryAfter(t *testing.T) {
 	require.Empty(t, recorder.Header().Get("Retry-After"))
 }
 
+func TestShouldRetryTaskRelayUsesConfiguredStatusCodes(t *testing.T) {
+	original := operation_setting.AutomaticRetryStatusCodeRanges
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{
+		{Start: http.StatusTooManyRequests, End: http.StatusTooManyRequests},
+	}
+	t.Cleanup(func() {
+		operation_setting.AutomaticRetryStatusCodeRanges = original
+	})
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	require.True(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: http.StatusTooManyRequests}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: http.StatusInternalServerError}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: http.StatusGatewayTimeout}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: 524}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: 0}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: 600}, 1))
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{StatusCode: http.StatusTooManyRequests, LocalError: true}, 1))
+}
+
 func TestCodexCapacityFailoverExcludesOnlySaturatedCredential(t *testing.T) {
 	initial := &model.Channel{
 		Id:      1,
@@ -66,6 +126,7 @@ func TestCodexCapacityFailoverExcludesOnlySaturatedCredential(t *testing.T) {
 		Status:  common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     "key-1\nkey-2",
+		Group:   "default",
 	}
 	initial.ChannelInfo.IsMultiKey = true
 	initial.SetTag("openai-vip")
@@ -76,10 +137,11 @@ func TestCodexCapacityFailoverExcludesOnlySaturatedCredential(t *testing.T) {
 		Status:  common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     "key-3",
+		Group:   "default",
 	}
 	alternate.SetTag("openai-vip")
 	alternate.SetOtherSettings(dto.ChannelOtherSettings{})
-	boundary := service.NewRetryBoundary(initial)
+	boundary := service.NewRetryBoundary(initial, "default")
 	require.NotNil(t, boundary)
 	boundary.MarkAttempt(initial, 0)
 	err := types.NewErrorWithStatusCode(
@@ -110,6 +172,7 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithinRetryBoundary(t *testing
 		Id: 31, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-a","account_id":"model-limited"}`,
+		Group:   "default",
 	}
 	initial.SetTag("openai-vip")
 	initial.SetOtherSettings(dto.ChannelOtherSettings{})
@@ -117,11 +180,12 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithinRetryBoundary(t *testing
 		Id: 32, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-b","account_id":"model-enabled"}`,
+		Group:   "default",
 	}
 	backup.SetTag("openai-vip")
 	backup.SetOtherSettings(dto.ChannelOtherSettings{})
 
-	boundary := service.NewRetryBoundary(initial)
+	boundary := service.NewRetryBoundary(initial, "default")
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
 	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
@@ -143,11 +207,12 @@ func TestSubscriptionOAuthExplicitChannelDoesNotSwitchOnModelUnavailable(t *test
 		Id: 41, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-a","account_id":"pinned-model-limited"}`,
+		Group:   "default",
 	}
 	initial.SetTag("openai-vip")
 	initial.SetOtherSettings(dto.ChannelOtherSettings{})
 
-	boundary := service.NewRetryBoundary(initial)
+	boundary := service.NewRetryBoundary(initial, "default")
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
 	retryParam.SetSubscriptionOAuthAttempt(
 		initial.Id,
@@ -174,6 +239,7 @@ func TestSubscriptionOAuthQuotaExhaustionSwitchesEvenWhen429RetryIsDisabled(t *t
 		Id: 51, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-a","account_id":"quota-exhausted"}`,
+		Group:   "default",
 	}
 	initial.SetTag("openai-vip")
 	initial.SetOtherSettings(dto.ChannelOtherSettings{})
@@ -181,11 +247,12 @@ func TestSubscriptionOAuthQuotaExhaustionSwitchesEvenWhen429RetryIsDisabled(t *t
 		Id: 52, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-b","account_id":"quota-available"}`,
+		Group:   "default",
 	}
 	backup.SetTag("openai-vip")
 	backup.SetOtherSettings(dto.ChannelOtherSettings{})
 
-	boundary := service.NewRetryBoundary(initial)
+	boundary := service.NewRetryBoundary(initial, "default")
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
 	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
@@ -195,6 +262,47 @@ func TestSubscriptionOAuthQuotaExhaustionSwitchesEvenWhen429RetryIsDisabled(t *t
 	)
 
 	require.Equal(t, types.ErrorCodeUpstreamQuotaExhausted, apiError.GetErrorCode())
+	require.True(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
+	require.False(t, boundary.Allows(initial))
+	require.True(t, boundary.Allows(backup))
+}
+
+func TestSubscriptionOAuthModelCapacitySwitchesEvenWhen429RetryIsDisabled(t *testing.T) {
+	originalRetry429 := common.SubscriptionOAuthRetry429
+	common.SubscriptionOAuthRetry429 = false
+	t.Cleanup(func() { common.SubscriptionOAuthRetry429 = originalRetry429 })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	initial := &model.Channel{
+		Id: 71, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-a","account_id":"capacity-a"}`,
+		Group:   "default",
+	}
+	initial.SetOtherSettings(dto.ChannelOtherSettings{})
+	backup := &model.Channel{
+		Id: 72, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-b","account_id":"capacity-b"}`,
+		Group:   "default",
+	}
+	backup.SetOtherSettings(dto.ChannelOtherSettings{})
+
+	boundary := service.NewRetryBoundary(initial, "default")
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
+	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
+	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	apiError := service.ApplyChannelErrorPolicy(
+		initial.Type,
+		types.NewOpenAIError(
+			errors.New("Selected model is at capacity. Please try a different model."),
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusTooManyRequests,
+		),
+	)
+
+	require.Equal(t, types.ErrorCodeModelAtCapacity, apiError.GetErrorCode())
 	require.True(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
 	require.False(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(backup))
@@ -210,6 +318,7 @@ func TestTrackRetryAttemptStopsSelectingCredentialAfterFiveAttempts(t *testing.T
 		Id: 61, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-a","account_id":"attempt-guard"}`,
+		Group:   "default",
 	}
 	initial.SetTag("openai-vip")
 	initial.SetOtherSettings(dto.ChannelOtherSettings{})
@@ -217,6 +326,7 @@ func TestTrackRetryAttemptStopsSelectingCredentialAfterFiveAttempts(t *testing.T
 		Id: 62, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
 		BaseURL: common.GetPointer("https://chatgpt.com"),
 		Key:     `{"access_token":"token-b","account_id":"attempt-backup"}`,
+		Group:   "default",
 	}
 	backup.SetTag("openai-vip")
 	backup.SetOtherSettings(dto.ChannelOtherSettings{})

@@ -19,6 +19,35 @@ describe('localizeErrorMessage', () => {
   test('localizes stream termination fields', () => {
     assert.equal(localizeErrorMessage('client_gone'), '客户端已断开')
     assert.equal(localizeErrorMessage('context canceled'), '请求上下文已取消')
+    assert.equal(localizeErrorMessage('timeout'), '上游流等待超时')
+  })
+
+  test('localizes stream transport and credential state errors', () => {
+    assert.equal(localizeErrorMessage('scanner_error'), '上游流读取错误')
+    assert.equal(
+      localizeErrorMessage(
+        'upstream stream produced no semantic output within 30s'
+      ),
+      '上游流在 30s 内未产生有效输出'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'stream error: stream ID 99; INTERNAL_ERROR; received from peer'
+      ),
+      '上游 HTTP/2 流异常：流 ID 99，对端返回内部错误'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'subscription OAuth credential is busy; retry after 1 seconds: subscription OAuth credential is temporarily unavailable'
+      ),
+      '订阅 OAuth 凭证正忙，请在 1 秒后重试：订阅 OAuth 凭证暂时不可用'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'Selected model is at capacity. Please try a different model.'
+      ),
+      '所选模型当前容量不足，请稍后重试或选择其他模型。'
+    )
   })
 
   test('keeps diagnostic codes while translating their labels', () => {

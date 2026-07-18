@@ -402,6 +402,12 @@ docker run --name new-api -d --restart always \
 
 **重試配置：** `設置 → 運營設置 → 通用設置 → 失敗重試次數`
 
+訂閱 OAuth 渠道會凍結請求首次選中的實際分組，並且只在該分組內的資料策略相容渠道間重試；渠道標籤僅作為管理中繼資料，不參與訂閱渠道路由。其他渠道類型繼續使用已設定的重試隔離規則，包括相同標籤自動隔離。管理員可以在渠道編輯器的「資料治理」中選擇更嚴格的隔離範圍。
+
+每個 API 回應都會透過以下回應標頭揭露實際資料處理資訊：`X-Relay-Upstream-Provider`、`X-Relay-Attempt`、`X-Relay-Retry-Count`、`X-Relay-Retry-Isolation`、`X-Relay-Data-Region`、`X-Relay-Data-Retention` 和 `X-Relay-Data-Training`。
+
+供應商和資料策略值是管理員聲明的中繼資料，不是供應商簽章或認證的承諾；啟用跨渠道重試前，應依上游帳戶合約核驗這些值。
+
 **快取配置：**
 - `REDIS_CONN_STRING`：Redis 快取（推薦）
 - `MEMORY_CACHE_ENABLED`：記憶體快取

@@ -2,11 +2,7 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -250,32 +246,7 @@ func (l *SubscriptionOAuthLease) IsRecoveryProbe() bool {
 // Claude Code falls back to the normalized OAuth token because that protocol
 // does not expose a separate account identifier.
 func SubscriptionOAuthCredentialFingerprint(channelType, channelID, keyIndex int, key string) string {
-	identity := strings.TrimSpace(key)
-	switch channelType {
-	case constant.ChannelTypeCodex:
-		var credential struct {
-			AccountID string `json:"account_id"`
-		}
-		if common.Unmarshal([]byte(identity), &credential) == nil && strings.TrimSpace(credential.AccountID) != "" {
-			identity = "account:" + strings.TrimSpace(credential.AccountID)
-		} else if identity != "" {
-			identity = "credential:" + identity
-		}
-	case constant.ChannelTypeClaudeCode:
-		identity = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(identity, "export "), "CLAUDE_CODE_OAUTH_TOKEN="))
-		if len(identity) >= 2 && ((identity[0] == '"' && identity[len(identity)-1] == '"') ||
-			(identity[0] == '\'' && identity[len(identity)-1] == '\'')) {
-			identity = identity[1 : len(identity)-1]
-		}
-		if identity != "" {
-			identity = "credential:" + identity
-		}
-	}
-	if identity == "" {
-		identity = fmt.Sprintf("channel:%d:key:%d", channelID, keyIndex)
-	}
-	digest := sha256.Sum256([]byte(strconv.Itoa(channelType) + ":" + identity))
-	return hex.EncodeToString(digest[:])
+	return model.SubscriptionOAuthCredentialFingerprint(channelType, channelID, keyIndex, key)
 }
 
 // AcquireSubscriptionOAuthCapacity reserves one process-local slot for a

@@ -486,10 +486,11 @@ export function transformChannelToFormDefaults(
         dataRegion = parsed.data_policy.region || ''
         dataRetention = parsed.data_policy.retention || ''
         dataTraining = parsed.data_policy.training || 'provider_default'
-        retryIsolation =
-          parsed.data_policy.retry_isolation === 'tag'
-            ? 'auto'
-            : parsed.data_policy.retry_isolation || 'auto'
+        retryIsolation = ['tag', 'group'].includes(
+          parsed.data_policy.retry_isolation
+        )
+          ? 'auto'
+          : parsed.data_policy.retry_isolation || 'auto'
         retryPolicyGroup = parsed.data_policy.retry_policy_group || ''
       }
     } catch (error) {
@@ -730,10 +731,14 @@ function normalizeBaseUrl(value: string | undefined): string {
 /**
  * Transform form data to API payload for creating channel
  */
-export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
+export function transformFormDataToCreatePayload(
+  formData: ChannelFormValues,
+  statusCodeRiskConfirmed = false
+): {
   mode: 'single' | 'batch' | 'multi_to_single'
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
+  status_code_risk_confirmed?: boolean
   channel: Partial<Channel>
 } {
   const mode = formData.multi_key_mode || 'single'
@@ -775,6 +780,7 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
       mode === 'multi_to_single' ? formData.multi_key_type : undefined,
     batch_add_set_key_prefix_2_name:
       mode === 'batch' ? formData.batch_add_set_key_prefix_2_name : undefined,
+    status_code_risk_confirmed: statusCodeRiskConfirmed || undefined,
     channel,
   }
 }
@@ -784,9 +790,12 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
  */
 export function transformFormDataToUpdatePayload(
   formData: ChannelFormValues,
-  channelId: number
-): Partial<Channel> {
-  const payload: Partial<Channel> = {
+  channelId: number,
+  statusCodeRiskConfirmed = false
+): Partial<Channel> & { status_code_risk_confirmed?: boolean } {
+  const payload: Partial<Channel> & {
+    status_code_risk_confirmed?: boolean
+  } = {
     id: channelId,
     name: formData.name,
     type: formData.type,
@@ -831,6 +840,10 @@ export function transformFormDataToUpdatePayload(
   payload.status_code_mapping = formData.status_code_mapping || ''
   payload.param_override = formData.param_override || ''
   payload.header_override = formData.header_override || ''
+
+  if (statusCodeRiskConfirmed) {
+    payload.status_code_risk_confirmed = true
+  }
 
   return payload
 }

@@ -1000,9 +1000,13 @@ export function useChannelsColumns(
         cell: ({ row }) => {
           const group = row.getValue('group') as string
           const groupArray = parseGroupsList(group)
+          if (groupArray.length === 0) {
+            return <span className='text-muted-foreground text-xs'>-</span>
+          }
+
           return (
-            <BadgeListCell
-              items={groupArray.map((g) => (
+            <div className='-ml-1.5 flex max-w-full min-w-0 flex-wrap gap-1'>
+              {groupArray.map((g) => (
                 <GroupBadge
                   key={g}
                   group={g}
@@ -1010,7 +1014,7 @@ export function useChannelsColumns(
                   size='sm'
                 />
               ))}
-            />
+            </div>
           )
         },
         filterFn: (row, id, value) => {

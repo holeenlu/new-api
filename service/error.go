@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -222,30 +223,109 @@ func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) 
 	}
 }
 
+// StatusCodeMappingRisk describes a channel mapping that changes an upstream
+// timeout response. A 504/524 may mean that the provider already accepted and
+// billed the request, so changing its response semantics must be confirmed
+// explicitly by the caller before it is saved.
+type StatusCodeMappingRisk struct {
+	From int
+	To   int
+}
+
+// ValidateStatusCodeMapping validates both syntax and the HTTP status range.
+// It returns the high-risk 504/524 mappings separately so callers can require
+// an explicit confirmation without weakening the normal validation path.
+func ValidateStatusCodeMapping(mapping string) ([]StatusCodeMappingRisk, error) {
+	mapping = strings.TrimSpace(mapping)
+	if mapping == "" || mapping == "{}" {
+		return nil, nil
+	}
+
+	parsed := make(map[string]any)
+	if err := common.Unmarshal([]byte(mapping), &parsed); err != nil {
+		return nil, fmt.Errorf("invalid status code mapping JSON: %w", err)
+	}
+	if parsed == nil {
+		return nil, errors.New("status code mapping must be a JSON object")
+	}
+
+	risks := make([]StatusCodeMappingRisk, 0)
+	for rawFrom, rawTo := range parsed {
+		normalizedFrom := strings.TrimSpace(rawFrom)
+		if len(normalizedFrom) != 3 ||
+			normalizedFrom[0] < '1' || normalizedFrom[0] > '5' ||
+			normalizedFrom[1] < '0' || normalizedFrom[1] > '9' ||
+			normalizedFrom[2] < '0' || normalizedFrom[2] > '9' {
+			return nil, fmt.Errorf("invalid source status code: %s", rawFrom)
+		}
+		from, _ := strconv.Atoi(normalizedFrom)
+		to, ok := parseStatusCodeMappingValue(rawTo)
+		if !ok {
+			return nil, fmt.Errorf("invalid target status code for %d", from)
+		}
+		if (from == http.StatusGatewayTimeout || from == 524) && from != to {
+			risks = append(risks, StatusCodeMappingRisk{From: from, To: to})
+		}
+	}
+
+	sort.Slice(risks, func(i, j int) bool {
+		if risks[i].From == risks[j].From {
+			return risks[i].To < risks[j].To
+		}
+		return risks[i].From < risks[j].From
+	})
+	return risks, nil
+}
+
+// NewStatusCodeMappingRisks returns only risky mappings newly introduced by
+// the current value. Existing risky mappings do not block unrelated edits.
+func NewStatusCodeMappingRisks(original, current string) ([]StatusCodeMappingRisk, error) {
+	// A legacy original value may be invalid because it predates server-side
+	// validation. Ignore that error only for the risk diff; the submitted current
+	// value is still validated strictly and must be corrected before it is saved.
+	originalRisks, _ := ValidateStatusCodeMapping(original)
+	currentRisks, err := ValidateStatusCodeMapping(current)
+	if err != nil {
+		return nil, err
+	}
+
+	known := make(map[StatusCodeMappingRisk]struct{}, len(originalRisks))
+	for _, risk := range originalRisks {
+		known[risk] = struct{}{}
+	}
+	newRisks := make([]StatusCodeMappingRisk, 0, len(currentRisks))
+	for _, risk := range currentRisks {
+		if _, exists := known[risk]; !exists {
+			newRisks = append(newRisks, risk)
+		}
+	}
+	return newRisks, nil
+}
+
 func parseStatusCodeMappingValue(value any) (int, bool) {
 	switch v := value.(type) {
 	case string:
-		if v == "" {
+		if strings.TrimSpace(v) == "" {
 			return 0, false
 		}
-		statusCode, err := strconv.Atoi(v)
+		statusCode, err := strconv.Atoi(strings.TrimSpace(v))
 		if err != nil {
 			return 0, false
 		}
-		return statusCode, true
+		return statusCode, statusCode >= 100 && statusCode <= 599
 	case float64:
-		if v != math.Trunc(v) {
+		if v != math.Trunc(v) || v < 100 || v > 599 {
 			return 0, false
 		}
 		return int(v), true
 	case int:
-		return v, true
+		return v, v >= 100 && v <= 599
 	case json.Number:
 		statusCode, err := strconv.Atoi(v.String())
 		if err != nil {
 			return 0, false
 		}
-		return statusCode, true
+		return statusCode, statusCode >= 100 && statusCode <= 599
 	default:
 		return 0, false
 	}

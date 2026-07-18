@@ -62,13 +62,7 @@ func CodexAlphaSearch(c *gin.Context) {
 
 	initialInfo := relaycommon.GenRelayInfoResponses(c, &dto.OpenAIResponsesRequest{Model: originModel})
 	initialInfo.InitChannelMeta(c)
-	retryParam := &service.RetryParam{
-		Ctx:         c,
-		TokenGroup:  initialInfo.TokenGroup,
-		ModelName:   originModel,
-		RequestPath: c.Request.URL.Path,
-		Retry:       common.GetPointer(0),
-	}
+	retryParam := service.NewRetryParam(c, initialInfo.TokenGroup, originModel, c.Request.URL.Path)
 	var lastError *types.NewAPIError
 	firstAttempt := true
 

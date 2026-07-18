@@ -90,6 +90,38 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
+func TestValidateStatusCodeMapping(t *testing.T) {
+	risks, err := ValidateStatusCodeMapping(`{"504":500,"524":"429","500":503}`)
+	require.NoError(t, err)
+	require.Equal(t, []StatusCodeMappingRisk{
+		{From: 504, To: 500},
+		{From: 524, To: 429},
+	}, risks)
+}
+
+func TestValidateStatusCodeMappingRejectsInvalidCodes(t *testing.T) {
+	for _, mapping := range []string{
+		`{"99":500}`,
+		`{"0504":500}`,
+		`{"+504":500}`,
+		`{"500":600}`,
+		`{"500":"not-a-status"}`,
+		`[]`,
+	} {
+		_, err := ValidateStatusCodeMapping(mapping)
+		require.Error(t, err, mapping)
+	}
+}
+
+func TestNewStatusCodeMappingRisksOnlyReturnsNewMappings(t *testing.T) {
+	risks, err := NewStatusCodeMappingRisks(
+		`{"504":500}`,
+		`{"504":500,"524":429}`,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []StatusCodeMappingRisk{{From: 524, To: 429}}, risks)
+}
+
 func TestRelayErrorHandlerOmitsInvalidJSONBodyFromErrorAndLog(t *testing.T) {
 	withDebugEnabled(t, false)
 

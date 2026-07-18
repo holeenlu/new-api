@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -64,6 +65,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	engine.Use(func(turn *gin.Context) {
 		if pinnedChannelID > 0 {
 			common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(pinnedChannelID))
+			service.DisableSubscriptionOAuthRetry(turn)
 		}
 		turn.Next()
 	})

@@ -85,3 +85,23 @@ func TestIsAlwaysSkipRetryStatusCode(t *testing.T) {
 	require.True(t, IsAlwaysSkipRetryStatusCode(524))
 	require.False(t, IsAlwaysSkipRetryStatusCode(500))
 }
+
+func TestAutomaticRetryStatusCodesFromStringRemovesHighRiskTimeouts(t *testing.T) {
+	orig := AutomaticRetryStatusCodeRanges
+	t.Cleanup(func() { AutomaticRetryStatusCodeRanges = orig })
+
+	require.NoError(t, AutomaticRetryStatusCodesFromString("500-599"))
+	require.Equal(t, []StatusCodeRange{
+		{Start: 500, End: 503},
+		{Start: 505, End: 523},
+		{Start: 525, End: 599},
+	}, AutomaticRetryStatusCodeRanges)
+	require.False(t, ShouldRetryByStatusCode(504))
+	require.False(t, ShouldRetryByStatusCode(524))
+}
+
+func TestNormalizeAutomaticRetryStatusCodes(t *testing.T) {
+	normalized, err := NormalizeAutomaticRetryStatusCodes("500-599,429")
+	require.NoError(t, err)
+	require.Equal(t, "429,500-503,505-523,525-599", normalized)
+}

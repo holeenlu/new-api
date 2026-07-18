@@ -283,6 +283,49 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 	assert.NotContains(t, body, "second")
 }
 
+func TestStreamScannerHandler_PreflightTimeoutWithoutCommittingResponse(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{Body: pr}
+	info := &relaycommon.RelayInfo{
+		DisablePing: true,
+		ChannelMeta: &relaycommon.ChannelMeta{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		StreamScannerHandlerWithPreflight(
+			c,
+			resp,
+			info,
+			20*time.Millisecond,
+			func() bool { return false },
+			func(data string, sr *StreamResult) {},
+		)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("preflight timeout did not stop the upstream stream")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	require.Error(t, info.StreamStatus.EndError)
+	assert.Contains(t, info.StreamStatus.EndError.Error(), "no semantic output")
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+}
+
 // ---------- Ping tests ----------
 
 func TestStreamScannerHandler_PingSentDuringSlowUpstream(t *testing.T) {

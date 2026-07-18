@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
@@ -32,6 +34,7 @@ func TestFetchUpstreamModels(t *testing.T) {
 
 func TestFetchUpstreamModelsClassifiesForbiddenResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "9")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"error":"access-token-secret"}`))
 	}))
@@ -42,5 +45,23 @@ func TestFetchUpstreamModelsClassifiesForbiddenResponse(t *testing.T) {
 	var apiErr *types.NewAPIError
 	require.True(t, errors.As(err, &apiErr))
 	require.Equal(t, types.ErrorCodeOAuthForbidden, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusForbidden, apiErr.GetUpstreamStatusCode())
+	require.Equal(t, 9*time.Second, apiErr.RetryAfter)
 	require.NotContains(t, err.Error(), "access-token-secret")
+}
+
+func TestFetchUpstreamModelsRejectsOversizedSuccessBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxCodexModelsBodyBytes+1)))
+	}))
+	defer server.Close()
+
+	_, err := FetchUpstreamModels(
+		context.Background(),
+		server.Client(),
+		server.URL,
+		`{"access_token":"access-token","account_id":"account-id"}`,
+	)
+
+	require.ErrorContains(t, err, "response exceeds")
 }

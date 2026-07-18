@@ -603,6 +603,32 @@ type AddChannelRequest struct {
 	MultiKeyMode              constant.MultiKeyMode `json:"multi_key_mode"`
 	BatchAddSetKeyPrefix2Name bool                  `json:"batch_add_set_key_prefix_2_name"`
 	Channel                   *model.Channel        `json:"channel"`
+	StatusCodeRiskConfirmed   bool                  `json:"status_code_risk_confirmed"`
+}
+
+func formatStatusCodeMappingRisks(risks []service.StatusCodeMappingRisk) []string {
+	items := make([]string, 0, len(risks))
+	for _, risk := range risks {
+		items = append(items, fmt.Sprintf("%d -> %d", risk.From, risk.To))
+	}
+	return items
+}
+
+func validateStatusCodeMappingRisk(original, current string, confirmed bool) ([]service.StatusCodeMappingRisk, error) {
+	risks, err := service.NewStatusCodeMappingRisks(original, current)
+	if err != nil {
+		return nil, err
+	}
+	if len(risks) == 0 {
+		return nil, nil
+	}
+	if confirmed {
+		return risks, nil
+	}
+	return nil, fmt.Errorf(
+		"504/524 状态码映射属于高风险配置，需要明确确认后保存：%s",
+		strings.Join(formatStatusCodeMappingRisks(risks), ", "),
+	)
 }
 
 func getVertexArrayKeys(keys string) ([]string, error) {
@@ -642,6 +668,22 @@ func AddChannel(c *gin.Context) {
 	err := c.ShouldBindJSON(&addChannelRequest)
 	if err != nil {
 		common.ApiError(c, err)
+		return
+	}
+	if addChannelRequest.Channel == nil {
+		common.ApiErrorMsg(c, "渠道不能为空")
+		return
+	}
+	statusCodeRisks, err := validateStatusCodeMappingRisk(
+		"",
+		addChannelRequest.Channel.GetStatusCodeMapping(),
+		addChannelRequest.StatusCodeRiskConfirmed,
+	)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
 		return
 	}
 
@@ -730,11 +772,16 @@ func AddChannel(c *gin.Context) {
 		return
 	}
 	service.ResetProxyClientCache()
-	recordManageAudit(c, "channel.create", map[string]interface{}{
+	auditParams := map[string]interface{}{
 		"name":  addChannelRequest.Channel.Name,
 		"type":  addChannelRequest.Channel.Type,
 		"count": len(channels),
-	})
+	}
+	if len(statusCodeRisks) > 0 {
+		auditParams["status_code_risk_confirmed"] = true
+		auditParams["status_code_risk_mappings"] = formatStatusCodeMappingRisks(statusCodeRisks)
+	}
+	recordManageAudit(c, "channel.create", auditParams)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -942,8 +989,9 @@ func DeleteChannelBatch(c *gin.Context) {
 
 type PatchChannel struct {
 	model.Channel
-	MultiKeyMode *string `json:"multi_key_mode"`
-	KeyMode      *string `json:"key_mode"` // 多key模式下密钥覆盖或者追加
+	MultiKeyMode            *string `json:"multi_key_mode"`
+	KeyMode                 *string `json:"key_mode"` // 多key模式下密钥覆盖或者追加
+	StatusCodeRiskConfirmed bool    `json:"status_code_risk_confirmed"`
 }
 
 type ChannelStatusRequest struct {
@@ -976,6 +1024,13 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
+	if _, err := service.ValidateStatusCodeMapping(channel.GetStatusCodeMapping()); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
 
 	// 使用统一的校验函数
 	if err := validateChannel(&channel.Channel, false); err != nil {
@@ -987,6 +1042,18 @@ func UpdateChannel(c *gin.Context) {
 	}
 	// Preserve existing ChannelInfo to ensure multi-key channels keep correct state even if the client does not send ChannelInfo in the request.
 	originChannel, err := model.GetChannelById(channel.Id, true)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	statusCodeRisks, err := validateStatusCodeMappingRisk(
+		originChannel.GetStatusCodeMapping(),
+		channel.GetStatusCodeMapping(),
+		channel.StatusCodeRiskConfirmed,
+	)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -1104,6 +1171,10 @@ func UpdateChannel(c *gin.Context) {
 	if channel.Group != originChannel.Group {
 		changedFields = append(changedFields, "group")
 	}
+	if _, submitted := requestData["status_code_mapping"]; submitted &&
+		channel.GetStatusCodeMapping() != originChannel.GetStatusCodeMapping() {
+		changedFields = append(changedFields, "status_code_mapping")
+	}
 	if channel.Type != originChannel.Type {
 		changedFields = append(changedFields, "type")
 	}
@@ -1113,11 +1184,16 @@ func UpdateChannel(c *gin.Context) {
 	if channel.Key != "" && channel.Key != originChannel.Key {
 		changedFields = append(changedFields, "key")
 	}
-	recordManageAudit(c, "channel.update", map[string]interface{}{
+	auditParams := map[string]interface{}{
 		"id":             channel.Id,
 		"name":           channel.Name,
 		"changed_fields": changedFields,
-	})
+	}
+	if len(statusCodeRisks) > 0 {
+		auditParams["status_code_risk_confirmed"] = true
+		auditParams["status_code_risk_mappings"] = formatStatusCodeMappingRisks(statusCodeRisks)
+	}
+	recordManageAudit(c, "channel.update", auditParams)
 	channel.Key = ""
 	clearChannelInfo(&channel.Channel)
 	c.JSON(http.StatusOK, gin.H{

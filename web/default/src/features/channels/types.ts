@@ -115,7 +115,7 @@ export interface ChannelDataPolicy {
   region?: string
   retention?: string
   training?: 'provider_default' | 'disabled' | 'enabled'
-  retry_isolation?: 'channel' | 'provider' | 'policy_group' | 'tag'
+  retry_isolation?: 'channel' | 'group' | 'provider' | 'policy_group' | 'tag'
   retry_policy_group?: string
 }
 
@@ -384,5 +384,6 @@ export interface AddChannelRequest {
   mode: 'single' | 'batch' | 'multi_to_single'
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
+  status_code_risk_confirmed?: boolean
   channel: Partial<Channel>
 }

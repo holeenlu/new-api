@@ -769,6 +769,7 @@ export function ChannelMutateDrawer({
   const currentDataRetention = form.watch('data_retention')
   const currentDataTraining = form.watch('data_training')
   const currentRetryIsolation = form.watch('retry_isolation')
+  const isSubscriptionOAuthChannel = currentType === 57 || currentType === 59
   const currentRetryPolicyGroup = form.watch('retry_policy_group')
   const currentUpstreamModelUpdateAutoSyncEnabled = form.watch(
     'upstream_model_update_auto_sync_enabled'
@@ -1626,6 +1627,8 @@ export function ChannelMutateDrawer({
   // Submit handler
   const onSubmit = useCallback(
     async (data: ChannelFormValues) => {
+      let statusCodeRiskConfirmed = false
+
       // Validate key is required when creating
       if (!isEditing && !data.key?.trim()) {
         form.setError('key', {
@@ -1671,6 +1674,7 @@ export function ChannelMutateDrawer({
         if (riskyRedirects.length > 0) {
           const confirmed = await confirmStatusCodeRisk(riskyRedirects)
           if (!confirmed) return
+          statusCodeRiskConfirmed = true
         }
       }
 
@@ -1722,7 +1726,10 @@ export function ChannelMutateDrawer({
         }
       }
 
-      await channelMutation.mutateAsync(data)
+      await channelMutation.mutateAsync({
+        ...data,
+        statusCodeRiskConfirmed,
+      })
     },
     [
       isEditing,
@@ -3968,7 +3975,9 @@ export function ChannelMutateDrawer({
                                     </Select>
                                     <FormDescription>
                                       {t(
-                                        'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.'
+                                        isSubscriptionOAuthChannel
+                                          ? 'Subscription OAuth automatic mode retries compatible channels in the selected group. Channel tags are metadata only.'
+                                          : 'Automatic mode retries channels with the same non-empty tag and matching data policy. Channels without a tag stay isolated.'
                                       )}
                                     </FormDescription>
                                     <FormMessage />

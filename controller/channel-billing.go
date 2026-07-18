@@ -22,6 +22,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const maxChannelManagementResponseBytes = 8 << 20
+
 // https://github.com/songquanpeng/one-api/issues/79
 
 type OpenAISubscriptionResponse struct {
@@ -167,11 +169,14 @@ func GetResponseBodyWithContext(ctx context.Context, method, url string, channel
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status code: %d", res.StatusCode)
+		return nil, service.RelayErrorHandler(ctx, res)
 	}
-	body, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxChannelManagementResponseBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxChannelManagementResponseBytes {
+		return nil, fmt.Errorf("upstream management response exceeds %d bytes", maxChannelManagementResponseBytes)
 	}
 	return body, nil
 }

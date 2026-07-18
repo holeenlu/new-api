@@ -16,6 +16,18 @@ deploy_die() {
   exit 1
 }
 
+deploy_flag_enabled() {
+  local name=$1
+  local default_value=${2:-false}
+  local value=${!name-}
+  [[ -n "$value" ]] || value=$default_value
+  case "$value" in
+    true | 1) return 0 ;;
+    false | 0) return 1 ;;
+    *) deploy_die "$name must be true, false, 1, or 0" ;;
+  esac
+}
+
 deploy_ensure_docker_cli() {
   if command -v docker >/dev/null 2>&1; then
     return

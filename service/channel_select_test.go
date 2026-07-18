@@ -25,6 +25,17 @@ func TestRetryParamCapacityFailureDoesNotConsumeUpstreamRetry(t *testing.T) {
 	require.Equal(t, 1, retryParam.AttemptIndex())
 }
 
+func TestNewRetryParamFreezesAutoEffectiveGroup(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(c, constant.ContextKeyAutoGroup, "vip")
+
+	retryParam := NewRetryParam(c, "auto", "gpt-test", "/v1/responses")
+	require.Equal(t, "vip", retryParam.EffectiveGroup)
+
+	common.SetContextKey(c, constant.ContextKeyAutoGroup, "default")
+	require.Equal(t, "vip", retryParam.EffectiveGroup)
+}
+
 func TestRetryParamCapacityCycleBackoffIsBounded(t *testing.T) {
 	retryParam := &RetryParam{}
 

@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,12 +9,14 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/service"
 )
 
 const (
 	codexModelsClientVersion = "0.144.0-alpha.4"
 	codexModelsUserAgent     = "codex_cli_rs/0.144.0-alpha.4 (Linux; amd64) Codex"
+	maxCodexModelsBodyBytes  = 1 << 20
 )
 
 type upstreamModel struct {
@@ -76,30 +77,18 @@ func FetchUpstreamModels(ctx context.Context, client *http.Client, baseURL strin
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, service.ApplyChannelErrorPolicy(
+			constant.ChannelTypeCodex,
+			service.RelayErrorHandler(ctx, resp),
+		)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCodexModelsBodyBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		detail := strings.TrimSpace(string(body))
-		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
-			detail = "upstream rejected the model discovery request"
-		}
-		if len(detail) > 512 {
-			detail = detail[:512]
-		}
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			return nil, types.NewErrorWithStatusCode(errors.New("OAuth credential is invalid or expired"), types.ErrorCodeOAuthUnauthorized, resp.StatusCode)
-		case http.StatusForbidden:
-			return nil, types.NewErrorWithStatusCode(errors.New("OAuth account is not permitted to discover models"), types.ErrorCodeOAuthForbidden, resp.StatusCode)
-		default:
-			return nil, types.NewErrorWithStatusCode(
-				fmt.Errorf("codex upstream model request failed: status=%d: %s", resp.StatusCode, common.RedactSensitiveCredentials(detail)),
-				types.ErrorCodeBadResponseStatusCode,
-				resp.StatusCode,
-			)
-		}
+	if len(body) > maxCodexModelsBodyBytes {
+		return nil, fmt.Errorf("codex upstream model response exceeds %d bytes", maxCodexModelsBodyBytes)
 	}
 
 	var payload upstreamModelsResponse

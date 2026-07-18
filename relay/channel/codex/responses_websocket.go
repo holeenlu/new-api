@@ -303,6 +303,7 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 	s.model = strings.TrimSpace(info.UpstreamModelName)
 	s.lease = lease
 	common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(info.ChannelId))
+	service.DisableSubscriptionOAuthRetry(c)
 	return nil
 }
 

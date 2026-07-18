@@ -54,9 +54,7 @@ IMAGE_ID=$(deploy_image_id "$IMAGE")
 
 deploy_log "Starting local PostgreSQL and Redis"
 for container in postgres redis; do
-  if ! docker inspect "$container" >/dev/null 2>&1; then
-    "${COMPOSE[@]}" up -d --no-build "$container"
-  fi
+  "${COMPOSE[@]}" up -d --no-build "$container"
   for ((attempt = 1; attempt <= 30; attempt++)); do
     health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)
     [[ "$health" == "healthy" ]] && break
@@ -118,6 +116,13 @@ fi
 if ! deploy_verify_relay_routes "${HEALTH_URL%/api/status}"; then
   rollback_local || true
   deploy_die "Local relay route verification failed"
+fi
+
+if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
+  deploy_log "Pruning dangling new-api Docker images locally"
+  if ! docker image prune --force --filter 'label=org.opencontainers.image.title=new-api'; then
+    deploy_log "Warning: local dangling image cleanup failed"
+  fi
 fi
 
 deploy_log "Local test environment ready: url=http://127.0.0.1:3000 image=${IMAGE_ID#sha256:}"

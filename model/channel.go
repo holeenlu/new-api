@@ -87,9 +87,18 @@ var channelSortColumns = map[string]string{
 func NewChannelSortOptions(sortBy string, sortOrder string, idSort bool) ChannelSortOptions {
 	normalizedSortBy := strings.ToLower(strings.TrimSpace(sortBy))
 	normalizedSortOrder := strings.ToLower(strings.TrimSpace(sortOrder))
-	if _, ok := channelSortColumns[normalizedSortBy]; !ok {
+	if normalizedSortBy == "" {
+		if !idSort {
+			normalizedSortBy = "name"
+			normalizedSortOrder = "asc"
+		}
+	} else if _, ok := channelSortColumns[normalizedSortBy]; !ok {
 		normalizedSortBy = ""
 		normalizedSortOrder = ""
+		if !idSort {
+			normalizedSortBy = "name"
+			normalizedSortOrder = "asc"
+		}
 	} else if normalizedSortOrder != "asc" {
 		normalizedSortOrder = "desc"
 	}
@@ -103,10 +112,16 @@ func NewChannelSortOptions(sortBy string, sortOrder string, idSort bool) Channel
 
 func (options ChannelSortOptions) Apply(query *gorm.DB) *gorm.DB {
 	if columnName, ok := channelSortColumns[options.SortBy]; ok {
-		return query.Order(clause.OrderByColumn{
+		query = query.Order(clause.OrderByColumn{
 			Column: clause.Column{Name: columnName},
 			Desc:   options.SortOrder != "asc",
 		})
+		if columnName != "id" {
+			query = query.Order(clause.OrderByColumn{
+				Column: clause.Column{Name: "id"},
+			})
+		}
+		return query
 	}
 	if options.IDSort {
 		return query.Order(clause.OrderByColumn{
@@ -122,7 +137,7 @@ func (options ChannelSortOptions) Apply(query *gorm.DB) *gorm.DB {
 
 func resolveChannelSortOptions(idSort bool, sortOptions []ChannelSortOptions) ChannelSortOptions {
 	if len(sortOptions) == 0 {
-		return NewChannelSortOptions("", "", idSort)
+		return ChannelSortOptions{IDSort: idSort}
 	}
 	options := sortOptions[0]
 	options.IDSort = options.IDSort || idSort
@@ -693,31 +708,37 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.SetOtherInfo(info)
 			return
 		}
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		setMultiKeyStatus(channel, keyIndex, status, reason)
+	}
+}
+
+func setMultiKeyStatus(channel *Channel, keyIndex, status int, reason string) {
+	if channel.ChannelInfo.MultiKeyStatusList == nil {
+		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if status == common.ChannelStatusEnabled {
+		delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
+	} else {
+		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
+		if channel.ChannelInfo.MultiKeyDisabledReason == nil {
+			channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
-		if status == common.ChannelStatusEnabled {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
-		} else {
-			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-				channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
-			}
-			if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-				channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
-			}
-			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+		if channel.ChannelInfo.MultiKeyDisabledTime == nil {
+			channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
-			channel.Status = common.ChannelStatusAutoDisabled
-			info := channel.GetOtherInfo()
-			info["status_reason"] = "All keys are disabled"
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-		} else if status == common.ChannelStatusEnabled {
-			channel.Status = common.ChannelStatusEnabled
-		}
+		channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
+		channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+	}
+	if !hasEnabledMultiKey(channel.GetKeys(), channel.ChannelInfo.MultiKeyStatusList) {
+		channel.Status = common.ChannelStatusAutoDisabled
+		info := channel.GetOtherInfo()
+		info["status_reason"] = "All keys are disabled"
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+	} else if status == common.ChannelStatusEnabled {
+		channel.Status = common.ChannelStatusEnabled
 	}
 }
 
@@ -998,6 +1019,8 @@ func (channel *Channel) ValidateSettings() error {
 	}
 	if channelOtherSettings.DataPolicy != nil &&
 		channelOtherSettings.DataPolicy.RetryIsolation == dto.RetryIsolationTag &&
+		channel.Type != constant.ChannelTypeCodex &&
+		channel.Type != constant.ChannelTypeClaudeCode &&
 		(channel.Tag == nil || strings.TrimSpace(*channel.Tag) == "") {
 		return fmt.Errorf("tag is required for tag retry isolation")
 	}

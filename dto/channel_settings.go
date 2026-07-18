@@ -23,6 +23,7 @@ type RetryIsolation string
 
 const (
 	RetryIsolationChannel     RetryIsolation = "channel"
+	RetryIsolationGroup       RetryIsolation = "group"
 	RetryIsolationProvider    RetryIsolation = "provider"
 	RetryIsolationPolicyGroup RetryIsolation = "policy_group"
 	RetryIsolationTag         RetryIsolation = "tag"
@@ -70,7 +71,7 @@ func (p *ChannelDataPolicy) Validate() error {
 		return fmt.Errorf("invalid data policy training value %q", p.Training)
 	}
 	switch p.RetryIsolation {
-	case "", RetryIsolationChannel, RetryIsolationProvider, RetryIsolationTag:
+	case "", RetryIsolationChannel, RetryIsolationGroup, RetryIsolationProvider, RetryIsolationTag:
 	case RetryIsolationPolicyGroup:
 		if strings.TrimSpace(p.RetryPolicyGroup) == "" {
 			return fmt.Errorf("retry_policy_group is required for policy_group retry isolation")
@@ -123,7 +124,7 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
-	DataPolicy                            *ChannelDataPolicy     `json:"data_policy,omitempty"`
+	DataPolicy                            *ChannelDataPolicy    `json:"data_policy,omitempty"`
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

@@ -6,13 +6,11 @@ x-default-logging: &default-logging
 
 services:
   new-api:
-    image: new-api:release-174
+    image: new-api:release-cc00-ai
     container_name: new-api
     restart: always
     logging: *default-logging
     command: --log-dir /app/logs
-    ports:
-      - "127.0.0.1:3001:3000"
     volumes:
       - ./data:/data
       - ./logs:/app/logs
@@ -23,8 +21,6 @@ services:
       REDIS_CONN_STRING: "${REDIS_CONN_STRING}"
       SESSION_SECRET: "${SESSION_SECRET}"
       CRYPTO_SECRET: "${CRYPTO_SECRET}"
-      SESSION_COOKIE_SECURE: "true"
-      SESSION_COOKIE_TRUSTED_URL: "${SESSION_COOKIE_TRUSTED_URL:-https://nextcode.buildtoconnect.com}"
       TZ: "${TZ:-UTC}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
@@ -117,29 +113,23 @@ services:
     networks:
       - new-api-network
 
-  caddy:
+  gateway:
     image: caddy:2-alpine
-    container_name: new-api-caddy
+    container_name: new-api-port-proxy
     restart: unless-stopped
     logging: *default-logging
     depends_on:
       new-api:
         condition: service_healthy
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - "192.168.172.80:3000:3000"
     volumes:
-      - ./Caddyfile.174.137.56.226:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - ./Caddyfile.192.168.172.80:/etc/caddy/Caddyfile:ro
     networks:
       - new-api-network
 
 volumes:
   pg_data:
-  caddy_data:
-  caddy_config:
 
 networks:
   new-api-network:

@@ -2,16 +2,20 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +47,77 @@ func TestGetResponseBodyWithContextHonorsCancellation(t *testing.T) {
 
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, requests.Load())
+}
+
+func TestGetResponseBodyWithContextPreservesUpstreamError(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"organization disabled"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetResponseBodyWithContext(context.Background(), http.MethodGet, server.URL, &model.Channel{}, http.Header{}, 0)
+
+	var apiError *types.NewAPIError
+	require.ErrorAs(t, err, &apiError)
+	require.Equal(t, http.StatusForbidden, apiError.GetUpstreamStatusCode())
+	require.Equal(t, 7*time.Second, apiError.RetryAfter)
+}
+
+func TestGetResponseBodyWithContextRejectsOversizedSuccessBody(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxChannelManagementResponseBytes+1)))
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetResponseBodyWithContext(
+		context.Background(),
+		http.MethodGet,
+		server.URL,
+		&model.Channel{},
+		http.Header{},
+		0,
+	)
+
+	require.ErrorContains(t, err, "management response exceeds")
+}
+
+func TestSubscriptionOAuthModelFetchErrorQuarantinesCredential(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+	key := `{"access_token":"token","account_id":"model-update-disabled"}`
+	channel := &model.Channel{
+		Type: constant.ChannelTypeCodex, Name: "codex", Key: key,
+		Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test",
+	}
+	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(&model.Ability{
+		Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true,
+	}).Error)
+	upstreamError := types.NewErrorWithStatusCode(
+		errors.New("OAuth credential is invalid or expired"),
+		types.ErrorCodeOAuthUnauthorized,
+		http.StatusUnauthorized,
+	)
+	upstreamError.UpstreamStatusCode = http.StatusUnauthorized
+
+	got := applySubscriptionOAuthModelFetchError(channel, key, upstreamError)
+
+	var gotAPIError *types.NewAPIError
+	require.ErrorAs(t, got, &gotAPIError)
+	require.Equal(t, types.ErrorCodeOAuthUnauthorized, gotAPIError.GetErrorCode())
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	require.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, 0, key)
+	_, capacityErr := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
+	require.True(t, service.IsSubscriptionOAuthCapacityError(capacityErr))
 }
 
 func TestBuildFetchModelsHeadersRejectsInvalidClaudeCodeToken(t *testing.T) {

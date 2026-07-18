@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
@@ -337,7 +338,7 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 			channel.GetSetting().Proxy,
 		)
 		if err != nil {
-			return nil, err
+			return nil, applySubscriptionOAuthModelFetchError(channel, key, err)
 		}
 		return normalizeModelNames(models), nil
 	}
@@ -427,7 +428,7 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 	}
 	body, err := GetResponseBodyWithContext(ctx, http.MethodGet, url, channel, headers, timeout)
 	if err != nil {
-		return nil, err
+		return nil, applySubscriptionOAuthModelFetchError(channel, key, err)
 	}
 
 	var result OpenAIModelsResponse
@@ -443,6 +444,32 @@ func fetchChannelUpstreamModelIDs(ctx context.Context, channel *model.Channel) (
 	})
 
 	return normalizeModelNames(ids), nil
+}
+
+func applySubscriptionOAuthModelFetchError(channel *model.Channel, key string, err error) error {
+	if channel == nil || err == nil ||
+		(channel.Type != constant.ChannelTypeCodex && channel.Type != constant.ChannelTypeClaudeCode) {
+		return err
+	}
+	var apiError *types.NewAPIError
+	if !errors.As(err, &apiError) {
+		return err
+	}
+	apiError = service.ApplyChannelErrorPolicy(channel.Type, apiError)
+	if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, apiError) {
+		service.QuarantineSubscriptionOAuthCredential(
+			*types.NewChannelError(
+				channel.Id,
+				channel.Type,
+				channel.Name,
+				channel.ChannelInfo.IsMultiKey,
+				key,
+				channel.GetAutoBan(),
+			),
+			apiError,
+		)
+	}
+	return apiError
 }
 
 func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {

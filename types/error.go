@@ -67,6 +67,7 @@ const (
 	ErrorCodeUpstreamQuotaExhausted       ErrorCode = "upstream_quota_exhausted"
 	ErrorCodeUpstreamRateLimited          ErrorCode = "upstream_rate_limited"
 	ErrorCodeModelNotSupported            ErrorCode = "model_not_supported"
+	ErrorCodeModelAtCapacity              ErrorCode = "model_at_capacity"
 
 	// client request error
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"

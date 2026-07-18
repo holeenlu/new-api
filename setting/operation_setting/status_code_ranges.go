@@ -55,7 +55,7 @@ func ShouldDisableByStatusCode(code int) bool {
 }
 
 func AutomaticRetryStatusCodesToString() string {
-	return statusCodeRangesToString(AutomaticRetryStatusCodeRanges)
+	return statusCodeRangesToString(removeAlwaysSkipRetryStatusCodes(AutomaticRetryStatusCodeRanges))
 }
 
 func AutomaticRetryStatusCodesFromString(s string) error {
@@ -63,8 +63,41 @@ func AutomaticRetryStatusCodesFromString(s string) error {
 	if err != nil {
 		return err
 	}
-	AutomaticRetryStatusCodeRanges = ranges
+	AutomaticRetryStatusCodeRanges = removeAlwaysSkipRetryStatusCodes(ranges)
 	return nil
+}
+
+func NormalizeAutomaticRetryStatusCodes(s string) (string, error) {
+	ranges, err := ParseHTTPStatusCodeRanges(s)
+	if err != nil {
+		return "", err
+	}
+	return statusCodeRangesToString(removeAlwaysSkipRetryStatusCodes(ranges)), nil
+}
+
+func removeAlwaysSkipRetryStatusCodes(ranges []StatusCodeRange) []StatusCodeRange {
+	filtered := make([]StatusCodeRange, 0, len(ranges))
+	for _, current := range ranges {
+		segments := []StatusCodeRange{current}
+		for skipped := range alwaysSkipRetryStatusCodes {
+			next := make([]StatusCodeRange, 0, len(segments)+1)
+			for _, segment := range segments {
+				if skipped < segment.Start || skipped > segment.End {
+					next = append(next, segment)
+					continue
+				}
+				if segment.Start < skipped {
+					next = append(next, StatusCodeRange{Start: segment.Start, End: skipped - 1})
+				}
+				if skipped < segment.End {
+					next = append(next, StatusCodeRange{Start: skipped + 1, End: segment.End})
+				}
+			}
+			segments = next
+		}
+		filtered = append(filtered, segments...)
+	}
+	return filtered
 }
 
 func IsAlwaysSkipRetryStatusCode(code int) bool {

@@ -46,7 +46,7 @@ func NewStreamScanner(reader io.Reader) *bufio.Scanner {
 	return scanner
 }
 
-func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
+func CopyCodexSSEHeaders(c *gin.Context, resp *http.Response) {
 	if c == nil || c.Writer == nil || resp == nil {
 		return
 	}
@@ -75,6 +75,31 @@ func ExtendWriteDeadline(c *gin.Context) {
 }
 
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+	streamScannerHandler(c, resp, info, 0, nil, dataHandler)
+}
+
+// StreamScannerHandlerWithPreflight delays upstream headers and keepalives until
+// the adapter reports semantic output. The timeout ends an idle preflight so the
+// caller can safely retry without exposing state from the failed upstream.
+func StreamScannerHandlerWithPreflight(
+	c *gin.Context,
+	resp *http.Response,
+	info *relaycommon.RelayInfo,
+	preflightTimeout time.Duration,
+	preflightComplete func() bool,
+	dataHandler func(data string, sr *StreamResult),
+) {
+	streamScannerHandler(c, resp, info, preflightTimeout, preflightComplete, dataHandler)
+}
+
+func streamScannerHandler(
+	c *gin.Context,
+	resp *http.Response,
+	info *relaycommon.RelayInfo,
+	preflightTimeout time.Duration,
+	preflightComplete func() bool,
+	dataHandler func(data string, sr *StreamResult),
+) {
 
 	if resp == nil || dataHandler == nil {
 		return
@@ -141,7 +166,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	scanner.Split(bufio.ScanLines)
-	copyCodexSSEHeaders(c, resp)
+	if preflightComplete == nil {
+		CopyCodexSSEHeaders(c, resp)
+	}
 	SetEventStreamHeaders(c)
 
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
@@ -169,12 +196,20 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				select {
 				case <-pingTicker.C:
 					var err error
+					ready := true
 					func() {
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
+						if preflightComplete != nil && !preflightComplete() {
+							ready = false
+							return
+						}
 						ExtendWriteDeadline(c)
 						err = PingData(c)
 					}()
+					if !ready {
+						continue
+					}
 					if err != nil {
 						logger.LogError(c, "ping data error: "+err.Error())
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
@@ -192,6 +227,29 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					logger.LogError(c, "ping goroutine max duration reached")
 					return
 				}
+			}
+		})
+	}
+
+	if preflightComplete != nil && preflightTimeout > 0 {
+		wg.Add(1)
+		gopool.Go(func() {
+			defer wg.Done()
+			timer := time.NewTimer(preflightTimeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				writeMutex.Lock()
+				defer writeMutex.Unlock()
+				if preflightComplete() {
+					return
+				}
+				err := fmt.Errorf("upstream stream produced no semantic output within %s", preflightTimeout)
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, err)
+				stop()
+			case <-ctx.Done():
+			case <-stopChan:
+			case <-c.Request.Context().Done():
 			}
 		})
 	}

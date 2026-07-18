@@ -403,7 +403,7 @@ docker run --name new-api -d --restart always \
 
 **Retry configuration:** `Settings → Operation Settings → General Settings → Failure Retry Count`
 
-Automatic retry uses channels with the same non-empty tag and identical provider, data region, retention, and training policy. Channels without a tag remain isolated to the current channel. Administrators can select stricter or broader retry scopes under **Data governance** in the channel editor.
+Subscription OAuth channels freeze the request's first effective group and retry only compatible channels in that group; channel tags are management metadata and do not affect subscription routing. Other channel types keep the configured retry isolation rules, including same-tag automatic isolation. Administrators can select stricter scopes under **Data governance** in the channel editor.
 
 Every API response discloses the active processing policy through `X-Relay-Upstream-Provider`, `X-Relay-Attempt`, `X-Relay-Retry-Count`, `X-Relay-Retry-Isolation`, `X-Relay-Data-Region`, `X-Relay-Data-Retention`, and `X-Relay-Data-Training`.
 

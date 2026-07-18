@@ -43,6 +43,10 @@ type UseChannelMutateFormParams = {
   onSuccess: () => void
 }
 
+type ChannelFormSubmission = ChannelFormValues & {
+  statusCodeRiskConfirmed?: boolean
+}
+
 const SENSITIVE_UPDATE_FIELDS = [
   'type',
   'key',
@@ -90,11 +94,12 @@ export function useChannelMutateForm(props: UseChannelMutateFormParams) {
   )
 
   return useMutation({
-    mutationFn: async (data: ChannelFormValues): Promise<string> => {
+    mutationFn: async (data: ChannelFormSubmission): Promise<string> => {
       if (props.isEditing && props.currentRow) {
         const payload = transformFormDataToUpdatePayload(
           data,
-          props.currentRow.id
+          props.currentRow.id,
+          data.statusCodeRiskConfirmed
         )
         if (!data.key?.trim()) {
           delete payload.key
@@ -125,7 +130,10 @@ export function useChannelMutateForm(props: UseChannelMutateFormParams) {
         return SUCCESS_MESSAGES.UPDATED
       }
 
-      const payload = transformFormDataToCreatePayload(data)
+      const payload = transformFormDataToCreatePayload(
+        data,
+        data.statusCodeRiskConfirmed
+      )
       const response = await createChannel(payload)
       if (!response.success) {
         throw new Error(response.message || t(ERROR_MESSAGES.CREATE_FAILED))

@@ -38,6 +38,8 @@ type RetryBoundary struct {
 	initialChannelID    int
 	initialType         int
 	initialTag          string
+	effectiveGroup      string
+	subscriptionOAuth   bool
 	policy              ResolvedChannelDataPolicy
 	usedChannelIDs      map[int]struct{}
 	usedKeyIndexes      map[int]map[int]struct{}
@@ -83,7 +85,10 @@ func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy 
 			policy.RetryPolicyGroup = ""
 		}
 	}
-	if policy.RetryIsolation == "" {
+	isSubscriptionOAuth := channel.Type == constant.ChannelTypeCodex || channel.Type == constant.ChannelTypeClaudeCode
+	if isSubscriptionOAuth && (policy.RetryIsolation == "" || policy.RetryIsolation == dto.RetryIsolationTag) {
+		policy.RetryIsolation = dto.RetryIsolationGroup
+	} else if policy.RetryIsolation == "" {
 		if strings.TrimSpace(channel.GetTag()) != "" {
 			policy.RetryIsolation = dto.RetryIsolationTag
 		} else {
@@ -111,14 +116,23 @@ func normalizedUpstreamEndpoint(rawURL string) string {
 	return parsed.String()
 }
 
-func NewRetryBoundary(channel *model.Channel) *RetryBoundary {
+func NewRetryBoundary(channel *model.Channel, effectiveGroup string) *RetryBoundary {
 	if channel == nil {
 		return nil
+	}
+	effectiveGroup = model.NormalizeChannelGroupFilter(effectiveGroup)
+	if effectiveGroup == "" {
+		groups := channel.GetGroups()
+		if len(groups) == 1 {
+			effectiveGroup = groups[0]
+		}
 	}
 	return &RetryBoundary{
 		initialChannelID:    channel.Id,
 		initialType:         channel.Type,
 		initialTag:          strings.TrimSpace(channel.GetTag()),
+		effectiveGroup:      effectiveGroup,
+		subscriptionOAuth:   channel.Type == constant.ChannelTypeCodex || channel.Type == constant.ChannelTypeClaudeCode,
 		policy:              ResolveChannelDataPolicy(channel),
 		usedChannelIDs:      make(map[int]struct{}),
 		usedKeyIndexes:      make(map[int]map[int]struct{}),
@@ -126,6 +140,17 @@ func NewRetryBoundary(channel *model.Channel) *RetryBoundary {
 		failedCredentials:   make(map[string]struct{}),
 		capacityAttempts:    make(map[string]map[int]map[int]struct{}),
 	}
+}
+
+func (b *RetryBoundary) EffectiveGroup() string {
+	if b == nil {
+		return ""
+	}
+	return b.effectiveGroup
+}
+
+func (b *RetryBoundary) IsSubscriptionOAuth() bool {
+	return b != nil && b.subscriptionOAuth
 }
 
 func (b *RetryBoundary) MarkAttempt(channel *model.Channel, multiKeyIndex ...int) {
@@ -254,6 +279,9 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 	if b == nil || channel == nil || channel.Status != common.ChannelStatusEnabled {
 		return false
 	}
+	if b.subscriptionOAuth && (channel.Type != b.initialType || !channelBelongsToGroup(channel, b.effectiveGroup)) {
+		return false
+	}
 	candidate := ResolveChannelDataPolicy(channel)
 	if candidate.Provider != b.policy.Provider || candidate.Region != b.policy.Region ||
 		candidate.Retention != b.policy.Retention || candidate.Training != b.policy.Training {
@@ -261,6 +289,10 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 	}
 	allowedByPolicy := false
 	switch b.policy.RetryIsolation {
+	case dto.RetryIsolationChannel:
+		allowedByPolicy = channel.Id == b.initialChannelID
+	case dto.RetryIsolationGroup:
+		allowedByPolicy = b.subscriptionOAuth && candidate.RetryIsolation == dto.RetryIsolationGroup
 	case dto.RetryIsolationProvider:
 		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationProvider &&
 			channel.Type == b.initialType && candidate.Endpoint == b.policy.Endpoint
@@ -268,11 +300,11 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationPolicyGroup &&
 			b.policy.RetryPolicyGroup != "" && candidate.RetryPolicyGroup == b.policy.RetryPolicyGroup
 	case dto.RetryIsolationTag:
-		allowedByPolicy = candidate.RetryIsolation == dto.RetryIsolationTag &&
+		allowedByPolicy = !b.subscriptionOAuth && candidate.RetryIsolation == dto.RetryIsolationTag &&
 			channel.Type == b.initialType && b.initialTag != "" &&
 			b.initialTag == strings.TrimSpace(channel.GetTag())
 	default:
-		allowedByPolicy = channel.Id == b.initialChannelID && channel.ChannelInfo.IsMultiKey
+		allowedByPolicy = false
 	}
 	if !allowedByPolicy {
 		return false
@@ -284,6 +316,18 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 		return channel.ChannelInfo.IsMultiKey && b.hasUntriedEnabledKey(channel)
 	}
 	return true
+}
+
+func channelBelongsToGroup(channel *model.Channel, group string) bool {
+	if channel == nil || strings.TrimSpace(group) == "" {
+		return false
+	}
+	for _, candidate := range channel.GetGroups() {
+		if candidate == group {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *RetryBoundary) hasEligibleSubscriptionOAuthCredential(channel *model.Channel) bool {

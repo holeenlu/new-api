@@ -44,7 +44,18 @@ const (
 	subscriptionOAuthRecoveryContextKey   = "subscription_oauth_capacity_recovery_probe"
 	subscriptionOAuthLeaseContextKey      = "subscription_oauth_capacity_lease"
 	subscriptionOAuthResponseContextKey   = "subscription_oauth_response_scoped"
+	subscriptionOAuthRetryDisabledKey     = "subscription_oauth_retry_disabled"
 )
+
+func DisableSubscriptionOAuthRetry(c *gin.Context) {
+	if c != nil {
+		c.Set(subscriptionOAuthRetryDisabledKey, true)
+	}
+}
+
+func IsSubscriptionOAuthRetryDisabled(c *gin.Context) bool {
+	return c != nil && c.GetBool(subscriptionOAuthRetryDisabledKey)
+}
 
 func BindSubscriptionOAuthLease(c *gin.Context, lease *SubscriptionOAuthLease) {
 	if c == nil || lease == nil {

@@ -189,13 +189,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
-	retryParam := &service.RetryParam{
-		Ctx:         c,
-		TokenGroup:  relayInfo.TokenGroup,
-		ModelName:   relayInfo.OriginModelName,
-		RequestPath: c.Request.URL.Path,
-		Retry:       common.GetPointer(0),
-	}
+	retryParam := service.NewRetryParam(c, relayInfo.TokenGroup, relayInfo.OriginModelName, c.Request.URL.Path)
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
@@ -328,13 +322,17 @@ func shouldContinueSubscriptionOAuthRetry(
 	}
 	accountUnavailable := service.IsSubscriptionOAuthAccountUnavailable(c.GetInt("channel_type"), apiError)
 	modelUnavailable := service.IsSubscriptionOAuthModelUnavailable(c.GetInt("channel_type"), apiError)
-	if accountUnavailable || modelUnavailable {
+	modelAtCapacity := service.IsSubscriptionOAuthModelAtCapacity(c.GetInt("channel_type"), apiError)
+	if accountUnavailable || modelUnavailable || modelAtCapacity {
 		if accountUnavailable {
 			retryParam.HandleSubscriptionOAuthAccountUnavailable()
 		} else if !c.Writer.Written() {
 			retryParam.HandleSubscriptionOAuthModelUnavailable()
 		}
 		if c.Writer.Written() {
+			return false
+		}
+		if service.IsSubscriptionOAuthRetryDisabled(c) {
 			return false
 		}
 		if _, specificChannel := c.Get("specific_channel_id"); specificChannel {
@@ -351,7 +349,7 @@ func shouldContinueSubscriptionOAuthRetry(
 			written,
 			responseStarted,
 			info.HasUpstreamFailureResponse(),
-			c.Writer.Written(),
+			c.Writer.Written() || service.IsSubscriptionOAuthRetryDisabled(c),
 			statusCode,
 			apiError.RetryAfter,
 		) != service.SubscriptionOAuthRetryStop
@@ -360,7 +358,10 @@ func shouldContinueSubscriptionOAuthRetry(
 		return false
 	}
 	if service.IsSubscriptionOAuthConcurrencyLimit(c.GetInt("channel_type"), apiError) {
-		return true
+		return !service.IsSubscriptionOAuthRetryDisabled(c)
+	}
+	if service.IsSubscriptionOAuthRetryDisabled(c) {
+		return false
 	}
 	written, responseStarted := info.UpstreamAttemptState()
 	return retryParam.DecideSubscriptionOAuthRetry(
@@ -402,7 +403,7 @@ func applySubscriptionOAuthCapacityFailover(channel *model.Channel, apiError *ty
 
 func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) bool {
 	if retryParam.Boundary == nil {
-		retryParam.Boundary = service.NewRetryBoundary(channel)
+		retryParam.Boundary = service.NewRetryBoundary(channel, retryParam.EffectiveGroup)
 		if retryParam.Boundary != nil {
 			retryParam.CandidateFilter = retryParam.Boundary.Allows
 		}
@@ -562,20 +563,30 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if types.IsSkipRetryError(openaiErr) {
 		return false
 	}
-	if service.IsSubscriptionOAuthTransientError(c.GetInt("channel_type"), openaiErr) {
-		return true
-	}
-	if retryTimes <= 0 {
+	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
 	}
 	code := openaiErr.StatusCode
 	if code >= 200 && code < 300 {
 		return false
 	}
-	if code < 100 || code > 599 {
+	upstreamCode := openaiErr.GetUpstreamStatusCode()
+	if operation_setting.IsAlwaysSkipRetryStatusCode(code) {
+		return false
+	}
+	// A channel mapping is an explicit high-risk override. Respect its mapped
+	// retry policy, but never let a raw 504/524 bypass the global guard.
+	if upstreamCode != 0 && upstreamCode != code &&
+		!operation_setting.ShouldRetryByStatusCode(code) {
+		return false
+	}
+	if service.IsSubscriptionOAuthTransientError(c.GetInt("channel_type"), openaiErr) {
 		return true
 	}
-	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
+	if retryTimes <= 0 {
+		return false
+	}
+	if code < 100 || code > 599 {
 		return false
 	}
 	return operation_setting.ShouldRetryByStatusCode(code)
@@ -626,6 +637,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		if credentialPath := c.GetStringSlice("subscription_oauth_credential_path"); len(credentialPath) > 0 {
 			adminInfo["subscription_oauth_credential_path"] = credentialPath
 			adminInfo["subscription_oauth_credential_fp"] = c.GetString("subscription_oauth_credential_fp")
+			adminInfo["subscription_oauth_effective_group"] = c.GetString("subscription_oauth_retry_group")
 		}
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
 		if isMultiKey {
@@ -753,13 +765,7 @@ func RelayTask(c *gin.Context) {
 		}
 	}()
 
-	retryParam := &service.RetryParam{
-		Ctx:         c,
-		TokenGroup:  relayInfo.TokenGroup,
-		ModelName:   relayInfo.OriginModelName,
-		RequestPath: c.Request.URL.Path,
-		Retry:       common.GetPointer(0),
-	}
+	retryParam := service.NewRetryParam(c, relayInfo.TokenGroup, relayInfo.OriginModelName, c.Request.URL.Path)
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		var channel *model.Channel
@@ -877,31 +883,8 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
-	if taskErr.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-	if taskErr.StatusCode == 307 {
-		return true
-	}
-	if taskErr.StatusCode/100 == 5 {
-		// 超时不重试
-		if operation_setting.IsAlwaysSkipRetryStatusCode(taskErr.StatusCode) {
-			return false
-		}
-		return true
-	}
-	if taskErr.StatusCode == http.StatusBadRequest {
-		return false
-	}
-	if taskErr.StatusCode == 408 {
-		// azure处理超时不重试
-		return false
-	}
 	if taskErr.LocalError {
 		return false
 	}
-	if taskErr.StatusCode/100 == 2 {
-		return false
-	}
-	return true
+	return operation_setting.ShouldRetryByStatusCode(taskErr.StatusCode)
 }

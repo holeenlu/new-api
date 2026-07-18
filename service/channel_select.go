@@ -17,6 +17,7 @@ type RetryParam struct {
 	TokenGroup      string
 	ModelName       string
 	RequestPath     string
+	EffectiveGroup  string
 	Retry           *int
 	CandidateFilter model.ChannelCandidateFilter
 	Boundary        *RetryBoundary
@@ -29,6 +30,30 @@ type RetryParam struct {
 	capacitySeen    map[string]struct{}
 	capacityReplay  bool
 	capacityCursor  int
+}
+
+const subscriptionOAuthRetryGroupContextKey = "subscription_oauth_retry_group"
+
+func NewRetryParam(c *gin.Context, tokenGroup, modelName, requestPath string) *RetryParam {
+	effectiveGroup := model.NormalizeChannelGroupFilter(tokenGroup)
+	if c != nil {
+		if tokenGroup == "auto" {
+			effectiveGroup = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
+		} else if effectiveGroup == "" {
+			effectiveGroup = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+		}
+		if effectiveGroup != "" {
+			c.Set(subscriptionOAuthRetryGroupContextKey, effectiveGroup)
+		}
+	}
+	return &RetryParam{
+		Ctx:            c,
+		TokenGroup:     tokenGroup,
+		ModelName:      modelName,
+		RequestPath:    requestPath,
+		EffectiveGroup: effectiveGroup,
+		Retry:          common.GetPointer(0),
+	}
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -176,6 +201,14 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	var err error
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
+	if param.Boundary != nil && param.Boundary.IsSubscriptionOAuth() {
+		selectGroup = param.Boundary.EffectiveGroup()
+		if selectGroup == "" {
+			return nil, selectGroup, errors.New("subscription OAuth retry group is unavailable")
+		}
+		channel, err = model.GetRandomSatisfiedChannel(selectGroup, param.ModelName, 0, param.RequestPath, param.CandidateFilter)
+		return channel, selectGroup, err
+	}
 
 	if param.TokenGroup == "auto" {
 		if len(setting.GetAutoGroups()) == 0 {

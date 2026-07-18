@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -16,6 +18,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const maxResponsesStreamPreflightBytes = 64 << 10
+
+const responsesStreamPreflightTimeout = 30 * time.Second
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
@@ -79,8 +85,35 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	var usage = &dto.Usage{}
 	var responseTextBuilder strings.Builder
+	type pendingStreamEvent struct {
+		response dto.ResponsesStreamResponse
+		data     string
+	}
+	pendingEvents := make([]pendingStreamEvent, 0, 2)
+	pendingBytes := 0
+	var downstreamCommitted atomic.Bool
+	isSubscriptionOAuth := relaycommon.IsSubscriptionOAuthChannel(info.ChannelType)
+	if !isSubscriptionOAuth {
+		downstreamCommitted.Store(true)
+	}
+	var preflightError *types.NewAPIError
 
-	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+	flushPendingEvents := func() {
+		for _, event := range pendingEvents {
+			sendResponsesStreamData(c, event.response, event.data)
+		}
+		pendingEvents = pendingEvents[:0]
+		pendingBytes = 0
+	}
+	commitPreflight := func() {
+		if downstreamCommitted.Swap(true) {
+			return
+		}
+		helper.CopyCodexSSEHeaders(c, resp)
+		flushPendingEvents()
+	}
+
+	handleStreamData := func(data string, sr *helper.StreamResult) {
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
@@ -89,7 +122,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
-		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed":
 			if streamResponse.Response != nil {
@@ -115,22 +147,92 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 		case "response.output_text.delta":
-			// 处理输出文本
 			responseTextBuilder.WriteString(streamResponse.Delta)
 		case dto.ResponsesOutputTypeItemDone:
-			// 函数调用处理
-			if streamResponse.Item != nil {
-				switch streamResponse.Item.Type {
-				case dto.BuildInCallWebSearchCall:
-					if info != nil && info.ResponsesUsageInfo != nil && info.ResponsesUsageInfo.BuiltInTools != nil {
-						if webSearchTool, exists := info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearchPreview]; exists && webSearchTool != nil {
-							webSearchTool.CallCount++
-						}
-					}
+			if streamResponse.Item != nil && streamResponse.Item.Type == dto.BuildInCallWebSearchCall &&
+				info != nil && info.ResponsesUsageInfo != nil && info.ResponsesUsageInfo.BuiltInTools != nil {
+				if webSearchTool, exists := info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearchPreview]; exists && webSearchTool != nil {
+					webSearchTool.CallCount++
 				}
 			}
 		}
-	})
+		if isSubscriptionOAuth {
+			streamError := streamResponse.GetOpenAIError()
+			if streamError != nil {
+				candidate := types.WithOpenAIError(*streamError, http.StatusTooManyRequests)
+				candidate.UpstreamStatusCode = http.StatusTooManyRequests
+				candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
+				if service.IsSubscriptionOAuthModelAtCapacity(info.ChannelType, candidate) {
+					info.MarkUpstreamFailureResponse()
+					if !downstreamCommitted.Load() {
+						preflightError = candidate
+						sr.Stop(candidate)
+						return
+					}
+					sr.Error(candidate)
+				}
+			}
+			if !downstreamCommitted.Load() {
+				switch streamResponse.Type {
+				case "response.created", "response.in_progress", "response.queued":
+					pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
+					pendingBytes += len(data)
+					if pendingBytes <= maxResponsesStreamPreflightBytes {
+						return
+					}
+					commitPreflight()
+					return
+				case "response.completed", "response.done":
+					pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
+					commitPreflight()
+					return
+				}
+				commitPreflight()
+			}
+		}
+		sendResponsesStreamData(c, streamResponse, data)
+	}
+	if isSubscriptionOAuth {
+		helper.StreamScannerHandlerWithPreflight(
+			c,
+			resp,
+			info,
+			responsesStreamPreflightTimeout,
+			func() bool { return downstreamCommitted.Load() },
+			handleStreamData,
+		)
+	} else {
+		helper.StreamScannerHandler(c, resp, info, handleStreamData)
+	}
+	if preflightError != nil {
+		helper.ClearEventStreamHeaders(c)
+		return nil, preflightError
+	}
+	if isSubscriptionOAuth && !downstreamCommitted.Load() && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason == relaycommon.StreamEndReasonScannerErr && info.StreamStatus.EndError != nil {
+		helper.ClearEventStreamHeaders(c)
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream stream failed before output: %w", info.StreamStatus.EndError),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+		)
+	}
+	if isSubscriptionOAuth && !downstreamCommitted.Load() && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason == relaycommon.StreamEndReasonTimeout {
+		helper.ClearEventStreamHeaders(c)
+		preflightErr := info.StreamStatus.EndError
+		if preflightErr == nil {
+			preflightErr = fmt.Errorf("upstream stream preflight timed out")
+		}
+		return nil, types.NewErrorWithStatusCode(
+			preflightErr,
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+		)
+	}
+	if len(pendingEvents) > 0 {
+		commitPreflight()
+	}
 
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量

@@ -169,6 +169,21 @@ func TestApplyChannelErrorPolicyClassifiesUnsupportedModel(t *testing.T) {
 	require.True(t, types.IsSkipRetryError(got))
 }
 
+func TestApplyChannelErrorPolicyClassifiesModelCapacitySeparatelyFromRateLimit(t *testing.T) {
+	err := types.NewOpenAIError(
+		errors.New("Selected model is at capacity. Please try a different model."),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+
+	got := ApplyChannelErrorPolicy(constant.ChannelTypeCodex, err)
+
+	require.Equal(t, types.ErrorCodeModelAtCapacity, got.GetErrorCode())
+	require.True(t, IsSubscriptionOAuthModelAtCapacity(constant.ChannelTypeCodex, got))
+	require.False(t, IsSubscriptionOAuthAccountUnavailable(constant.ChannelTypeCodex, got))
+	require.True(t, types.IsSkipRetryError(got))
+}
+
 func TestApplyChannelErrorPolicyClassifiesModelErrorCodeWithoutMessageHint(t *testing.T) {
 	err := types.NewOpenAIError(errors.New("resource unavailable"), types.ErrorCodeModelNotFound, http.StatusNotFound)
 
