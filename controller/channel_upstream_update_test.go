@@ -21,6 +21,7 @@ import (
 )
 
 func TestFetchModelsUsesSharedChannelFetchBehavior(t *testing.T) {
+	service.InitHttpClient()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			t.Errorf("unexpected path: %s", r.URL.Path)

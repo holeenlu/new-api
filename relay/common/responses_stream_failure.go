@@ -3,6 +3,7 @@ package common
 import "github.com/gin-gonic/gin"
 
 const responsesStreamPreflightFailureEventKey = "responses_stream_preflight_failure_event"
+const responsesStreamFailureEmittedKey = "responses_stream_failure_emitted"
 
 // SetResponsesStreamPreflightFailureEvent preserves a valid upstream
 // response.failed event until the retry loop has exhausted eligible OAuth
@@ -27,4 +28,14 @@ func ClearResponsesStreamPreflightFailureEvent(c *gin.Context) {
 	if c != nil {
 		c.Set(responsesStreamPreflightFailureEventKey, "")
 	}
+}
+
+func MarkResponsesStreamFailureEmitted(c *gin.Context) {
+	if c != nil {
+		c.Set(responsesStreamFailureEmittedKey, true)
+	}
+}
+
+func IsResponsesStreamFailureEmitted(c *gin.Context) bool {
+	return c != nil && c.GetBool(responsesStreamFailureEmittedKey)
 }

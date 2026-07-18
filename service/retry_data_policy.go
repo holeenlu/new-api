@@ -88,7 +88,7 @@ func ResolveChannelDataPolicy(channel *model.Channel) ResolvedChannelDataPolicy 
 			policy.RetryPolicyGroup = ""
 		}
 	}
-	isSubscriptionOAuth := channel.Type == constant.ChannelTypeCodex || channel.Type == constant.ChannelTypeClaudeCode
+	isSubscriptionOAuth := constant.IsSubscriptionOAuthChannel(channel.Type)
 	if isSubscriptionOAuth && (policy.RetryIsolation == "" || policy.RetryIsolation == dto.RetryIsolationTag) {
 		policy.RetryIsolation = dto.RetryIsolationGroup
 	} else if policy.RetryIsolation == "" {
@@ -135,7 +135,7 @@ func NewRetryBoundary(channel *model.Channel, effectiveGroup string) *RetryBound
 		initialType:         channel.Type,
 		initialTag:          strings.TrimSpace(channel.GetTag()),
 		effectiveGroup:      effectiveGroup,
-		subscriptionOAuth:   channel.Type == constant.ChannelTypeCodex || channel.Type == constant.ChannelTypeClaudeCode,
+		subscriptionOAuth:   constant.IsSubscriptionOAuthChannel(channel.Type),
 		policy:              ResolveChannelDataPolicy(channel),
 		usedChannelIDs:      make(map[int]struct{}),
 		usedKeyIndexes:      make(map[int]map[int]struct{}),
@@ -312,7 +312,7 @@ func (b *RetryBoundary) Allows(channel *model.Channel) bool {
 	if !allowedByPolicy {
 		return false
 	}
-	if b.initialType == constant.ChannelTypeCodex || b.initialType == constant.ChannelTypeClaudeCode {
+	if constant.IsSubscriptionOAuthChannel(b.initialType) {
 		return b.hasEligibleSubscriptionOAuthCredential(channel)
 	}
 	if _, used := b.usedChannelIDs[channel.Id]; used {

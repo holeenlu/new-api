@@ -435,6 +435,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	}
 
 	if info.IsStream {
+		info.ResponsesStreamEventTransform = normalizeCollaborationSpawnAgentModel
 		return openai.OaiResponsesStreamHandler(c, info, resp)
 	}
 	return openai.OaiResponsesHandler(c, info, resp)

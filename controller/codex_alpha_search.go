@@ -197,13 +197,12 @@ func CodexAlphaSearch(c *gin.Context) {
 			apiError = types.NewErrorWithStatusCode(requestErr, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
 		}
 		apiError = service.ApplyChannelErrorPolicy(channel.Type, apiError)
-		applySubscriptionOAuthCapacityFailover(channel, apiError, retryParam)
 		lastError = apiError
 		if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, apiError) {
 			logger.LogWarn(c, fmt.Sprintf(
 				"subscription OAuth capacity failover: channel=%d credential=%s",
 				channel.Id,
-				c.GetString("subscription_oauth_credential_fp"),
+				service.SubscriptionOAuthCredentialPreview(c),
 			))
 		} else {
 			processChannelError(c, *types.NewChannelError(

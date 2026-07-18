@@ -93,7 +93,7 @@ type upstreamResult struct {
 }
 
 func supportsUpstreamPricingSync(channelType int) bool {
-	return channelType != constant.ChannelTypeClaudeCode && channelType != constant.ChannelTypeCodex
+	return !constant.IsSubscriptionOAuthChannel(channelType)
 }
 
 func valueMap(value any) map[string]any {

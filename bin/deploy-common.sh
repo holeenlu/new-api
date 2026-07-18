@@ -325,3 +325,225 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" UPSTREAM_LOCATION_DISCOVERY_ENABLED true
   deploy_env_ensure "$env_file" UPSTREAM_LOCATION_DISCOVERY_TIMEOUT 8
 }
+
+deploy_server_main() {
+  : "${DEPLOY_NAME:?}" "${DEPLOY_SLUG:?}" "${DEPLOY_TARGET:?}" "${REMOTE_DIR:?}"
+  : "${COMPOSE_FILE:?}" "${CADDY_FILE:?}" "${PROXY_SERVICE:?}" "${TARGET_IMAGE:?}"
+  : "${ROLLBACK_IMAGE:?}" "${HEALTH_URL:?}" "${BUILD_IMAGE:?}"
+
+  local no_cache=${NO_CACHE:-false}
+  local goproxy=${GOPROXY:-https://goproxy.cn,direct}
+  local goproxy_fallback=${GOPROXY_FALLBACK:-https://proxy.golang.org,direct}
+  local local_archive remote_archive remote_lock remote_state control_path initial_env_file askpass_script
+  local ssh_master_active=false
+  local_archive=$(mktemp "${TMPDIR:-/tmp}/new-api-${DEPLOY_SLUG}.XXXXXX")
+  remote_archive="/tmp/new-api-${DEPLOY_SLUG}-$$.tar.gz"
+  remote_lock="$REMOTE_DIR/.deploy-lock-$DEPLOY_SLUG"
+  remote_state="$REMOTE_DIR/.deploy-state-$DEPLOY_SLUG.env"
+  control_path="/tmp/new-api-${DEPLOY_SLUG}-ssh-${UID}-$$"
+  initial_env_file=""
+  askpass_script=""
+
+  SSH_OPTIONS=(
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=15
+    -o ControlMaster=auto
+    -o ControlPersist=5m
+    -o ControlPath="$control_path"
+  )
+  if [[ -n "${DEPLOY_SSH_KEY:-}" ]]; then
+    [[ -r "$DEPLOY_SSH_KEY" ]] || deploy_die "Missing SSH deployment key: $DEPLOY_SSH_KEY"
+    SSH_OPTIONS=(-i "$DEPLOY_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_OPTIONS[@]}")
+  elif [[ -n "${SSHPASS:-}" ]]; then
+    export SSH_DEPLOY_PASSWORD=$SSHPASS
+    unset SSHPASS
+    askpass_script=$(mktemp "${TMPDIR:-/tmp}/new-api-${DEPLOY_SLUG}-askpass.XXXXXX")
+    chmod 700 "$askpass_script"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$SSH_DEPLOY_PASSWORD"' >"$askpass_script"
+  fi
+
+  ssh_remote() {
+    if [[ -n "$askpass_script" ]]; then
+      DISPLAY="${DISPLAY:-new-api-deploy}" SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force \
+        command ssh "${SSH_OPTIONS[@]}" "$@"
+      return
+    fi
+    command ssh "${SSH_OPTIONS[@]}" "$@"
+  }
+  scp_remote() {
+    if [[ -n "$askpass_script" ]]; then
+      DISPLAY="${DISPLAY:-new-api-deploy}" SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force \
+        command scp "${SSH_OPTIONS[@]}" "$@"
+      return
+    fi
+    command scp "${SSH_OPTIONS[@]}" "$@"
+  }
+  deploy_server_cleanup() {
+    if [[ "$ssh_master_active" == true ]]; then
+      ssh_remote "$DEPLOY_TARGET" "rm -f '$remote_archive'; rmdir '$remote_lock' 2>/dev/null || true" >/dev/null 2>&1 || true
+      ssh_remote -O exit "$DEPLOY_TARGET" >/dev/null 2>&1 || true
+    fi
+    rm -f "$askpass_script" "$control_path" "$local_archive" "$initial_env_file"
+  }
+  trap deploy_server_cleanup EXIT
+  trap 'exit 130' INT TERM
+
+  deploy_ensure_docker_cli
+  deploy_require_commands docker ssh scp gzip curl git sed awk tail od tr
+  docker info >/dev/null 2>&1 || deploy_die "Local Docker daemon is unavailable"
+  docker buildx version >/dev/null 2>&1 || deploy_die "Local docker buildx is unavailable"
+  for file in "$ROOT_DIR/$COMPOSE_FILE" "$ROOT_DIR/$CADDY_FILE"; do
+    [[ -f "$file" ]] || deploy_die "Missing deployment input: $file"
+  done
+
+  local app_version archive_sha remote_start_time version start_time status_json
+  app_version=$(deploy_build_version "$ROOT_DIR")
+  deploy_build_image "$ROOT_DIR" "$BUILD_IMAGE" linux/amd64 "$app_version" "$goproxy" "$goproxy_fallback" "$no_cache" \
+    || deploy_die "$DEPLOY_NAME local source build failed"
+  deploy_assert_image_platform "$BUILD_IMAGE" linux/amd64
+  deploy_assert_image_runs "$BUILD_IMAGE" "$app_version" linux/amd64
+  docker save "$BUILD_IMAGE" | gzip >"$local_archive"
+  [[ -s "$local_archive" ]] || deploy_die "$DEPLOY_NAME image archive is empty"
+  archive_sha=$(deploy_file_sha256 "$local_archive")
+
+  deploy_log "Connecting to $DEPLOY_NAME"
+  ssh_remote -MNf "$DEPLOY_TARGET"
+  ssh_master_active=true
+  ssh_remote "$DEPLOY_TARGET" "docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1" \
+    || deploy_die "Remote Docker is unavailable"
+  ssh_remote "$DEPLOY_TARGET" "mkdir -p '$REMOTE_DIR'"
+  if ! ssh_remote "$DEPLOY_TARGET" "test -f '$REMOTE_DIR/.env'"; then
+    if ! deploy_flag_enabled DEPLOY_INITIALIZE_ENV false; then
+      deploy_die "Remote .env is missing: $REMOTE_DIR/.env"
+    fi
+    initial_env_file=$(mktemp "${TMPDIR:-/tmp}/new-api-${DEPLOY_SLUG}-env.XXXXXX")
+    deploy_prepare_env_file "$initial_env_file"
+    scp_remote "$initial_env_file" "$DEPLOY_TARGET:$REMOTE_DIR/.env"
+    ssh_remote "$DEPLOY_TARGET" "chmod 600 '$REMOTE_DIR/.env'"
+  fi
+  ssh_remote "$DEPLOY_TARGET" "mkdir '$remote_lock' 2>/dev/null || { find '$remote_lock' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$remote_lock' && mkdir '$remote_lock'; }" \
+    || deploy_die "Another $DEPLOY_NAME deployment is active"
+
+  scp_remote "$ROOT_DIR/$COMPOSE_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$COMPOSE_FILE"
+  scp_remote "$ROOT_DIR/$CADDY_FILE" "$DEPLOY_TARGET:$REMOTE_DIR/$CADDY_FILE"
+  scp_remote "$local_archive" "$DEPLOY_TARGET:$remote_archive"
+
+  ssh_remote "$DEPLOY_TARGET" "bash -s -- '$REMOTE_DIR' '$COMPOSE_FILE' '$PROXY_SERVICE' '$remote_archive' '$BUILD_IMAGE' '$TARGET_IMAGE' '$ROLLBACK_IMAGE' '$archive_sha' '$app_version' '$remote_state' '${DEPLOY_DATABASE_BACKUP_ENABLED:-true}' '$DEPLOY_NAME'" <<'REMOTE_DEPLOY'
+set -Eeuo pipefail
+remote_dir=$1; compose_file=$2; proxy_service=$3; archive=$4; build_image=$5
+target_image=$6; rollback_image=$7; expected_sha=$8; expected_version=$9
+state_file=${10}; backup_enabled=${11}; deploy_name=${12}
+cd "$remote_dir"
+compose=(docker compose --env-file .env -f "$compose_file")
+switched=false; rollback_available=false
+file_sha256() { command -v sha256sum >/dev/null 2>&1 && sha256sum "$1" | awk '{print $1}' || shasum -a 256 "$1" | awk '{print $1}'; }
+wait_healthy() {
+  local container=$1 attempts=${2:-45} health
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)
+    [[ "$health" == healthy ]] && return 0
+    [[ "$health" != unhealthy && "$health" != exited && "$health" != dead ]] || return 1
+    sleep 2
+  done
+  return 1
+}
+wait_status() {
+  for ((attempt=1; attempt<=45; attempt++)); do
+    docker exec new-api wget -q -O - http://localhost:3000/api/status >/dev/null 2>&1 && return 0
+    state=$(docker inspect -f '{{.State.Status}}' new-api 2>/dev/null || true)
+    [[ "$state" != exited && "$state" != dead ]] || return 1
+    sleep 2
+  done
+  return 1
+}
+reload_proxy() {
+  "${compose[@]}" up -d --no-build --no-deps "$proxy_service" >/dev/null
+  "${compose[@]}" exec -T "$proxy_service" caddy reload --config /etc/caddy/Caddyfile </dev/null >/dev/null
+}
+rollback() {
+  [[ "$rollback_available" == true ]] || return 1
+  docker tag "$rollback_image" "$target_image"
+  "${compose[@]}" up -d --no-build --no-deps --force-recreate --remove-orphans new-api
+  wait_status
+  reload_proxy
+}
+finish() {
+  status=$?; trap - EXIT; rm -f "$archive"
+  if ((status != 0)) && [[ "$switched" == true ]]; then
+    rollback || echo "[deploy] Warning: $deploy_name rollback failed" >&2
+  fi
+  exit "$status"
+}
+trap finish EXIT
+
+[[ "$(file_sha256 "$archive")" == "$expected_sha" ]] || { echo "Transferred image checksum mismatch" >&2; exit 1; }
+"${compose[@]}" config -q
+for dependency in redis postgres; do
+  "${compose[@]}" up -d --no-build "$dependency"
+  wait_healthy "$dependency" 30
+done
+if [[ "$backup_enabled" == true || "$backup_enabled" == 1 ]]; then
+  mkdir -p backups
+  backup="backups/predeploy-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+  docker exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip >"$backup"
+  chmod 600 "$backup"
+  mapfile -t backups < <(find backups -maxdepth 1 -name 'predeploy-*.sql.gz' -type f | sort)
+  while ((${#backups[@]} > 3)); do rm -f "${backups[0]}"; backups=("${backups[@]:1}"); done
+fi
+if [[ -n "$("${compose[@]}" ps -q "$proxy_service")" ]]; then
+  "${compose[@]}" exec -T "$proxy_service" caddy validate --config /etc/caddy/Caddyfile </dev/null >/dev/null
+else
+  "${compose[@]}" run --rm --no-deps -T --entrypoint caddy "$proxy_service" validate --config /etc/caddy/Caddyfile </dev/null >/dev/null
+fi
+if docker inspect new-api >/dev/null 2>&1; then
+  previous_image=$(docker inspect -f '{{.Image}}' new-api)
+  if docker image inspect "$previous_image" >/dev/null 2>&1; then
+    docker tag "$previous_image" "$rollback_image"
+    rollback_available=true
+  fi
+fi
+gunzip -c "$archive" | docker load >/dev/null
+loaded_version=$(docker image inspect "$build_image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
+[[ "$loaded_version" == "$expected_version" ]] || { echo "Loaded image version mismatch" >&2; exit 1; }
+docker tag "$build_image" "$target_image"
+switched=true
+"${compose[@]}" up -d --no-build --no-deps --force-recreate --remove-orphans new-api
+wait_healthy new-api || { docker logs --tail 120 new-api >&2 || true; exit 1; }
+reload_proxy
+expected_image=$(docker image inspect "$target_image" --format '{{.Id}}')
+running_image=$(docker inspect -f '{{.Image}}' new-api)
+[[ "$expected_image" == "$running_image" ]] || { echo "Running image mismatch" >&2; exit 1; }
+status_json=$(docker exec new-api wget -q -O - http://localhost:3000/api/status)
+start_time=$(printf '%s' "$status_json" | sed -n 's/.*"start_time":\([0-9][0-9]*\).*/\1/p')
+version=$(printf '%s' "$status_json" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+[[ "$version" == "$expected_version" && "$start_time" =~ ^[0-9]+$ ]] || { echo "Running process identity mismatch" >&2; exit 1; }
+printf 'ARCHIVE_SHA256=%s\nAPP_VERSION=%s\nSTART_TIME=%s\n' "$expected_sha" "$version" "$start_time" >"$state_file"
+chmod 600 "$state_file"
+switched=false
+REMOTE_DEPLOY
+
+  remote_start_time=$(ssh_remote "$DEPLOY_TARGET" "sed -n 's/^START_TIME=//p' '$remote_state'")
+  version=""; start_time=""
+  for ((attempt=1; attempt<=30; attempt++)); do
+    if status_json=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 --header 'Cache-Control: no-cache' "$HEALTH_URL?deploy_check=$remote_start_time" 2>/dev/null); then
+      version=$(printf '%s' "$status_json" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+      start_time=$(printf '%s' "$status_json" | sed -n 's/.*"start_time":\([0-9][0-9]*\).*/\1/p')
+      [[ "$version" == "$app_version" && "$start_time" == "$remote_start_time" ]] && break
+    fi
+    sleep 2
+  done
+  if [[ "$version" != "$app_version" || "$start_time" != "$remote_start_time" ]] || ! deploy_verify_relay_routes "${HEALTH_URL%/api/status}"; then
+    ssh_remote "$DEPLOY_TARGET" "cd '$REMOTE_DIR' && docker image inspect '$ROLLBACK_IMAGE' >/dev/null && docker tag '$ROLLBACK_IMAGE' '$TARGET_IMAGE' && docker compose --env-file .env -f '$COMPOSE_FILE' up -d --no-build --no-deps --force-recreate --remove-orphans new-api" || true
+    deploy_die "$DEPLOY_NAME deployment verification failed"
+  fi
+  # Clean only obsolete deployment-managed files after the new release has
+  # passed both container and public endpoint verification.
+  ssh_remote "$DEPLOY_TARGET" "find '$REMOTE_DIR' -maxdepth 1 -type f \
+    \( -name 'docker-compose*.yml' -o -name 'Caddyfile*' \) \
+    ! -name '$COMPOSE_FILE' ! -name '$CADDY_FILE' -delete" \
+    || deploy_log "Warning: obsolete deployment file cleanup failed"
+  if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
+    ssh_remote "$DEPLOY_TARGET" "docker image prune --force --filter 'label=org.opencontainers.image.title=new-api'" || deploy_log "Warning: image cleanup failed"
+  fi
+  deploy_log "$DEPLOY_NAME deployment completed: version=$app_version start_time=$remote_start_time"
+}

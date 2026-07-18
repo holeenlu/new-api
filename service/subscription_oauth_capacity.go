@@ -119,8 +119,7 @@ func configuredSubscriptionOAuthFingerprints() (map[string]struct{}, error) {
 func subscriptionOAuthFingerprintsForChannels(channels []*model.Channel) map[string]struct{} {
 	fingerprints := make(map[string]struct{})
 	for _, channel := range channels {
-		if channel == nil ||
-			(channel.Type != constant.ChannelTypeCodex && channel.Type != constant.ChannelTypeClaudeCode) ||
+		if channel == nil || !constant.IsSubscriptionOAuthChannel(channel.Type) ||
 			strings.TrimSpace(channel.Key) == "" {
 			continue
 		}

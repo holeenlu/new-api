@@ -362,7 +362,7 @@ func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {
 	require.Contains(t, err.Error(), "cannot be overridden")
 }
 
-func TestProcessHeaderOverride_CodexRuntimeHeadersSkipProtectedIdentity(t *testing.T) {
+func TestProcessHeaderOverride_CodexRuntimeHeadersFilterProtectedIdentity(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -389,7 +389,7 @@ func TestProcessHeaderOverride_CodexRuntimeHeadersSkipProtectedIdentity(t *testi
 	require.NotContains(t, headers, "user-agent")
 	require.NotContains(t, headers, "x-openai-internal-codex-responses-lite")
 	require.NotContains(t, headers, "x-codex-beta-features")
-	require.Equal(t, "session-123", headers["session-id"])
+	require.NotContains(t, headers, "session-id")
 }
 
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {
@@ -409,6 +409,7 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 			"Session_id": "sess-123",
 		},
 		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeCodex,
 			ParamOverride: map[string]any{
 				"operations": []any{
 					map[string]any{
@@ -434,14 +435,14 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 
 	headers, err := processHeaderOverride(info, ctx)
 	require.NoError(t, err)
-	require.Equal(t, "Codex CLI", headers["originator"])
-	require.Equal(t, "sess-123", headers["session_id"])
+	require.NotContains(t, headers, "originator")
+	require.NotContains(t, headers, "session_id")
 	_, exists = headers["x-codex-beta-features"]
 	require.False(t, exists)
 
 	upstreamReq := httptest.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	applyHeaderOverrideToRequest(upstreamReq, headers)
-	require.Equal(t, "Codex CLI", upstreamReq.Header.Get("Originator"))
-	require.Equal(t, "sess-123", upstreamReq.Header.Get("Session_id"))
+	require.Empty(t, upstreamReq.Header.Get("Originator"))
+	require.Empty(t, upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
 }

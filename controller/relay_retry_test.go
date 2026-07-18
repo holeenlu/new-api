@@ -172,8 +172,13 @@ func TestCodexCapacityFailoverExcludesOnlySaturatedCredential(t *testing.T) {
 		0,
 		service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, "key-1"),
 	)
-	applySubscriptionOAuthCapacityFailover(initial, err, retryParam)
+	decision, _ := retryParam.DecideSubscriptionOAuthContinuation(service.SubscriptionOAuthRetryObservation{
+		ChannelType: initial.Type,
+		Error:       err,
+		Retryable:   true,
+	})
 
+	require.Equal(t, service.SubscriptionOAuthSwitchCredential, decision)
 	require.True(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(alternate))
 	require.Contains(t, boundary.ExcludedKeyIndexes(initial), 0)

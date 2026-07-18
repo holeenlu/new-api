@@ -376,6 +376,18 @@ func resolveClientModelMetadata(modelName string, codexModel bool, upstream map[
 	if profile, exists := model.GetOfficialModelMetadata(modelName); exists {
 		return profile
 	}
+	normalizedModelName := strings.ToLower(strings.TrimSpace(modelName))
+	if strings.HasPrefix(normalizedModelName, "claude-") {
+		for _, suffix := range []string{"-low", "-medium", "-high"} {
+			baseName, found := strings.CutSuffix(normalizedModelName, suffix)
+			if !found {
+				continue
+			}
+			if profile, exists := model.GetOfficialModelMetadata(baseName); exists {
+				return profile
+			}
+		}
+	}
 	if codexModel {
 		return defaultCodexClientModelMetadata
 	}

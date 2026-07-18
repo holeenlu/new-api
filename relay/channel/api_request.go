@@ -192,7 +192,8 @@ func stripSensitiveClientNetworkHeaders(header http.Header) {
 }
 
 func isClaudeCodeOAuthProtectedHeader(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	name = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
+	switch name {
 	case "authorization", "x-api-key", "anthropic-version", "anthropic-beta", "user-agent", "x-app", "host",
 		"session-id", "thread-id", "x-client-request-id", "x-session-id":
 		return true
@@ -202,7 +203,8 @@ func isClaudeCodeOAuthProtectedHeader(name string) bool {
 }
 
 func isCodexOAuthProtectedHeader(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	name = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
+	switch name {
 	case "authorization", "x-api-key", "chatgpt-account-id", "openai-beta", "originator", "user-agent", "content-type", "host",
 		"x-openai-internal-codex-responses-lite", "x-codex-beta-features", "session-id", "thread-id", "x-session-id",
 		"x-client-request-id", "x-codex-parent-thread-id", "x-codex-turn-state", "x-codex-turn-metadata",
@@ -585,7 +587,7 @@ func isSubscriptionOAuthResponseHeaderTimeout(err error, req *http.Request, info
 	if err == nil || req == nil || info == nil {
 		return false
 	}
-	if info.ChannelType != rootconstant.ChannelTypeCodex && info.ChannelType != rootconstant.ChannelTypeClaudeCode {
+	if !rootconstant.IsSubscriptionOAuthChannel(info.ChannelType) {
 		return false
 	}
 	// A canceled/deadline-exceeded client request is not an upstream header timeout.
@@ -600,7 +602,7 @@ func classifySubscriptionOAuthTransportError(err error, req *http.Request, info 
 	if err == nil || req == nil || info == nil {
 		return nil
 	}
-	if info.ChannelType != rootconstant.ChannelTypeCodex && info.ChannelType != rootconstant.ChannelTypeClaudeCode {
+	if !rootconstant.IsSubscriptionOAuthChannel(info.ChannelType) {
 		return nil
 	}
 	if req.Context().Err() != nil {
@@ -638,7 +640,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	var client *http.Client
 	var err error
 	if common2.SubscriptionOAuthResponseHeaderTimeout > 0 &&
-		(info.ChannelType == rootconstant.ChannelTypeCodex || info.ChannelType == rootconstant.ChannelTypeClaudeCode) {
+		rootconstant.IsSubscriptionOAuthChannel(info.ChannelType) {
 		client, err = service.GetHttpClientWithResponseHeaderTimeout(
 			info.ChannelSetting.Proxy,
 			time.Duration(common2.SubscriptionOAuthResponseHeaderTimeout)*time.Second,

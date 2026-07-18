@@ -19,7 +19,7 @@ import (
 // from being mistaken for invalid OAuth credentials. A 5xx may be retried or
 // routed elsewhere, but it must not change the channel's enabled state.
 func ShouldDisableChannelForType(channelType int, err *types.NewAPIError) bool {
-	if err != nil && isSubscriptionOAuthChannelType(channelType) &&
+	if err != nil && constant.IsSubscriptionOAuthChannel(channelType) &&
 		err.GetUpstreamStatusCode() == http.StatusTooManyRequests {
 		return false
 	}
@@ -30,7 +30,7 @@ func ShouldDisableChannelForType(channelType int, err *types.NewAPIError) bool {
 }
 
 func IsSubscriptionOAuthTransientError(channelType int, err *types.NewAPIError) bool {
-	if err == nil || !isSubscriptionOAuthChannelType(channelType) {
+	if err == nil || !constant.IsSubscriptionOAuthChannel(channelType) {
 		return false
 	}
 	statusCode := err.GetUpstreamStatusCode()
@@ -41,12 +41,12 @@ func IsSubscriptionOAuthTransientError(channelType int, err *types.NewAPIError) 
 }
 
 func IsSubscriptionOAuthConcurrencyLimit(channelType int, err *types.NewAPIError) bool {
-	return err != nil && isSubscriptionOAuthChannelType(channelType) &&
+	return err != nil && constant.IsSubscriptionOAuthChannel(channelType) &&
 		err.GetErrorCode() == types.ErrorCodeOAuthChannelConcurrencyLimit
 }
 
 func IsSubscriptionOAuthAccountUnavailable(channelType int, err *types.NewAPIError) bool {
-	if err == nil || !isSubscriptionOAuthChannelType(channelType) {
+	if err == nil || !constant.IsSubscriptionOAuthChannel(channelType) {
 		return false
 	}
 	return err.GetErrorCode() == types.ErrorCodeOAuthUnauthorized ||
@@ -102,19 +102,19 @@ func QuarantineSubscriptionOAuthCredential(channelError types.ChannelError, err 
 }
 
 func IsSubscriptionOAuthModelUnavailable(channelType int, err *types.NewAPIError) bool {
-	return err != nil && isSubscriptionOAuthChannelType(channelType) &&
+	return err != nil && constant.IsSubscriptionOAuthChannel(channelType) &&
 		err.GetErrorCode() == types.ErrorCodeModelNotSupported
 }
 
 func IsSubscriptionOAuthModelAtCapacity(channelType int, err *types.NewAPIError) bool {
-	return err != nil && isSubscriptionOAuthChannelType(channelType) &&
+	return err != nil && constant.IsSubscriptionOAuthChannel(channelType) &&
 		err.GetErrorCode() == types.ErrorCodeModelAtCapacity
 }
 
 // ApplyChannelErrorPolicy classifies subscription account failures and keeps
 // only transient transport failures eligible for the request-local retry loop.
 func ApplyChannelErrorPolicy(channelType int, err *types.NewAPIError) *types.NewAPIError {
-	if err == nil || !isSubscriptionOAuthChannelType(channelType) {
+	if err == nil || !constant.IsSubscriptionOAuthChannel(channelType) {
 		return err
 	}
 	err = classifySubscriptionOAuthError(err)
@@ -167,10 +167,6 @@ func classifySubscriptionOAuthError(err *types.NewAPIError) *types.NewAPIError {
 	default:
 		return err
 	}
-}
-
-func isSubscriptionOAuthChannelType(channelType int) bool {
-	return channelType == constant.ChannelTypeCodex || channelType == constant.ChannelTypeClaudeCode
 }
 
 var subscriptionOAuthAccountDisabledMarkers = []string{

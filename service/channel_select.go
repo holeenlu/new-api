@@ -32,8 +32,6 @@ type RetryParam struct {
 	capacityCursor  int
 }
 
-const subscriptionOAuthRetryGroupContextKey = "subscription_oauth_retry_group"
-
 func NewRetryParam(c *gin.Context, tokenGroup, modelName, requestPath string) *RetryParam {
 	effectiveGroup := model.NormalizeChannelGroupFilter(tokenGroup)
 	if c != nil {
@@ -43,7 +41,7 @@ func NewRetryParam(c *gin.Context, tokenGroup, modelName, requestPath string) *R
 			effectiveGroup = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 		}
 		if effectiveGroup != "" {
-			c.Set(subscriptionOAuthRetryGroupContextKey, effectiveGroup)
+			SetSubscriptionOAuthEffectiveGroup(c, effectiveGroup)
 		}
 	}
 	return &RetryParam{

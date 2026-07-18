@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,37 +40,43 @@ type SubscriptionOAuthRetryState struct {
 	credentials map[string]*subscriptionOAuthCredentialRetry
 }
 
-const (
-	subscriptionOAuthGenerationContextKey = "subscription_oauth_capacity_generation"
-	subscriptionOAuthRecoveryContextKey   = "subscription_oauth_capacity_recovery_probe"
-	subscriptionOAuthLeaseContextKey      = "subscription_oauth_capacity_lease"
-	subscriptionOAuthResponseContextKey   = "subscription_oauth_response_scoped"
-	subscriptionOAuthRetryDisabledKey     = "subscription_oauth_retry_disabled"
-)
+type SubscriptionOAuthRetryObservation struct {
+	ChannelType             int
+	Error                   *types.NewAPIError
+	UpstreamRequestWritten  bool
+	UpstreamResponseStarted bool
+	ExplicitFailureResponse bool
+	DownstreamStarted       bool
+	RetryDisabled           bool
+	SpecificChannel         bool
+	Retryable               bool
+}
 
 func DisableSubscriptionOAuthRetry(c *gin.Context) {
-	if c != nil {
-		c.Set(subscriptionOAuthRetryDisabledKey, true)
+	if state := subscriptionOAuthState(c, true); state != nil {
+		state.retryDisabled = true
 	}
 }
 
 func IsSubscriptionOAuthRetryDisabled(c *gin.Context) bool {
-	return c != nil && c.GetBool(subscriptionOAuthRetryDisabledKey)
+	state := subscriptionOAuthState(c, false)
+	return state != nil && state.retryDisabled
 }
 
 func BindSubscriptionOAuthLease(c *gin.Context, lease *SubscriptionOAuthLease) {
 	if c == nil || lease == nil {
 		return
 	}
-	c.Set(subscriptionOAuthGenerationContextKey, lease.Generation())
-	c.Set(subscriptionOAuthRecoveryContextKey, lease.IsRecoveryProbe())
-	c.Set(subscriptionOAuthLeaseContextKey, lease)
+	state := subscriptionOAuthState(c, true)
+	state.generation = lease.Generation()
+	state.recoveryProbe = lease.IsRecoveryProbe()
+	state.lease = lease
 }
 
 func BindSubscriptionOAuthResponseLease(c *gin.Context, lease *SubscriptionOAuthLease) {
 	BindSubscriptionOAuthLease(c, lease)
-	if c != nil && lease != nil {
-		c.Set(subscriptionOAuthResponseContextKey, true)
+	if state := subscriptionOAuthState(c, false); state != nil && lease != nil {
+		state.responseScoped = true
 	}
 }
 
@@ -77,10 +84,11 @@ func ClearSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 	if c == nil {
 		return
 	}
-	c.Set(subscriptionOAuthGenerationContextKey, uint64(0))
-	c.Set(subscriptionOAuthRecoveryContextKey, false)
-	c.Set(subscriptionOAuthLeaseContextKey, (*SubscriptionOAuthLease)(nil))
-	c.Set(subscriptionOAuthResponseContextKey, false)
+	state := subscriptionOAuthState(c, true)
+	state.generation = 0
+	state.recoveryProbe = false
+	state.lease = nil
+	state.responseScoped = false
 }
 
 // ResolveBoundSubscriptionOAuthResponse records the outcome of a response
@@ -88,16 +96,12 @@ func ClearSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 // test. This is required for half-open recovery probes, whose capacity remains
 // reserved until the response outcome is known.
 func ResolveBoundSubscriptionOAuthResponse(c *gin.Context, success bool) {
-	if c == nil || !c.GetBool(subscriptionOAuthResponseContextKey) {
+	state := subscriptionOAuthState(c, false)
+	if state == nil || !state.responseScoped {
 		return
 	}
-	value, exists := c.Get(subscriptionOAuthLeaseContextKey)
-	if !exists {
-		return
-	}
-	lease, _ := value.(*SubscriptionOAuthLease)
-	if lease != nil {
-		lease.ResolveResponse(success)
+	if state.lease != nil {
+		state.lease.ResolveResponse(success)
 	}
 }
 
@@ -154,16 +158,14 @@ func (p *RetryParam) CaptureSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 	if target == nil || c == nil {
 		return
 	}
-	if value, exists := c.Get(subscriptionOAuthGenerationContextKey); exists {
-		if generation, ok := value.(uint64); ok {
-			p.oauthRetry.current.Generation = generation
-		}
+	state := subscriptionOAuthState(c, false)
+	if state == nil {
+		return
 	}
-	p.oauthRetry.current.RecoveryProbe = c.GetBool(subscriptionOAuthRecoveryContextKey)
-	if value, exists := c.Get(subscriptionOAuthLeaseContextKey); exists {
-		p.oauthRetry.current.lease, _ = value.(*SubscriptionOAuthLease)
-	}
-	p.oauthRetry.current.ResponseScoped = c.GetBool(subscriptionOAuthResponseContextKey)
+	p.oauthRetry.current.Generation = state.generation
+	p.oauthRetry.current.RecoveryProbe = state.recoveryProbe
+	p.oauthRetry.current.lease = state.lease
+	p.oauthRetry.current.ResponseScoped = state.responseScoped
 }
 
 func (p *RetryParam) HandleSubscriptionOAuthCapacityFailure() {
@@ -229,6 +231,77 @@ func (p *RetryParam) HandleSubscriptionOAuthModelCapacity() {
 		return
 	}
 	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+}
+
+// DecideSubscriptionOAuthContinuation is the single state transition entry
+// for subscription OAuth retries. Callers report what happened; this method
+// updates the credential ledger and returns whether to retry the current
+// credential, switch credentials, or stop.
+func (p *RetryParam) DecideSubscriptionOAuthContinuation(
+	observation SubscriptionOAuthRetryObservation,
+) (SubscriptionOAuthRetryDecision, time.Duration) {
+	if p == nil || observation.Error == nil {
+		return SubscriptionOAuthRetryStop, 0
+	}
+
+	stop := observation.DownstreamStarted || observation.RetryDisabled || observation.SpecificChannel
+	if IsSubscriptionOAuthAccountUnavailable(observation.ChannelType, observation.Error) {
+		p.HandleSubscriptionOAuthAccountUnavailable()
+		if stop {
+			return SubscriptionOAuthRetryStop, 0
+		}
+		return SubscriptionOAuthSwitchCredential, 0
+	}
+	if IsSubscriptionOAuthModelAtCapacity(observation.ChannelType, observation.Error) {
+		if !observation.DownstreamStarted {
+			p.HandleSubscriptionOAuthModelCapacity()
+		}
+		if stop {
+			return SubscriptionOAuthRetryStop, 0
+		}
+		return SubscriptionOAuthSwitchCredential, 0
+	}
+	if IsSubscriptionOAuthModelUnavailable(observation.ChannelType, observation.Error) {
+		if !observation.DownstreamStarted {
+			p.HandleSubscriptionOAuthModelUnavailable()
+		}
+		if stop {
+			return SubscriptionOAuthRetryStop, 0
+		}
+		return SubscriptionOAuthSwitchCredential, 0
+	}
+	if IsSubscriptionOAuthConcurrencyLimit(observation.ChannelType, observation.Error) {
+		p.HandleSubscriptionOAuthCapacityFailure()
+		if stop {
+			return SubscriptionOAuthRetryStop, observation.Error.RetryAfter
+		}
+		return SubscriptionOAuthSwitchCredential, observation.Error.RetryAfter
+	}
+
+	statusCode := observation.Error.GetUpstreamStatusCode()
+	if statusCode == http.StatusTooManyRequests {
+		retryAfter := SubscriptionOAuthRetryCooldown(observation.Error.RetryAfter)
+		decision := p.DecideSubscriptionOAuthRetry(
+			observation.UpstreamRequestWritten,
+			observation.UpstreamResponseStarted,
+			observation.ExplicitFailureResponse,
+			stop,
+			statusCode,
+			observation.Error.RetryAfter,
+		)
+		return decision, retryAfter
+	}
+	if stop || !observation.Retryable {
+		return SubscriptionOAuthRetryStop, 0
+	}
+	return p.DecideSubscriptionOAuthRetry(
+		observation.UpstreamRequestWritten,
+		observation.UpstreamResponseStarted,
+		observation.ExplicitFailureResponse,
+		false,
+		statusCode,
+		observation.Error.RetryAfter,
+	), 0
 }
 
 // DecideSubscriptionOAuthRetry applies a per-credential retry budget. A local

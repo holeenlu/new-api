@@ -606,8 +606,7 @@ func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Chann
 }
 
 func applySubscriptionOAuthModelFetchError(channel *model.Channel, key string, err error) error {
-	if channel == nil || err == nil ||
-		(channel.Type != constant.ChannelTypeCodex && channel.Type != constant.ChannelTypeClaudeCode) {
+	if channel == nil || err == nil || !constant.IsSubscriptionOAuthChannel(channel.Type) {
 		return err
 	}
 	var apiError *types.NewAPIError

@@ -21,7 +21,6 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import * as z from 'zod'
 
 import {
   Form,
@@ -44,10 +43,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import {
-  excludeHttpStatusCodes,
-  parseHttpStatusCodeRules,
-} from '@/lib/http-status-code-rules'
+import { parseHttpStatusCodeRules } from '@/lib/http-status-code-rules'
 
 import {
   SettingsForm,
@@ -59,215 +55,17 @@ import { SettingsSection } from '../components/settings-section'
 import { useResetForm } from '../hooks/use-reset-form'
 import { useUpdateOption } from '../hooks/use-update-option'
 import { safeNumberFieldProps } from '../utils/numeric-field'
-
-const numericString = z.string().refine((value) => {
-  const trimmed = value.trim()
-  if (!trimmed) return true
-  return !Number.isNaN(Number(trimmed)) && Number(trimmed) >= 0
-}, 'Enter a non-negative number or leave empty')
-
-const channelTestModes = ['scheduled_all', 'passive_recovery'] as const
-const alwaysSkippedRetryStatusCodes = new Set([504, 524])
-
-const parseAutomaticRetryStatusCodes = (value: unknown) =>
-  excludeHttpStatusCodes(
-    parseHttpStatusCodeRules(value),
-    alwaysSkippedRetryStatusCodes
-  )
-type ChannelTestMode = (typeof channelTestModes)[number]
-
-const routingReliabilitySchema = z
-  .object({
-    RetryTimes: z.coerce.number().min(0).max(10),
-    SubscriptionOAuthUpstreamRetryTimes: z.coerce.number().int().min(0).max(10),
-    SubscriptionOAuthCapacityCycleTimes: z.coerce.number().int().min(0).max(10),
-    SubscriptionOAuthCapacityWaitSeconds: z.coerce
-      .number()
-      .int()
-      .min(0)
-      .max(30),
-    SubscriptionOAuthRetry429: z.boolean(),
-    ChannelDisableThreshold: numericString,
-    AutomaticDisableChannelEnabled: z.boolean(),
-    AutomaticEnableChannelEnabled: z.boolean(),
-    AutomaticDisableKeywords: z.string(),
-    AutomaticDisableStatusCodes: z.string(),
-    AutomaticRetryStatusCodes: z.string(),
-    monitor_setting: z.object({
-      auto_test_channel_enabled: z.boolean(),
-      auto_test_channel_minutes: z.coerce
-        .number()
-        .int()
-        .min(1, 'Interval must be at least 1 minute'),
-      channel_test_mode: z.enum(channelTestModes),
-    }),
-  })
-  .superRefine((values, ctx) => {
-    const disableParsed = parseHttpStatusCodeRules(
-      values.AutomaticDisableStatusCodes
-    )
-    if (!disableParsed.ok) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['AutomaticDisableStatusCodes'],
-        message: `Invalid status code rules: ${disableParsed.invalidTokens.join(
-          ', '
-        )}`,
-      })
-    }
-
-    const retryParsed = parseAutomaticRetryStatusCodes(
-      values.AutomaticRetryStatusCodes
-    )
-    if (!retryParsed.ok) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['AutomaticRetryStatusCodes'],
-        message: `Invalid status code rules: ${retryParsed.invalidTokens.join(
-          ', '
-        )}`,
-      })
-    }
-  })
-
-type RoutingReliabilityFormValues = z.output<typeof routingReliabilitySchema>
-type RoutingReliabilityFormInput = z.input<typeof routingReliabilitySchema>
-
-type RoutingReliabilitySectionProps = {
-  defaultValues: {
-    RetryTimes: number
-    SubscriptionOAuthUpstreamRetryTimes: number
-    SubscriptionOAuthCapacityCycleTimes: number
-    SubscriptionOAuthCapacityWaitSeconds: number
-    SubscriptionOAuthRetry429: boolean
-    ChannelDisableThreshold: string
-    AutomaticDisableChannelEnabled: boolean
-    AutomaticEnableChannelEnabled: boolean
-    AutomaticDisableKeywords: string
-    AutomaticDisableStatusCodes: string
-    AutomaticRetryStatusCodes: string
-    'monitor_setting.auto_test_channel_enabled': boolean
-    'monitor_setting.auto_test_channel_minutes': number
-    'monitor_setting.channel_test_mode': ChannelTestMode
-  }
-}
-
-function normalizeLineEndings(value: string) {
-  return value.replaceAll('\r\n', '\n')
-}
-
-type NormalizedRoutingReliabilityValues = {
-  RetryTimes: number
-  SubscriptionOAuthUpstreamRetryTimes: number
-  SubscriptionOAuthCapacityCycleTimes: number
-  SubscriptionOAuthCapacityWaitSeconds: number
-  SubscriptionOAuthRetry429: boolean
-  ChannelDisableThreshold: string
-  AutomaticDisableChannelEnabled: boolean
-  AutomaticEnableChannelEnabled: boolean
-  AutomaticDisableKeywords: string
-  AutomaticDisableStatusCodes: string
-  AutomaticRetryStatusCodes: string
-  'monitor_setting.auto_test_channel_enabled': boolean
-  'monitor_setting.auto_test_channel_minutes': number
-  'monitor_setting.channel_test_mode': ChannelTestMode
-}
-
-function normalizeChannelTestMode(value?: string): ChannelTestMode {
-  return value === 'passive_recovery' ? 'passive_recovery' : 'scheduled_all'
-}
-
-const buildFormDefaults = (
-  defaults: RoutingReliabilitySectionProps['defaultValues']
-): RoutingReliabilityFormInput => ({
-  RetryTimes: defaults.RetryTimes ?? 0,
-  SubscriptionOAuthUpstreamRetryTimes:
-    defaults.SubscriptionOAuthUpstreamRetryTimes ?? 5,
-  SubscriptionOAuthCapacityCycleTimes:
-    defaults.SubscriptionOAuthCapacityCycleTimes ?? 5,
-  SubscriptionOAuthCapacityWaitSeconds:
-    defaults.SubscriptionOAuthCapacityWaitSeconds ?? 5,
-  SubscriptionOAuthRetry429: defaults.SubscriptionOAuthRetry429 ?? false,
-  ChannelDisableThreshold: defaults.ChannelDisableThreshold ?? '',
-  AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
-  AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
-  AutomaticDisableKeywords: normalizeLineEndings(
-    defaults.AutomaticDisableKeywords ?? ''
-  ),
-  AutomaticDisableStatusCodes: defaults.AutomaticDisableStatusCodes ?? '',
-  AutomaticRetryStatusCodes: defaults.AutomaticRetryStatusCodes ?? '',
-  monitor_setting: {
-    auto_test_channel_enabled:
-      defaults['monitor_setting.auto_test_channel_enabled'],
-    auto_test_channel_minutes:
-      defaults['monitor_setting.auto_test_channel_minutes'],
-    channel_test_mode: normalizeChannelTestMode(
-      defaults['monitor_setting.channel_test_mode']
-    ),
-  },
-})
-
-const normalizeDefaults = (
-  defaults: RoutingReliabilitySectionProps['defaultValues']
-): NormalizedRoutingReliabilityValues => ({
-  RetryTimes: defaults.RetryTimes ?? 0,
-  SubscriptionOAuthUpstreamRetryTimes:
-    defaults.SubscriptionOAuthUpstreamRetryTimes ?? 5,
-  SubscriptionOAuthCapacityCycleTimes:
-    defaults.SubscriptionOAuthCapacityCycleTimes ?? 5,
-  SubscriptionOAuthCapacityWaitSeconds:
-    defaults.SubscriptionOAuthCapacityWaitSeconds ?? 5,
-  SubscriptionOAuthRetry429: defaults.SubscriptionOAuthRetry429 ?? false,
-  ChannelDisableThreshold: (defaults.ChannelDisableThreshold ?? '').trim(),
-  AutomaticDisableChannelEnabled: defaults.AutomaticDisableChannelEnabled,
-  AutomaticEnableChannelEnabled: defaults.AutomaticEnableChannelEnabled,
-  AutomaticDisableKeywords: normalizeLineEndings(
-    defaults.AutomaticDisableKeywords ?? ''
-  ),
-  AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
-    defaults.AutomaticDisableStatusCodes ?? ''
-  ).normalized,
-  AutomaticRetryStatusCodes: parseAutomaticRetryStatusCodes(
-    defaults.AutomaticRetryStatusCodes ?? ''
-  ).normalized,
-  'monitor_setting.auto_test_channel_enabled':
-    defaults['monitor_setting.auto_test_channel_enabled'],
-  'monitor_setting.auto_test_channel_minutes':
-    defaults['monitor_setting.auto_test_channel_minutes'],
-  'monitor_setting.channel_test_mode': normalizeChannelTestMode(
-    defaults['monitor_setting.channel_test_mode']
-  ),
-})
-
-const normalizeFormValues = (
-  values: RoutingReliabilityFormValues
-): NormalizedRoutingReliabilityValues => ({
-  RetryTimes: values.RetryTimes,
-  SubscriptionOAuthUpstreamRetryTimes:
-    values.SubscriptionOAuthUpstreamRetryTimes,
-  SubscriptionOAuthCapacityCycleTimes:
-    values.SubscriptionOAuthCapacityCycleTimes,
-  SubscriptionOAuthCapacityWaitSeconds:
-    values.SubscriptionOAuthCapacityWaitSeconds,
-  SubscriptionOAuthRetry429: values.SubscriptionOAuthRetry429,
-  ChannelDisableThreshold: values.ChannelDisableThreshold.trim(),
-  AutomaticDisableChannelEnabled: values.AutomaticDisableChannelEnabled,
-  AutomaticEnableChannelEnabled: values.AutomaticEnableChannelEnabled,
-  AutomaticDisableKeywords: normalizeLineEndings(
-    values.AutomaticDisableKeywords
-  ),
-  AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
-    values.AutomaticDisableStatusCodes
-  ).normalized,
-  AutomaticRetryStatusCodes: parseAutomaticRetryStatusCodes(
-    values.AutomaticRetryStatusCodes
-  ).normalized,
-  'monitor_setting.auto_test_channel_enabled':
-    values.monitor_setting.auto_test_channel_enabled,
-  'monitor_setting.auto_test_channel_minutes':
-    values.monitor_setting.auto_test_channel_minutes,
-  'monitor_setting.channel_test_mode': values.monitor_setting.channel_test_mode,
-})
+import {
+  buildFormDefaults,
+  normalizeDefaults,
+  normalizeFormValues,
+  parseAutomaticRetryStatusCodes,
+  routingReliabilitySchema,
+  type NormalizedRoutingReliabilityValues,
+  type RoutingReliabilityFormInput,
+  type RoutingReliabilityFormValues,
+  type RoutingReliabilitySectionProps,
+} from './routing-reliability-form'
 
 export function RoutingReliabilitySection({
   defaultValues,

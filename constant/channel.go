@@ -61,6 +61,10 @@ const (
 
 )
 
+func IsSubscriptionOAuthChannel(channelType int) bool {
+	return channelType == ChannelTypeCodex || channelType == ChannelTypeClaudeCode
+}
+
 var ChannelBaseURLs = []string{
 	"",                                    // 0
 	"https://api.openai.com",              // 1
