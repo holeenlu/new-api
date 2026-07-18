@@ -40,3 +40,34 @@ func TestSubscriptionOAuthLegacyTagIsolationDoesNotRequireTag(t *testing.T) {
 
 	require.NoError(t, channel.ValidateSettings())
 }
+
+func TestAdvancedCustomChannelRequiresModelListRouteWhenUpdateChecksEnabled(t *testing.T) {
+	inferenceRoute := dto.AdvancedCustomRoute{
+		IncomingPath: "/v1/chat/completions",
+		UpstreamPath: "/v1/chat/completions",
+		Converter:    "none",
+	}
+	channel := &Channel{Type: constant.ChannelTypeAdvancedCustom}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: true,
+		AdvancedCustom: &dto.AdvancedCustomConfig{
+			Routes: []dto.AdvancedCustomRoute{inferenceRoute},
+		},
+	})
+	require.ErrorContains(t, channel.ValidateSettings(), dto.AdvancedCustomModelListPath)
+
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled: true,
+		AdvancedCustom: &dto.AdvancedCustomConfig{
+			Routes: []dto.AdvancedCustomRoute{
+				inferenceRoute,
+				{
+					IncomingPath: dto.AdvancedCustomModelListPath,
+					UpstreamPath: dto.AdvancedCustomModelListPath,
+					Converter:    "none",
+				},
+			},
+		},
+	})
+	require.NoError(t, channel.ValidateSettings())
+}

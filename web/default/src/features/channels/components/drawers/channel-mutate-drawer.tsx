@@ -1457,6 +1457,9 @@ export function ChannelMutateDrawer({
           type,
           key: form.getValues('key'),
           base_url: form.getValues('base_url') || '',
+          advanced_custom: form.getValues('advanced_custom') || '',
+          header_override: form.getValues('header_override') || '',
+          proxy: form.getValues('proxy') || '',
         })
       }
 

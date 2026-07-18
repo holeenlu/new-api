@@ -27,6 +27,7 @@ import type { Channel } from '../types'
 import {
   CHANNEL_TYPE_ADVANCED_CUSTOM,
   advancedCustomConfigUsesRelativeUpstreamPath,
+  hasValidAdvancedCustomModelListRoute,
   parseAdvancedCustomConfig,
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
@@ -271,6 +272,16 @@ export const channelFormSchema = z
           ctx,
           'base_url',
           'Base URL is required when an advanced route uses an upstream path'
+        )
+      }
+      if (
+        data.upstream_model_update_check_enabled === true &&
+        !hasValidAdvancedCustomModelListRoute(advancedCustomConfig)
+      ) {
+        addRequiredIssue(
+          ctx,
+          'upstream_model_update_check_enabled',
+          'OpenAI Models route is required to enable upstream model checks'
         )
       }
     }

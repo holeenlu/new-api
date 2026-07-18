@@ -15,9 +15,12 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -483,6 +486,46 @@ func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Chann
 			}
 		}
 		return channelUpstreamModelCatalog{IDs: normalizeModelNames(ids), Metadata: metadata}, nil
+	}
+
+	if channel.Type == constant.ChannelTypeAdvancedCustom {
+		key, _, apiErr := channel.GetNextEnabledKey()
+		if apiErr != nil {
+			return channelUpstreamModelCatalog{}, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+		}
+		key = strings.TrimSpace(key)
+		info := &relaycommon.RelayInfo{
+			RelayFormat:    types.RelayFormatOpenAI,
+			RelayMode:      relayconstant.RelayModeUnknown,
+			RequestURLPath: dto.AdvancedCustomModelListPath,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType:          constant.ChannelTypeAdvancedCustom,
+				ChannelBaseUrl:       baseURL,
+				ApiKey:               key,
+				ChannelOtherSettings: channel.GetOtherSettings(),
+			},
+		}
+		adaptor := &advancedcustom.Adaptor{}
+		url, headers, err := adaptor.BuildModelListRequest(info)
+		if err != nil {
+			return channelUpstreamModelCatalog{}, err
+		}
+		if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
+			return channelUpstreamModelCatalog{}, err
+		}
+		body, err := GetResponseBodyWithContext(ctx, http.MethodGet, url, channel, headers, time.Duration(common.ChannelManagementRequestTimeout)*time.Second)
+		if err != nil {
+			return channelUpstreamModelCatalog{}, err
+		}
+		var result OpenAIModelsResponse
+		if err := common.Unmarshal(body, &result); err != nil {
+			return channelUpstreamModelCatalog{}, fmt.Errorf("invalid OpenAI Models response: %w", err)
+		}
+		ids := normalizeModelNames(lo.Map(result.Data, func(item OpenAIModel, _ int) string { return item.ID }))
+		if len(ids) == 0 {
+			return channelUpstreamModelCatalog{}, errors.New("OpenAI Models response contains no valid model IDs")
+		}
+		return channelUpstreamModelCatalog{IDs: ids}, nil
 	}
 
 	var url string

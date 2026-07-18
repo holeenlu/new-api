@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/types"
@@ -267,6 +268,20 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 	}
 
 	return headers, nil
+}
+
+func applyFetchModelsHeaderOverrides(channel *model.Channel, key string, headers http.Header) error {
+	info := &relaycommon.RelayInfo{IsChannelTest: true, ChannelMeta: &relaycommon.ChannelMeta{
+		ApiKey: key, HeadersOverride: channel.GetHeaderOverride(),
+	}}
+	overrides, err := relaychannel.ResolveHeaderOverride(info, nil)
+	if err != nil {
+		return err
+	}
+	for name, value := range overrides {
+		headers.Set(name, value)
+	}
+	return nil
 }
 
 func FetchUpstreamModels(c *gin.Context) {
@@ -1366,9 +1381,12 @@ func equalStringPtr(a, b *string) bool {
 
 func FetchModels(c *gin.Context) {
 	var req struct {
-		BaseURL string `json:"base_url"`
-		Type    int    `json:"type"`
-		Key     string `json:"key"`
+		BaseURL        string `json:"base_url"`
+		Type           int    `json:"type"`
+		Key            string `json:"key"`
+		AdvancedCustom string `json:"advanced_custom"`
+		HeaderOverride string `json:"header_override"`
+		Proxy          string `json:"proxy"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1426,6 +1444,36 @@ func FetchModels(c *gin.Context) {
 			"success": true,
 			"data":    models,
 		})
+		return
+	}
+
+	if req.Type == constant.ChannelTypeAdvancedCustom {
+		var config dto.AdvancedCustomConfig
+		if err := common.UnmarshalJsonStr(strings.TrimSpace(req.AdvancedCustom), &config); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "advanced_custom is required and must be valid JSON"})
+			return
+		}
+		channel := &model.Channel{Type: req.Type, Key: key, BaseURL: &baseURL}
+		settings := channel.GetOtherSettings()
+		settings.AdvancedCustom = &config
+		channel.SetOtherSettings(settings)
+		if strings.TrimSpace(req.HeaderOverride) != "" {
+			var headerOverride map[string]any
+			if err := common.UnmarshalJsonStr(req.HeaderOverride, &headerOverride); err != nil {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": "header_override must be a JSON object"})
+				return
+			}
+			channel.HeaderOverride = &req.HeaderOverride
+		}
+		channelSettings := channel.GetSetting()
+		channelSettings.Proxy = strings.TrimSpace(req.Proxy)
+		channel.SetSetting(channelSettings)
+		catalog, err := fetchNonCodexUpstreamModelCatalog(c.Request.Context(), channel)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": fmt.Sprintf("获取模型列表失败: %s", err.Error())})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": catalog.IDs})
 		return
 	}
 
