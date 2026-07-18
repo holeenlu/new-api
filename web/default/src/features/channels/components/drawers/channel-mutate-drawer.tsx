@@ -128,8 +128,6 @@ import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
-  fetchModels,
-  fetchUpstreamModels,
   getAllModels,
   getChannel,
   getChannelKey,
@@ -147,6 +145,8 @@ import {
   FIELD_PLACEHOLDERS,
   MODEL_FETCHABLE_TYPES,
 } from '../../constants'
+import { useChannelEditorFormState } from '../../hooks/use-channel-editor-form-state'
+import { useChannelModelActions } from '../../hooks/use-channel-model-actions'
 import { useChannelMutateForm } from '../../hooks/use-channel-mutate-form'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
@@ -621,8 +621,6 @@ export function ChannelMutateDrawer({
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
   const canRevealChannelKey = currentUser?.role === ROLE.SUPER_ADMIN
-  const [isFetchingAndFillingModels, setIsFetchingAndFillingModels] =
-    useState(false)
   const [channelKey, setChannelKey] = useState<string | null>(null)
   const [isChannelKeyLoading, setIsChannelKeyLoading] = useState(false)
   const [codexOAuthDialogOpen, setCodexOAuthDialogOpen] = useState(false)
@@ -719,64 +717,59 @@ export function ChannelMutateDrawer({
     defaultValues: CHANNEL_FORM_DEFAULT_VALUES,
   })
 
-  // Watch form values for conditional rendering
-  const multiKeyMode = form.watch('multi_key_mode')
-  const multiKeyType = form.watch('multi_key_type')
-  const keyMode = form.watch('key_mode')
-  const currentGroups = form.watch('group')
-  const currentType = form.watch('type')
-  const currentStatus = form.watch('status')
-  const currentBaseUrl = form.watch('base_url')
-  const currentKey = form.watch('key')
-  const currentOther = form.watch('other')
-  const currentModels = form.watch('models')
-  const currentName = form.watch('name')
-  const currentModelMapping = form.watch('model_mapping')
-  const awsKeyType = form.watch('aws_key_type')
-  const vertexKeyType = form.watch('vertex_key_type')
-  const upstreamModelUpdateCheckEnabled = form.watch(
-    'upstream_model_update_check_enabled'
-  )
-  const currentSettings = form.watch('settings')
-  const currentAdvancedCustom = form.watch('advanced_custom')
-  const currentPriority = form.watch('priority')
-  const currentWeight = form.watch('weight')
-  const currentTestModel = form.watch('test_model')
-  const currentAutoBan = form.watch('auto_ban')
-  const currentTag = form.watch('tag')
-  const currentRemark = form.watch('remark')
-  const currentStatusCodeMapping = form.watch('status_code_mapping')
-  const currentParamOverride = form.watch('param_override')
-  const currentHeaderOverride = form.watch('header_override')
-  const currentForceFormat = form.watch('force_format')
-  const currentThinkingToContent = form.watch('thinking_to_content')
-  const currentPassThroughBodyEnabled = form.watch('pass_through_body_enabled')
-  const currentDisableTaskPollingSleep = form.watch(
-    'disable_task_polling_sleep'
-  )
-  const currentProxy = form.watch('proxy')
-  const currentSystemPrompt = form.watch('system_prompt')
-  const currentSystemPromptOverride = form.watch('system_prompt_override')
-  const currentAllowServiceTier = form.watch('allow_service_tier')
-  const currentDisableStore = form.watch('disable_store')
-  const currentAllowSafetyIdentifier = form.watch('allow_safety_identifier')
-  const currentAllowIncludeObfuscation = form.watch('allow_include_obfuscation')
-  const currentAllowInferenceGeo = form.watch('allow_inference_geo')
-  const currentAllowSpeed = form.watch('allow_speed')
-  const currentClaudeBetaQuery = form.watch('claude_beta_query')
-  const currentDataProvider = form.watch('data_provider')
-  const currentDataRegion = form.watch('data_region')
-  const currentDataRetention = form.watch('data_retention')
-  const currentDataTraining = form.watch('data_training')
-  const currentRetryIsolation = form.watch('retry_isolation')
+  const {
+    multi_key_mode: multiKeyMode,
+    multi_key_type: multiKeyType,
+    key_mode: keyMode,
+    group: currentGroups,
+    type: currentType,
+    status: currentStatus,
+    base_url: currentBaseUrl,
+    key: currentKey,
+    other: currentOther,
+    models: currentModels,
+    name: currentName,
+    model_mapping: currentModelMapping,
+    aws_key_type: awsKeyType,
+    vertex_key_type: vertexKeyType,
+    upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
+    settings: currentSettings,
+    advanced_custom: currentAdvancedCustom,
+    priority: currentPriority,
+    weight: currentWeight,
+    test_model: currentTestModel,
+    auto_ban: currentAutoBan,
+    tag: currentTag,
+    remark: currentRemark,
+    status_code_mapping: currentStatusCodeMapping,
+    param_override: currentParamOverride,
+    header_override: currentHeaderOverride,
+    force_format: currentForceFormat,
+    thinking_to_content: currentThinkingToContent,
+    pass_through_body_enabled: currentPassThroughBodyEnabled,
+    disable_task_polling_sleep: currentDisableTaskPollingSleep,
+    proxy: currentProxy,
+    system_prompt: currentSystemPrompt,
+    system_prompt_override: currentSystemPromptOverride,
+    allow_service_tier: currentAllowServiceTier,
+    disable_store: currentDisableStore,
+    allow_safety_identifier: currentAllowSafetyIdentifier,
+    allow_include_obfuscation: currentAllowIncludeObfuscation,
+    allow_inference_geo: currentAllowInferenceGeo,
+    allow_speed: currentAllowSpeed,
+    claude_beta_query: currentClaudeBetaQuery,
+    data_provider: currentDataProvider,
+    data_region: currentDataRegion,
+    data_retention: currentDataRetention,
+    data_training: currentDataTraining,
+    retry_isolation: currentRetryIsolation,
+    retry_policy_group: currentRetryPolicyGroup,
+    upstream_model_update_auto_sync_enabled:
+      currentUpstreamModelUpdateAutoSyncEnabled,
+    upstream_model_update_ignored_models:
+      currentUpstreamModelUpdateIgnoredModels,
+  } = useChannelEditorFormState(form.control)
   const isSubscriptionOAuthChannel = currentType === 57 || currentType === 59
-  const currentRetryPolicyGroup = form.watch('retry_policy_group')
-  const currentUpstreamModelUpdateAutoSyncEnabled = form.watch(
-    'upstream_model_update_auto_sync_enabled'
-  )
-  const currentUpstreamModelUpdateIgnoredModels = form.watch(
-    'upstream_model_update_ignored_models'
-  )
   const {
     unlocked: doubaoApiEditUnlocked,
     handleClick: handleApiConfigSecretClick,
@@ -1414,145 +1407,24 @@ export function ChannelMutateDrawer({
     }
   }, [channelId, queryClient, t])
 
-  // Unified function to update models
-  const updateModels = useCallback(
-    (newModels: string[], merge: boolean = false) => {
-      const finalModels = merge
-        ? formatModelsArray([...currentModelsArray, ...newModels])
-        : formatModelsArray(newModels)
-      form.setValue('models', finalModels)
-      return newModels.length
-    },
-    [currentModelsArray, form]
-  )
-
-  // Fetch the provider's models and keep the request-to-upstream mapping explicit.
-  const handleFetchAndFillModels = useCallback(async () => {
-    const type = form.getValues('type')
-    if (!MODEL_FETCHABLE_TYPES.has(type)) {
-      toast.error(t('This channel type does not support fetching models'))
-      return
-    }
-
-    if (!isEditing && !canEditSensitive) {
-      toast.error(t("You don't have necessary permission"))
-      return
-    }
-
-    if (!isEditing && !form.getValues('key')?.trim()) {
-      toast.error(t('Please enter API key first'))
-      return
-    }
-
-    setIsFetchingAndFillingModels(true)
-    try {
-      let response
-      if (isEditing) {
-        if (!channelId) {
-          throw new Error(t('Channel ID is required'))
-        }
-        response = await fetchUpstreamModels(channelId)
-      } else {
-        response = await fetchModels({
-          type,
-          key: form.getValues('key'),
-          base_url: form.getValues('base_url') || '',
-          advanced_custom: form.getValues('advanced_custom') || '',
-          header_override: form.getValues('header_override') || '',
-          proxy: form.getValues('proxy') || '',
-        })
-      }
-
-      if (!response.success) {
-        throw new Error(
-          getChannelErrorMessage(
-            response.error_code,
-            response.message || t('Failed to fetch models')
-          )
-        )
-      }
-
-      const models = formatModelsArray(
-        Array.isArray(response.data) ? response.data : []
-      )
-      const modelList = parseModelsString(models)
-      if (modelList.length === 0) {
-        toast.info(t('No models fetched yet.'))
-        return
-      }
-
-      form.setValue('models', models, {
-        shouldDirty: true,
-        shouldValidate: true,
-      })
-      toast.success(t('Fetched {{count}} models', { count: modelList.length }))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Failed to fetch models')
-      )
-    } finally {
-      setIsFetchingAndFillingModels(false)
-    }
-  }, [canEditSensitive, channelId, form, isEditing, t])
-
-  const handleFillAllModels = useCallback(() => {
-    if (!allModelsList.length) {
-      toast.info(t('No models available'))
-      return
-    }
-    updateModels(allModelsList)
-    toast.success(
-      t('Filled {{count}} model(s)', { count: allModelsList.length })
-    )
-  }, [allModelsList, updateModels, t])
-
-  const handleClearModels = useCallback(() => {
-    form.setValue('models', '')
-    toast.success(t('Cleared all models'))
-  }, [form, t])
-
-  const handleCopyModels = useCallback(async () => {
-    const models = form.getValues('models')
-    if (!models?.trim()) {
-      toast.info(t('No models to copy'))
-      return
-    }
-    await copyToClipboard(models)
-  }, [form, copyToClipboard, t])
-
-  // Handle adding prefill group models
-  const handleAddPrefillGroup = useCallback(
-    (group: { id: number; name: string; items: string | string[] }) => {
-      try {
-        const items = Array.isArray(group.items)
-          ? group.items
-          : JSON.parse(group.items)
-
-        if (!Array.isArray(items)) {
-          throw new Error('Invalid items format')
-        }
-
-        const count = updateModels(items, true)
-        toast.success(
-          t('Added {{count}} models from "{{name}}"', {
-            count,
-            name: group.name,
-          })
-        )
-      } catch {
-        toast.error(t('Failed to parse group items'))
-      }
-    },
-    [updateModels, t]
-  )
-
-  // Handle model selection change from MultiSelect
-  const handleModelsChange = useCallback(
-    (selected: string[]) => {
-      form.setValue('models', selected.join(','))
-    },
-    [form]
-  )
+  const {
+    addPrefillGroup: handleAddPrefillGroup,
+    changeModels: handleModelsChange,
+    clearModels: handleClearModels,
+    copyModels: handleCopyModels,
+    fetchAndFillModels: handleFetchAndFillModels,
+    fillAllModels: handleFillAllModels,
+    isFetchingModels: isFetchingAndFillingModels,
+    updateModels,
+  } = useChannelModelActions({
+    form,
+    currentModels: currentModelsArray,
+    availableModels: allModelsList,
+    channelId,
+    editing: isEditing,
+    canEditSensitive,
+    copyToClipboard,
+  })
 
   // Handle successful submission
   const handleSuccess = useCallback(() => {
@@ -4723,7 +4595,7 @@ export function ChannelMutateDrawer({
       {paramOverrideEditorOpen && !sensitiveLocked && (
         <ParamOverrideEditorDialog
           open={paramOverrideEditorOpen}
-          value={form.watch('param_override') || ''}
+          value={currentParamOverride || ''}
           onOpenChange={setParamOverrideEditorOpen}
           onSave={(nextValue) => {
             form.setValue('param_override', nextValue, {
@@ -4737,7 +4609,7 @@ export function ChannelMutateDrawer({
       {advancedCustomEditorOpen && !sensitiveLocked && (
         <AdvancedCustomEditorDialog
           open={advancedCustomEditorOpen}
-          value={form.watch('advanced_custom') || ''}
+          value={currentAdvancedCustom || ''}
           onOpenChange={setAdvancedCustomEditorOpen}
           onSave={(nextValue) => {
             form.setValue('advanced_custom', nextValue, {

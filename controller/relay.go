@@ -462,7 +462,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 					return channel, nil
 				}
 			}
-			retryParam.HandleSubscriptionOAuthCredentialUnavailable()
+			retryParam.RejectSubscriptionOAuthReplayTarget()
 			continue
 		}
 
@@ -486,7 +486,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			)
 		case <-timer.C:
 		}
-		if !retryParam.Boundary.RestartCapacityCycle() || !retryParam.StartCapacityReplay() {
+		if !retryParam.RestartSubscriptionOAuthCapacityCycle() {
 			break
 		}
 	}

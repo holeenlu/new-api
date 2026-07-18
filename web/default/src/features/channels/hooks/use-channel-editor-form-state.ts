@@ -16,29 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { AxiosError } from 'axios'
-import i18next from 'i18next'
-import { toast } from 'sonner'
+import { useWatch, type Control } from 'react-hook-form'
 
-import { localizeErrorMessage } from '@/lib/localize-error-message'
+import type { ChannelFormValues } from '../lib'
 
-export function handleServerError(error: unknown) {
-  let errMsg = i18next.t('Something went wrong!')
-
-  if (
-    error &&
-    typeof error === 'object' &&
-    'status' in error &&
-    Number(error.status) === 204
-  ) {
-    errMsg = i18next.t('Content not found.')
-  }
-
-  if (error instanceof AxiosError) {
-    errMsg =
-      error.displayMessage ??
-      localizeErrorMessage(error.response?.data || error, errMsg)
-  }
-
-  toast.error(localizeErrorMessage(errMsg))
+export function useChannelEditorFormState(
+  control: Control<ChannelFormValues>
+): ChannelFormValues {
+  return useWatch({ control }) as ChannelFormValues
 }

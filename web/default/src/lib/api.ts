@@ -29,6 +29,10 @@ declare module 'axios' {
     skipErrorHandler?: boolean
     disableDuplicate?: boolean
   }
+
+  export interface AxiosError {
+    displayMessage?: string
+  }
 }
 
 export type ApiRequestConfig = AxiosRequestConfig
@@ -95,7 +99,7 @@ api.interceptors.response.use(
           response.data.message || response.data,
           t('Request failed')
         )
-        response.data.message = msg
+        response.data.display_message = msg
         if (!skipBusiness) toast.error(msg)
       }
     }
@@ -106,25 +110,7 @@ api.interceptors.response.use(
     const status = error?.response?.status
     const data = error?.response?.data
     const msg = localizeErrorMessage(data || error, t('Request failed'))
-    if (typeof data === 'string') {
-      error.response.data = msg
-    } else if (data && typeof data === 'object') {
-      if (typeof data.message === 'string') {
-        data.message = localizeErrorMessage(data.message)
-      }
-      if (typeof data.title === 'string') {
-        data.title = localizeErrorMessage(data.title)
-      }
-      if (typeof data.detail === 'string') {
-        data.detail = localizeErrorMessage(data.detail)
-      }
-      if (data.error && typeof data.error === 'object') {
-        if (typeof data.error.message === 'string') {
-          data.error.message = localizeErrorMessage(data.error.message)
-        }
-      }
-    }
-    if (error && typeof error === 'object') error.message = msg
+    if (error && typeof error === 'object') error.displayMessage = msg
 
     if (status === 401) {
       try {

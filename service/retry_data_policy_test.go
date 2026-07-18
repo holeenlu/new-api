@@ -303,7 +303,7 @@ func TestCapacityFailureDoesNotConsumeCredentialAttemptBudget(t *testing.T) {
 	retryParam := &RetryParam{Boundary: boundary}
 
 	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
-	retryParam.HandleSubscriptionOAuthCapacityFailure()
+	retryParam.handleSubscriptionOAuthCapacityFailure()
 	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
 }
 
@@ -347,13 +347,13 @@ func TestSubscriptionOAuthFiveFailuresSwitchWithinFrozenGroup(t *testing.T) {
 		assert.Equal(
 			t,
 			SubscriptionOAuthRetryCurrentCredential,
-			retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+			retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 		)
 	}
 	assert.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 	)
 	assert.False(t, boundary.Allows(initial))
 	assert.True(t, boundary.Allows(backup))
@@ -395,7 +395,7 @@ func TestSubscriptionOAuthAccountUnavailableSwitchesAndCoolsCredential(t *testin
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
 	retryParam := &RetryParam{Boundary: boundary}
 	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
-	retryParam.HandleSubscriptionOAuthAccountUnavailable()
+	retryParam.handleSubscriptionOAuthAccountUnavailable()
 
 	require.False(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(backup))
@@ -416,7 +416,7 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithoutCoolingAccount(t *testi
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
 	retryParam := &RetryParam{Boundary: boundary}
 	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
-	retryParam.HandleSubscriptionOAuthModelUnavailable()
+	retryParam.handleSubscriptionOAuthModelUnavailable()
 
 	require.False(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(backup))

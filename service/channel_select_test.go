@@ -80,13 +80,13 @@ func TestSubscriptionOAuthRetrySwitchesAfterFiveCredentialFailures(t *testing.T)
 		require.Equal(
 			t,
 			SubscriptionOAuthRetryCurrentCredential,
-			retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+			retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 		)
 	}
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 	)
 	require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
 }
@@ -97,12 +97,12 @@ func TestSubscriptionOAuthRetryLimitsAmbiguousPostWriteFailure(t *testing.T) {
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryCurrentCredential,
-		retryParam.DecideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
+		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
 	)
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
+		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
 	)
 }
 
@@ -117,13 +117,13 @@ func TestSubscriptionOAuthAmbiguousFailureCannotExceedFailureBudget(t *testing.T
 		require.Equal(
 			t,
 			SubscriptionOAuthRetryCurrentCredential,
-			retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+			retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 		)
 	}
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
+		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
 	)
 }
 
@@ -137,7 +137,7 @@ func TestSubscriptionOAuthRetryZeroDisablesAmbiguousRetry(t *testing.T) {
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
-		retryParam.DecideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
+		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
 	)
 }
 
@@ -158,7 +158,7 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
-		retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusTooManyRequests, 12*time.Second),
+		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusTooManyRequests, 12*time.Second),
 	)
 	state.mu.Lock()
 	require.True(t, state.recoveryPending)
@@ -175,7 +175,7 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusTooManyRequests, time.Second),
+		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusTooManyRequests, time.Second),
 	)
 }
 
@@ -183,16 +183,16 @@ func TestSubscriptionOAuthCapacityReplayPreservesCredentialOrder(t *testing.T) {
 	retryParam := &RetryParam{}
 	for index, fingerprint := range []string{"credential-a", "credential-b", "credential-c"} {
 		retryParam.SetSubscriptionOAuthAttempt(index+1, 0, fingerprint)
-		retryParam.HandleSubscriptionOAuthCapacityFailure()
+		retryParam.handleSubscriptionOAuthCapacityFailure()
 	}
 
-	require.True(t, retryParam.StartCapacityReplay())
+	require.True(t, retryParam.startCapacityReplay())
 	for index, fingerprint := range []string{"credential-a", "credential-b", "credential-c"} {
 		target := retryParam.SubscriptionOAuthAttemptTarget()
 		require.NotNil(t, target)
 		require.Equal(t, index+1, target.ChannelID)
 		require.Equal(t, fingerprint, target.Fingerprint)
-		retryParam.HandleSubscriptionOAuthCapacityFailure()
+		retryParam.handleSubscriptionOAuthCapacityFailure()
 	}
 	require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
 }
@@ -223,7 +223,7 @@ func TestSubscriptionOAuthFailedRecoveryProbeSwitchesImmediately(t *testing.T) {
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
-		retryParam.DecideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
+		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 	)
 }
 
@@ -237,6 +237,6 @@ func TestSubscriptionOAuthRetry429CannotBypassStartedResponse(t *testing.T) {
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
-		retryParam.DecideSubscriptionOAuthRetry(true, true, true, true, http.StatusTooManyRequests, 0),
+		retryParam.decideSubscriptionOAuthRetry(true, true, true, true, http.StatusTooManyRequests, 0),
 	)
 }

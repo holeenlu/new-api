@@ -35,9 +35,15 @@ type subscriptionOAuthCredentialRetry struct {
 	postWriteRetries int
 }
 
-type SubscriptionOAuthRetryState struct {
-	current     *SubscriptionOAuthAttemptTarget
-	credentials map[string]*subscriptionOAuthCredentialRetry
+type subscriptionOAuthTracker struct {
+	current        *SubscriptionOAuthAttemptTarget
+	credentials    map[string]*subscriptionOAuthCredentialRetry
+	capacityCycles int
+	capacityWait   time.Duration
+	capacityOrder  []SubscriptionOAuthAttemptTarget
+	capacitySeen   map[string]struct{}
+	capacityReplay bool
+	capacityCursor int
 }
 
 type SubscriptionOAuthRetryObservation struct {
@@ -105,13 +111,91 @@ func ResolveBoundSubscriptionOAuthResponse(c *gin.Context, success bool) {
 	}
 }
 
-func (p *RetryParam) ensureSubscriptionOAuthRetryState() *SubscriptionOAuthRetryState {
-	if p.oauthRetry == nil {
-		p.oauthRetry = &SubscriptionOAuthRetryState{
-			credentials: make(map[string]*subscriptionOAuthCredentialRetry),
+func (p *RetryParam) ensureSubscriptionOAuthTracker() *subscriptionOAuthTracker {
+	if p.oauth == nil {
+		p.oauth = &subscriptionOAuthTracker{
+			credentials:  make(map[string]*subscriptionOAuthCredentialRetry),
+			capacitySeen: make(map[string]struct{}),
 		}
 	}
-	return p.oauthRetry
+	return p.oauth
+}
+
+func (p *RetryParam) NextCapacityCycleBackoff() (time.Duration, bool) {
+	tracker := p.ensureSubscriptionOAuthTracker()
+	if tracker.capacityCycles == 0 {
+		tracker.capacityCycles = 1
+	}
+	if tracker.capacityCycles >= common.SubscriptionOAuthCapacityCycleTimes {
+		return 0, false
+	}
+	maxWait := time.Duration(common.SubscriptionOAuthCapacityWaitSeconds) * time.Second
+	remaining := maxWait - tracker.capacityWait
+	if remaining <= 0 {
+		return 0, false
+	}
+	tracker.capacityCycles++
+	shift := min(tracker.capacityCycles-2, 3)
+	base := 250 * time.Millisecond * time.Duration(1<<shift)
+	jitterLimit := min(int(base/(4*time.Millisecond)), 100)
+	delay := base + time.Duration(common.GetRandomInt(jitterLimit+1))*time.Millisecond
+	if delay > remaining {
+		delay = remaining
+	}
+	tracker.capacityWait += delay
+	return delay, true
+}
+
+func (p *RetryParam) recordCapacityTarget(target *SubscriptionOAuthAttemptTarget) {
+	if p == nil || target == nil || target.Fingerprint == "" {
+		return
+	}
+	tracker := p.ensureSubscriptionOAuthTracker()
+	if _, exists := tracker.capacitySeen[target.Fingerprint]; exists {
+		return
+	}
+	tracker.capacitySeen[target.Fingerprint] = struct{}{}
+	tracker.capacityOrder = append(tracker.capacityOrder, SubscriptionOAuthAttemptTarget{
+		ChannelID:   target.ChannelID,
+		KeyIndex:    target.KeyIndex,
+		Fingerprint: target.Fingerprint,
+	})
+}
+
+func (p *RetryParam) advanceCapacityReplay() {
+	if p == nil || p.oauth == nil {
+		return
+	}
+	tracker := p.oauth
+	if !tracker.capacityReplay || tracker.capacityCursor >= len(tracker.capacityOrder) {
+		tracker.capacityReplay = false
+		return
+	}
+	target := tracker.capacityOrder[tracker.capacityCursor]
+	tracker.capacityCursor++
+	tracker.current = &target
+	if tracker.credentials[target.Fingerprint] == nil {
+		tracker.credentials[target.Fingerprint] = &subscriptionOAuthCredentialRetry{}
+	}
+}
+
+func (p *RetryParam) startCapacityReplay() bool {
+	if p == nil || p.oauth == nil || len(p.oauth.capacityOrder) == 0 {
+		return false
+	}
+	p.oauth.capacityReplay = true
+	p.oauth.capacityCursor = 0
+	p.advanceCapacityReplay()
+	return p.SubscriptionOAuthAttemptTarget() != nil
+}
+
+// RestartSubscriptionOAuthCapacityCycle reopens only credentials excluded by
+// local capacity and then replays them in their original selection order.
+func (p *RetryParam) RestartSubscriptionOAuthCapacityCycle() bool {
+	if p == nil || p.Boundary == nil || !p.Boundary.RestartCapacityCycle() {
+		return false
+	}
+	return p.startCapacityReplay()
 }
 
 // SetSubscriptionOAuthAttempt reserves one request-local attempt for a
@@ -119,7 +203,7 @@ func (p *RetryParam) ensureSubscriptionOAuthRetryState() *SubscriptionOAuthRetry
 // path fails before normal retry accounting, the same credential cannot be
 // selected more than the configured per-credential limit.
 func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) bool {
-	state := p.ensureSubscriptionOAuthRetryState()
+	state := p.ensureSubscriptionOAuthTracker()
 	credential := state.credentials[fingerprint]
 	if credential == nil {
 		credential = &subscriptionOAuthCredentialRetry{}
@@ -146,10 +230,10 @@ func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, finger
 }
 
 func (p *RetryParam) SubscriptionOAuthAttemptTarget() *SubscriptionOAuthAttemptTarget {
-	if p == nil || p.oauthRetry == nil || p.oauthRetry.current == nil {
+	if p == nil || p.oauth == nil || p.oauth.current == nil {
 		return nil
 	}
-	target := *p.oauthRetry.current
+	target := *p.oauth.current
 	return &target
 }
 
@@ -162,13 +246,13 @@ func (p *RetryParam) CaptureSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 	if state == nil {
 		return
 	}
-	p.oauthRetry.current.Generation = state.generation
-	p.oauthRetry.current.RecoveryProbe = state.recoveryProbe
-	p.oauthRetry.current.lease = state.lease
-	p.oauthRetry.current.ResponseScoped = state.responseScoped
+	p.oauth.current.Generation = state.generation
+	p.oauth.current.RecoveryProbe = state.recoveryProbe
+	p.oauth.current.lease = state.lease
+	p.oauth.current.ResponseScoped = state.responseScoped
 }
 
-func (p *RetryParam) HandleSubscriptionOAuthCapacityFailure() {
+func (p *RetryParam) handleSubscriptionOAuthCapacityFailure() {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return
@@ -176,26 +260,28 @@ func (p *RetryParam) HandleSubscriptionOAuthCapacityFailure() {
 	if p.Boundary != nil {
 		p.Boundary.ExcludeCredential(target.Fingerprint, target.ChannelID, target.KeyIndex)
 	}
-	if credential := p.oauthRetry.credentials[target.Fingerprint]; credential != nil && credential.attempts > 0 {
+	if credential := p.oauth.credentials[target.Fingerprint]; credential != nil && credential.attempts > 0 {
 		credential.attempts--
 	}
 	p.recordCapacityTarget(target)
-	p.oauthRetry.current = nil
+	p.oauth.current = nil
 	p.advanceCapacityReplay()
 }
 
-func (p *RetryParam) HandleSubscriptionOAuthCredentialUnavailable() {
+// RejectSubscriptionOAuthReplayTarget advances past a stale replay target
+// that can no longer be loaded or matched to its original credential.
+func (p *RetryParam) RejectSubscriptionOAuthReplayTarget() {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return
 	}
-	p.oauthRetry.current = nil
+	p.oauth.current = nil
 	p.advanceCapacityReplay()
 }
 
-// HandleSubscriptionOAuthAccountUnavailable removes an invalid or forbidden
+// handleSubscriptionOAuthAccountUnavailable removes an invalid or forbidden
 // account from this request and opens its short circuit for subsequent requests.
-func (p *RetryParam) HandleSubscriptionOAuthAccountUnavailable() {
+func (p *RetryParam) handleSubscriptionOAuthAccountUnavailable() {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return
@@ -203,10 +289,10 @@ func (p *RetryParam) HandleSubscriptionOAuthAccountUnavailable() {
 	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
 }
 
-// HandleSubscriptionOAuthModelUnavailable excludes the credential only from
+// handleSubscriptionOAuthModelUnavailable excludes the credential only from
 // the current request. Model entitlement is account- and model-specific, so it
 // must not make the account unavailable for other models.
-func (p *RetryParam) HandleSubscriptionOAuthModelUnavailable() {
+func (p *RetryParam) handleSubscriptionOAuthModelUnavailable() {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return
@@ -214,18 +300,18 @@ func (p *RetryParam) HandleSubscriptionOAuthModelUnavailable() {
 	if p.Boundary != nil {
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
-	if p.oauthRetry != nil {
-		p.oauthRetry.current = nil
+	if p.oauth != nil {
+		p.oauth.current = nil
 	}
 	p.advanceCapacityReplay()
 }
 
-// HandleSubscriptionOAuthModelCapacity removes a temporarily saturated
+// handleSubscriptionOAuthModelCapacity removes a temporarily saturated
 // credential from the current request and opens its short cooldown before the
 // next same-group credential is selected. This is intentionally distinct from
 // a model-entitlement failure, which is request-local and does not cool down
 // the OAuth account.
-func (p *RetryParam) HandleSubscriptionOAuthModelCapacity() {
+func (p *RetryParam) handleSubscriptionOAuthModelCapacity() {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return
@@ -246,7 +332,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 
 	stop := observation.DownstreamStarted || observation.RetryDisabled || observation.SpecificChannel
 	if IsSubscriptionOAuthAccountUnavailable(observation.ChannelType, observation.Error) {
-		p.HandleSubscriptionOAuthAccountUnavailable()
+		p.handleSubscriptionOAuthAccountUnavailable()
 		if stop {
 			return SubscriptionOAuthRetryStop, 0
 		}
@@ -254,7 +340,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 	}
 	if IsSubscriptionOAuthModelAtCapacity(observation.ChannelType, observation.Error) {
 		if !observation.DownstreamStarted {
-			p.HandleSubscriptionOAuthModelCapacity()
+			p.handleSubscriptionOAuthModelCapacity()
 		}
 		if stop {
 			return SubscriptionOAuthRetryStop, 0
@@ -263,7 +349,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 	}
 	if IsSubscriptionOAuthModelUnavailable(observation.ChannelType, observation.Error) {
 		if !observation.DownstreamStarted {
-			p.HandleSubscriptionOAuthModelUnavailable()
+			p.handleSubscriptionOAuthModelUnavailable()
 		}
 		if stop {
 			return SubscriptionOAuthRetryStop, 0
@@ -271,7 +357,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 		return SubscriptionOAuthSwitchCredential, 0
 	}
 	if IsSubscriptionOAuthConcurrencyLimit(observation.ChannelType, observation.Error) {
-		p.HandleSubscriptionOAuthCapacityFailure()
+		p.handleSubscriptionOAuthCapacityFailure()
 		if stop {
 			return SubscriptionOAuthRetryStop, observation.Error.RetryAfter
 		}
@@ -281,7 +367,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 	statusCode := observation.Error.GetUpstreamStatusCode()
 	if statusCode == http.StatusTooManyRequests {
 		retryAfter := SubscriptionOAuthRetryCooldown(observation.Error.RetryAfter)
-		decision := p.DecideSubscriptionOAuthRetry(
+		decision := p.decideSubscriptionOAuthRetry(
 			observation.UpstreamRequestWritten,
 			observation.UpstreamResponseStarted,
 			observation.ExplicitFailureResponse,
@@ -294,7 +380,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 	if stop || !observation.Retryable {
 		return SubscriptionOAuthRetryStop, 0
 	}
-	return p.DecideSubscriptionOAuthRetry(
+	return p.decideSubscriptionOAuthRetry(
 		observation.UpstreamRequestWritten,
 		observation.UpstreamResponseStarted,
 		observation.ExplicitFailureResponse,
@@ -304,9 +390,9 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 	), 0
 }
 
-// DecideSubscriptionOAuthRetry applies a per-credential retry budget. A local
+// decideSubscriptionOAuthRetry applies a per-credential retry budget. A local
 // capacity failure is handled separately and never consumes this budget.
-func (p *RetryParam) DecideSubscriptionOAuthRetry(
+func (p *RetryParam) decideSubscriptionOAuthRetry(
 	written bool,
 	responseStarted bool,
 	explicitFailureResponse bool,
@@ -329,7 +415,7 @@ func (p *RetryParam) DecideSubscriptionOAuthRetry(
 		return SubscriptionOAuthRetryStop
 	}
 
-	state := p.ensureSubscriptionOAuthRetryState()
+	state := p.ensureSubscriptionOAuthTracker()
 	credential := state.credentials[target.Fingerprint]
 	if credential == nil {
 		credential = &subscriptionOAuthCredentialRetry{}
@@ -381,8 +467,8 @@ func (p *RetryParam) failCurrentSubscriptionOAuthCredential(target *Subscription
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
 	CooldownSubscriptionOAuthCredential(target.Fingerprint, target.Generation, cooldown)
-	if p.oauthRetry != nil {
-		p.oauthRetry.current = nil
+	if p.oauth != nil {
+		p.oauth.current = nil
 	}
 	p.advanceCapacityReplay()
 }
