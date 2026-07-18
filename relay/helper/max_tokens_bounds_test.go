@@ -69,4 +69,20 @@ func TestMaxTokensBounds(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "max_output_tokens is invalid")
 	})
+
+	for _, test := range []struct {
+		alias     string
+		modelName string
+	}{
+		{alias: "Sol", modelName: "gpt-5.6-sol"},
+		{alias: "Terra", modelName: "gpt-5.6-terra"},
+		{alias: "Luna", modelName: "gpt-5.6-luna"},
+	} {
+		t.Run("responses normalizes "+test.alias, func(t *testing.T) {
+			c := newJSONContext(t, `{"model":"`+test.alias+`","input":"hi"}`)
+			req, err := GetAndValidateResponsesRequest(c)
+			require.NoError(t, err)
+			require.Equal(t, test.modelName, req.Model)
+		})
+	}
 }

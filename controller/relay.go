@@ -100,6 +100,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				relaycommon.IsSubscriptionOAuthChannel(c.GetInt("channel_type")) {
 				c.Header("Retry-After", "2")
 			}
+			if c.GetBool("responses_stream_failure_emitted") {
+				return
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -229,6 +232,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		attempt := len(c.GetStringSlice("use_channel"))
 		service.ApplyRelayDataPolicyHeaders(c, channel, attempt)
 		clearStaleRetryAfter(c)
+		relaycommon.ClearResponsesStreamPreflightFailureEvent(c)
 		relayInfo.ResetUpstreamAttemptState()
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
@@ -288,6 +292,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if isSubscriptionOAuth {
 			if !shouldContinueSubscriptionOAuthRetry(c, relayInfo, retryParam, newAPIError) {
+				if relayInfo.RelayMode == relayconstant.RelayModeResponses && !c.Writer.Written() {
+					if data, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c); exists {
+						helper.SetEventStreamHeaders(c)
+						if helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.failed"}, data) == nil {
+							c.Set("responses_stream_failure_emitted", true)
+						}
+					}
+				}
 				break
 			}
 			continue
@@ -334,6 +346,8 @@ func shouldContinueSubscriptionOAuthRetry(
 	if accountUnavailable || modelUnavailable || modelAtCapacity {
 		if accountUnavailable {
 			retryParam.HandleSubscriptionOAuthAccountUnavailable()
+		} else if modelAtCapacity && !c.Writer.Written() {
+			retryParam.HandleSubscriptionOAuthModelCapacity()
 		} else if !c.Writer.Written() {
 			retryParam.HandleSubscriptionOAuthModelUnavailable()
 		}

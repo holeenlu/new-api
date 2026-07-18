@@ -140,7 +140,7 @@ func TestCodexResponsesLiteFiltersHostedToolsAndKeepsClientTools(t *testing.T) {
 		},
 	}
 	tools := json.RawMessage(`[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"},{"type":"namespace","name":"collaboration"},{"type":"web_search"},{"type":"image_generation"}]`)
-	input := json.RawMessage(`[{"type":"additional_tools","tools":[{"type":"function","name":"keep"},{"type":"web_search"}]},{"role":"user","content":"hello"}]`)
+	input := json.RawMessage(`[{"type":"additional_tools","tools":[{"type":"function","name":"keep"},{"type":"namespace","name":"collaboration"},{"type":"web_search"}]},{"role":"user","content":"hello"}]`)
 
 	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{
 		Tools:      tools,
@@ -149,8 +149,8 @@ func TestCodexResponsesLiteFiltersHostedToolsAndKeepsClientTools(t *testing.T) {
 	})
 	require.NoError(t, err)
 	got := converted.(dto.OpenAIResponsesRequest)
-	require.JSONEq(t, `[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"}]`, string(got.Tools))
-	require.JSONEq(t, `[{"type":"additional_tools","tools":[{"type":"function","name":"keep"}]},{"role":"user","content":"hello"}]`, string(got.Input))
+	require.JSONEq(t, `[{"type":"function","name":"lookup"},{"type":"custom","name":"shell"},{"type":"tool_search","execution":"client"},{"type":"namespace","name":"collaboration"}]`, string(got.Tools))
+	require.JSONEq(t, `[{"type":"additional_tools","tools":[{"type":"function","name":"keep"},{"type":"namespace","name":"collaboration"}]},{"role":"user","content":"hello"}]`, string(got.Input))
 	require.JSONEq(t, `"auto"`, string(got.ToolChoice))
 	require.NotNil(t, got.Reasoning)
 	require.NotEmpty(t, got.ClientMetadata)
@@ -159,6 +159,19 @@ func TestCodexResponsesLiteFiltersHostedToolsAndKeepsClientTools(t *testing.T) {
 	require.NoError(t, (&Adaptor{}).SetupRequestHeader(c, &headers, info))
 	require.Equal(t, "true", headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"))
 	require.Equal(t, "Codex Desktop", headers.Get("Originator"))
+}
+
+func TestCodexResponsesLiteKeepsNamespaceToolChoice(t *testing.T) {
+	payload, err := FilterResponsesLitePayload([]byte(`{
+		"tools":[{"type":"namespace","name":"collaboration"}],
+		"tool_choice":{"type":"namespace","name":"collaboration"}
+	}`))
+
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"tools":[{"type":"namespace","name":"collaboration"}],
+		"tool_choice":{"type":"namespace","name":"collaboration"}
+	}`, string(payload))
 }
 
 func TestCodexResponsesLiteIsNotEnabledForOtherModelsOrCompact(t *testing.T) {

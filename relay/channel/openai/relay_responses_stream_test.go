@@ -70,6 +70,25 @@ func TestCodexResponsesStreamRetriesModelCapacityBeforeOutput(t *testing.T) {
 	require.Empty(t, recorder.Header().Get("X-Codex-Turn-State"))
 }
 
+func TestCodexResponsesStreamRetriesServerOverloadBeforeOutput(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded"}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeModelAtCapacity, apiError.GetErrorCode())
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.Empty(t, recorder.Body.String())
+	failureEvent, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c)
+	require.True(t, exists)
+	require.Contains(t, failureEvent, `"type":"response.failed"`)
+}
+
 func TestCodexResponsesStreamFlushesPreflightEventsInOrder(t *testing.T) {
 	c, recorder, resp, info := newCodexResponsesStreamTest(t,
 		`data: {"type":"response.created","response":{"id":"resp_1"}}`,

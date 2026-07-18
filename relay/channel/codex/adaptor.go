@@ -87,6 +87,14 @@ func getOrCreateCodexResponsesMetadata(c *gin.Context) (*codexChannelTestMetadat
 }
 
 func shouldUseCodexResponsesLite(info *relaycommon.RelayInfo) bool {
+	return IsResponsesLiteRequest(info)
+}
+
+// IsResponsesLiteRequest reports whether a request will use the Codex
+// Responses Lite protocol. Keep this decision shared by conversion and the
+// final outbound-payload filter so channel overrides cannot reintroduce
+// hosted tools that Lite rejects.
+func IsResponsesLiteRequest(info *relaycommon.RelayInfo) bool {
 	return info != nil &&
 		info.RelayMode == relayconstant.RelayModeResponses &&
 		isCodexLiteModel(info)

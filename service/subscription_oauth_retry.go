@@ -218,6 +218,19 @@ func (p *RetryParam) HandleSubscriptionOAuthModelUnavailable() {
 	p.advanceCapacityReplay()
 }
 
+// HandleSubscriptionOAuthModelCapacity removes a temporarily saturated
+// credential from the current request and opens its short cooldown before the
+// next same-group credential is selected. This is intentionally distinct from
+// a model-entitlement failure, which is request-local and does not cool down
+// the OAuth account.
+func (p *RetryParam) HandleSubscriptionOAuthModelCapacity() {
+	target := p.SubscriptionOAuthAttemptTarget()
+	if target == nil {
+		return
+	}
+	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+}
+
 // DecideSubscriptionOAuthRetry applies a per-credential retry budget. A local
 // capacity failure is handled separately and never consumes this budget.
 func (p *RetryParam) DecideSubscriptionOAuthRetry(

@@ -26,9 +26,10 @@ func filterCodexResponsesLiteRequest(request *dto.OpenAIResponsesRequest) error 
 }
 
 // FilterResponsesLitePayload removes hosted tool declarations unsupported by
-// Responses Lite while preserving function, custom, and client tool search.
-// Tool declarations may also appear in additional_tools input items or nested
-// historical response metadata.
+// Responses Lite while preserving client-executed tools. Codex collaboration
+// tools are declared as namespaces and must remain intact for derived agent
+// sessions. Tool declarations may also appear in additional_tools input items
+// or nested historical response metadata.
 func FilterResponsesLitePayload(payload []byte) ([]byte, error) {
 	var root map[string]any
 	if err := common.Unmarshal(payload, &root); err != nil {
@@ -89,7 +90,7 @@ func codexResponsesLiteToolAllowed(value any) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(stringValue(tool["type"]))) {
-	case "function", "custom":
+	case "function", "custom", "namespace":
 		return true
 	case "tool_search":
 		return strings.EqualFold(strings.TrimSpace(stringValue(tool["execution"])), "client")

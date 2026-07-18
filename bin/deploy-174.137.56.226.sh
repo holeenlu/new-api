@@ -209,8 +209,13 @@ else
 fi
 
 if docker inspect new-api >/dev/null 2>&1; then
-  docker tag "$(docker inspect -f '{{.Image}}' new-api)" "$rollback_image"
-  rollback_available=true
+  previous_image=$(docker inspect -f '{{.Image}}' new-api)
+  if docker image inspect "$previous_image" >/dev/null 2>&1; then
+    docker tag "$previous_image" "$rollback_image"
+    rollback_available=true
+  else
+    echo "[deploy] Warning: current new-api container references missing image $previous_image; rollback is unavailable" >&2
+  fi
 fi
 
 gunzip -c "$archive" | docker load >/dev/null

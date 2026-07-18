@@ -165,6 +165,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				if service.IsSubscriptionOAuthModelAtCapacity(info.ChannelType, candidate) {
 					info.MarkUpstreamFailureResponse()
 					if !downstreamCommitted.Load() {
+						if streamResponse.Type == "response.failed" {
+							relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
+						}
 						preflightError = candidate
 						sr.Stop(candidate)
 						return

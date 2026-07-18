@@ -10,6 +10,7 @@ import (
 	appconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -121,6 +122,13 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			jsonData, err = relaycommon.ApplyParamOverrideForChannel(jsonData, info)
 			if err != nil {
 				return newAPIErrorFromParamOverride(err)
+			}
+		}
+		if info.ChannelType == appconstant.ChannelTypeCodex && info.IsStream &&
+			codex.IsResponsesLiteRequest(info) {
+			jsonData, err = codex.FilterResponsesLitePayload(jsonData)
+			if err != nil {
+				return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 			}
 		}
 

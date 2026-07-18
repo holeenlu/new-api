@@ -71,8 +71,12 @@ fi
 ROLLBACK_AVAILABLE=false
 if docker inspect new-api >/dev/null 2>&1; then
   PREVIOUS_IMAGE_ID=$(docker inspect -f '{{.Image}}' new-api)
-  docker tag "$PREVIOUS_IMAGE_ID" "$ROLLBACK_IMAGE"
-  ROLLBACK_AVAILABLE=true
+  if docker image inspect "$PREVIOUS_IMAGE_ID" >/dev/null 2>&1; then
+    docker tag "$PREVIOUS_IMAGE_ID" "$ROLLBACK_IMAGE"
+    ROLLBACK_AVAILABLE=true
+  else
+    deploy_log "Warning: current new-api container references missing image $PREVIOUS_IMAGE_ID; rollback is unavailable"
+  fi
 fi
 
 rollback_local() {

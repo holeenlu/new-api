@@ -197,6 +197,9 @@ var subscriptionOAuthModelCapacityMarkers = []string{
 	"model is at capacity",
 	"model_at_capacity",
 	"model capacity",
+	"server_is_overloaded",
+	"service_unavailable_error",
+	"servers are currently overloaded",
 }
 
 func containsSubscriptionOAuthErrorMarker(message, code string, markers []string) bool {

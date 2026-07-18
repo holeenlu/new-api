@@ -184,6 +184,20 @@ func TestApplyChannelErrorPolicyClassifiesModelCapacitySeparatelyFromRateLimit(t
 	require.True(t, types.IsSkipRetryError(got))
 }
 
+func TestApplyChannelErrorPolicyClassifiesResponsesStreamOverloadAsCapacity(t *testing.T) {
+	err := types.NewOpenAIError(
+		errors.New("Our servers are currently overloaded"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+	err.RelayError = &types.OpenAIError{Type: "service_unavailable_error", Code: "server_is_overloaded"}
+
+	got := ApplyChannelErrorPolicy(constant.ChannelTypeCodex, err)
+
+	require.Equal(t, types.ErrorCodeModelAtCapacity, got.GetErrorCode())
+	require.True(t, IsSubscriptionOAuthModelAtCapacity(constant.ChannelTypeCodex, got))
+}
+
 func TestApplyChannelErrorPolicyClassifiesModelErrorCodeWithoutMessageHint(t *testing.T) {
 	err := types.NewOpenAIError(errors.New("resource unavailable"), types.ErrorCodeModelNotFound, http.StatusNotFound)
 

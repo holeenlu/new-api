@@ -137,6 +137,14 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 	if request.Model == "" {
 		return nil, errors.New("model is required")
 	}
+	switch strings.ToLower(strings.TrimSpace(request.Model)) {
+	case "sol":
+		request.Model = "gpt-5.6-sol"
+	case "terra":
+		request.Model = "gpt-5.6-terra"
+	case "luna":
+		request.Model = "gpt-5.6-luna"
+	}
 	if request.Input == nil {
 		return nil, errors.New("input is required")
 	}
