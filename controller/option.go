@@ -238,6 +238,101 @@ type OptionUpdateRequest struct {
 	Value any    `json:"value"`
 }
 
+type optionBatchUpdateRequest struct {
+	Options map[string]string `json:"options"`
+}
+
+var routingReliabilityOptionKeys = map[string]struct{}{
+	"RetryTimes":                                {},
+	"SubscriptionOAuthUpstreamRetryTimes":       {},
+	"SubscriptionOAuthCapacityCycleTimes":       {},
+	"SubscriptionOAuthCapacityWaitSeconds":      {},
+	"SubscriptionOAuthRetry429":                 {},
+	"ChannelDisableThreshold":                   {},
+	"AutomaticDisableChannelEnabled":            {},
+	"AutomaticEnableChannelEnabled":             {},
+	"AutomaticDisableKeywords":                  {},
+	"AutomaticDisableStatusCodes":               {},
+	"AutomaticRetryStatusCodes":                 {},
+	"monitor_setting.auto_test_channel_enabled": {},
+	"monitor_setting.auto_test_channel_minutes": {},
+	"monitor_setting.channel_test_mode":         {},
+}
+
+func validateRoutingReliabilityOption(key, value string) error {
+	if _, ok := routingReliabilityOptionKeys[key]; !ok {
+		return fmt.Errorf("配置项 %s 不支持批量保存", key)
+	}
+
+	switch key {
+	case "RetryTimes", "SubscriptionOAuthUpstreamRetryTimes", "SubscriptionOAuthCapacityCycleTimes":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 10 {
+			return fmt.Errorf("%s 必须是 0 到 10 的整数", key)
+		}
+	case "SubscriptionOAuthCapacityWaitSeconds":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 30 {
+			return fmt.Errorf("%s 必须是 0 到 30 的整数", key)
+		}
+	case "SubscriptionOAuthRetry429", "AutomaticDisableChannelEnabled", "AutomaticEnableChannelEnabled", "monitor_setting.auto_test_channel_enabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s 必须是布尔值", key)
+		}
+	case "ChannelDisableThreshold":
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			parsed, err := strconv.ParseFloat(trimmed, 64)
+			if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 {
+				return fmt.Errorf("%s 必须是非负数或留空", key)
+			}
+		}
+	case "AutomaticDisableStatusCodes", "AutomaticRetryStatusCodes":
+		if _, err := operation_setting.ParseHTTPStatusCodeRanges(value); err != nil {
+			return err
+		}
+	case "monitor_setting.auto_test_channel_minutes":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return fmt.Errorf("%s 必须是不小于 1 的整数", key)
+		}
+	case "monitor_setting.channel_test_mode":
+		if value != "scheduled_all" && value != "passive_recovery" {
+			return fmt.Errorf("%s 无效", key)
+		}
+	}
+	return nil
+}
+
+func UpdateRoutingReliabilityOptions(c *gin.Context) {
+	var request optionBatchUpdateRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || len(request.Options) == 0 {
+		common.ApiErrorMsg(c, "无效的参数")
+		return
+	}
+	if len(request.Options) > len(routingReliabilityOptionKeys) {
+		common.ApiErrorMsg(c, "配置项数量超过限制")
+		return
+	}
+	for key, value := range request.Options {
+		if err := validateRoutingReliabilityOption(key, value); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if err := model.UpdateOptionsBulk(request.Options); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	keys := make([]string, 0, len(request.Options))
+	for key := range request.Options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	recordManageAudit(c, "option.routing_reliability.update", map[string]interface{}{"keys": keys})
+	common.ApiSuccess(c, nil)
+}
+
 type modelPricingOptionsUpdateRequest struct {
 	Options map[string]string `json:"options"`
 }

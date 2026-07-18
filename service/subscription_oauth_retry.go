@@ -30,9 +30,8 @@ type SubscriptionOAuthAttemptTarget struct {
 }
 
 type subscriptionOAuthCredentialRetry struct {
-	attempts         int
-	failures         int
-	postWriteRetries int
+	attempts int
+	failures int
 }
 
 type subscriptionOAuthTracker struct {
@@ -74,15 +73,18 @@ func BindSubscriptionOAuthLease(c *gin.Context, lease *SubscriptionOAuthLease) {
 		return
 	}
 	state := subscriptionOAuthState(c, true)
-	state.generation = lease.Generation()
-	state.recoveryProbe = lease.IsRecoveryProbe()
-	state.lease = lease
+	if state.attempt == nil {
+		state.attempt = &SubscriptionOAuthAttemptTarget{}
+	}
+	state.attempt.Generation = lease.Generation()
+	state.attempt.RecoveryProbe = lease.IsRecoveryProbe()
+	state.attempt.lease = lease
 }
 
 func BindSubscriptionOAuthResponseLease(c *gin.Context, lease *SubscriptionOAuthLease) {
 	BindSubscriptionOAuthLease(c, lease)
 	if state := subscriptionOAuthState(c, false); state != nil && lease != nil {
-		state.responseScoped = true
+		state.attempt.ResponseScoped = true
 	}
 }
 
@@ -91,10 +93,7 @@ func ClearSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 		return
 	}
 	state := subscriptionOAuthState(c, true)
-	state.generation = 0
-	state.recoveryProbe = false
-	state.lease = nil
-	state.responseScoped = false
+	state.attempt = nil
 }
 
 // ResolveBoundSubscriptionOAuthResponse records the outcome of a response
@@ -103,11 +102,11 @@ func ClearSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 // reserved until the response outcome is known.
 func ResolveBoundSubscriptionOAuthResponse(c *gin.Context, success bool) {
 	state := subscriptionOAuthState(c, false)
-	if state == nil || !state.responseScoped {
+	if state == nil || state.attempt == nil || !state.attempt.ResponseScoped {
 		return
 	}
-	if state.lease != nil {
-		state.lease.ResolveResponse(success)
+	if state.attempt.lease != nil {
+		state.attempt.lease.ResolveResponse(success)
 	}
 }
 
@@ -173,7 +172,7 @@ func (p *RetryParam) advanceCapacityReplay() {
 	}
 	target := tracker.capacityOrder[tracker.capacityCursor]
 	tracker.capacityCursor++
-	tracker.current = &target
+	p.setSubscriptionOAuthAttemptTarget(&target)
 	if tracker.credentials[target.Fingerprint] == nil {
 		tracker.credentials[target.Fingerprint] = &subscriptionOAuthCredentialRetry{}
 	}
@@ -217,16 +216,32 @@ func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, finger
 		if p.Boundary != nil {
 			p.Boundary.FailCredential(fingerprint)
 		}
-		state.current = nil
+		p.clearSubscriptionOAuthAttemptTarget()
 		return false
 	}
 	credential.attempts++
-	state.current = &SubscriptionOAuthAttemptTarget{
+	p.setSubscriptionOAuthAttemptTarget(&SubscriptionOAuthAttemptTarget{
 		ChannelID:   channelID,
 		KeyIndex:    keyIndex,
 		Fingerprint: fingerprint,
-	}
+	})
 	return true
+}
+
+func (p *RetryParam) setSubscriptionOAuthAttemptTarget(target *SubscriptionOAuthAttemptTarget) {
+	if p == nil || p.oauth == nil {
+		return
+	}
+	p.oauth.current = target
+	if p.Ctx != nil {
+		if state := subscriptionOAuthState(p.Ctx, true); state != nil {
+			state.attempt = target
+		}
+	}
+}
+
+func (p *RetryParam) clearSubscriptionOAuthAttemptTarget() {
+	p.setSubscriptionOAuthAttemptTarget(nil)
 }
 
 func (p *RetryParam) SubscriptionOAuthAttemptTarget() *SubscriptionOAuthAttemptTarget {
@@ -243,13 +258,9 @@ func (p *RetryParam) CaptureSubscriptionOAuthAttemptMetadata(c *gin.Context) {
 		return
 	}
 	state := subscriptionOAuthState(c, false)
-	if state == nil {
-		return
+	if state != nil && state.attempt != p.oauth.current {
+		state.attempt = p.oauth.current
 	}
-	p.oauth.current.Generation = state.generation
-	p.oauth.current.RecoveryProbe = state.recoveryProbe
-	p.oauth.current.lease = state.lease
-	p.oauth.current.ResponseScoped = state.responseScoped
 }
 
 func (p *RetryParam) handleSubscriptionOAuthCapacityFailure() {
@@ -264,7 +275,7 @@ func (p *RetryParam) handleSubscriptionOAuthCapacityFailure() {
 		credential.attempts--
 	}
 	p.recordCapacityTarget(target)
-	p.oauth.current = nil
+	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }
 
@@ -275,7 +286,7 @@ func (p *RetryParam) RejectSubscriptionOAuthReplayTarget() {
 	if target == nil {
 		return
 	}
-	p.oauth.current = nil
+	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }
 
@@ -300,9 +311,7 @@ func (p *RetryParam) handleSubscriptionOAuthModelUnavailable() {
 	if p.Boundary != nil {
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
-	if p.oauth != nil {
-		p.oauth.current = nil
-	}
+	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }
 
@@ -435,15 +444,11 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 		return SubscriptionOAuthSwitchCredential
 	}
 
-	// A request that may already have reached the provider is allowed only one
-	// ambiguous retry, and it still has to fit within the general failure budget.
-	if written && (!responseStarted || !explicitFailureResponse) {
-		if credential.postWriteRetries >= 1 {
-			p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
-			return SubscriptionOAuthSwitchCredential
-		}
-		credential.postWriteRetries++
-		return SubscriptionOAuthRetryCurrentCredential
+	// Once bytes may have reached the provider, the gateway has no idempotency
+	// proof. Replaying to this or another credential can duplicate execution or
+	// billing, so preserve the original upstream error for the client.
+	if written {
+		return SubscriptionOAuthRetryStop
 	}
 
 	return SubscriptionOAuthRetryCurrentCredential
@@ -467,9 +472,7 @@ func (p *RetryParam) failCurrentSubscriptionOAuthCredential(target *Subscription
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
 	CooldownSubscriptionOAuthCredential(target.Fingerprint, target.Generation, cooldown)
-	if p.oauth != nil {
-		p.oauth.current = nil
-	}
+	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }
 

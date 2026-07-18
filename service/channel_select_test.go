@@ -91,40 +91,32 @@ func TestSubscriptionOAuthRetrySwitchesAfterFiveCredentialFailures(t *testing.T)
 	require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
 }
 
-func TestSubscriptionOAuthRetryLimitsAmbiguousPostWriteFailure(t *testing.T) {
+func TestSubscriptionOAuthRetryStopsAmbiguousPostWriteFailure(t *testing.T) {
 	retryParam := &RetryParam{}
 	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a")
 	require.Equal(
 		t,
-		SubscriptionOAuthRetryCurrentCredential,
-		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
-	)
-	require.Equal(
-		t,
-		SubscriptionOAuthSwitchCredential,
+		SubscriptionOAuthRetryStop,
 		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
 	)
 }
 
-func TestSubscriptionOAuthAmbiguousFailureCannotExceedFailureBudget(t *testing.T) {
+func TestSubscriptionOAuthWrittenRequestStopsBeforeFailureBudget(t *testing.T) {
 	originalRetries := common.SubscriptionOAuthUpstreamRetryTimes
 	common.SubscriptionOAuthUpstreamRetryTimes = 5
 	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
 
 	retryParam := &RetryParam{}
 	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-budget")
-	for range 4 {
+	for range 3 {
 		require.Equal(
 			t,
 			SubscriptionOAuthRetryCurrentCredential,
 			retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusServiceUnavailable, 0),
 		)
 	}
-	require.Equal(
-		t,
-		SubscriptionOAuthSwitchCredential,
-		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0),
-	)
+	require.Equal(t, SubscriptionOAuthRetryStop,
+		retryParam.decideSubscriptionOAuthRetry(true, false, false, false, http.StatusBadGateway, 0))
 }
 
 func TestSubscriptionOAuthRetryZeroDisablesAmbiguousRetry(t *testing.T) {
@@ -214,9 +206,9 @@ func TestSubscriptionOAuthFailedRecoveryProbeSwitchesImmediately(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, lease.IsRecoveryProbe())
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	BindSubscriptionOAuthLease(c, lease)
-	retryParam := &RetryParam{}
+	retryParam := NewRetryParam(c, "default", "gpt-test", "/v1/responses")
 	retryParam.SetSubscriptionOAuthAttempt(1, 0, fingerprint)
+	BindSubscriptionOAuthLease(c, lease)
 	retryParam.CaptureSubscriptionOAuthAttemptMetadata(c)
 	lease.Release()
 

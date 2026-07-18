@@ -39,6 +39,10 @@ export type UpdateOptionResponse = {
   message: string
 }
 
+export type UpdateRoutingReliabilityOptionsRequest = {
+  options: Record<string, string>
+}
+
 export type UpdateModelPricingOptionsRequest = {
   options: Record<string, string>
 }

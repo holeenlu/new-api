@@ -28,6 +28,7 @@ import type {
   UpdateModelPricingOptionsRequest,
   UpdateOptionRequest,
   UpdateOptionResponse,
+  UpdateRoutingReliabilityOptionsRequest,
   UpstreamChannelsResponse,
   UpstreamLocationRefreshResponse,
   UpstreamRatiosResponse,
@@ -40,6 +41,16 @@ export async function getSystemOptions() {
 
 export async function updateSystemOption(request: UpdateOptionRequest) {
   const res = await api.put<UpdateOptionResponse>('/api/option/', request)
+  return res.data
+}
+
+export async function updateRoutingReliabilityOptions(
+  request: UpdateRoutingReliabilityOptionsRequest
+) {
+  const res = await api.put<UpdateOptionResponse>(
+    '/api/option/routing-reliability',
+    request
+  )
   return res.data
 }
 

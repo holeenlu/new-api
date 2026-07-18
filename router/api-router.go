@@ -189,6 +189,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			optionRoute.GET("/", controller.GetOptions)
 			optionRoute.PUT("/", controller.UpdateOption)
+			optionRoute.PUT("/routing-reliability", controller.UpdateRoutingReliabilityOptions)
 			optionRoute.PUT("/model-pricing", controller.UpdateModelPricingOptions)
 			optionRoute.POST("/payment_compliance", controller.ConfirmPaymentCompliance)
 			optionRoute.POST("/upstream-location/refresh", controller.RefreshUpstreamLocationProfiles)

@@ -503,8 +503,9 @@ Buildx 缓存默认在每次成功构建后清理 24 小时未使用的数据，
 调整，设置 `DEPLOY_PRUNE_BUILD_CACHE=false` 才会完全关闭清理。
 
 三支正式服务器脚本分别配置自己的 SSH、目录、Compose、Caddy、镜像标签、回滚标签和公网验收，
-只复用 `bin/deploy-common.sh` 中无服务器状态的构建、校验和环境文件工具；已删除旧的参数化
-`bin/deploy-remote.sh`。每个正式入口都会在本机以当前源码独立构建自己的 `linux/amd64` 镜像，
+只保留目标参数，并复用 `bin/deploy-common.sh` 中的构建、传输、校验和验收编排。公共脚本会上传受
+版本控制的 `bin/deploy-remote.sh`，由它在目标服务器执行镜像装载、数据库备份、切换、回滚和本机
+健康检查；该远端激活脚本仍在使用，并未删除。每个正式入口都会在本机以当前源码独立构建自己的 `linux/amd64` 镜像，
 构建在服务器外完成，随后只传输该服务器 Compose、Caddyfile 和本次临时压缩镜像；不依赖
 `.deploy-artifacts`，不上传源码，也不自动修改服务器 `.env`。服务器 `.env` 缺失时直接停止，避免使用
 其他服务器默认值。
@@ -651,3 +652,19 @@ Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth clien
 `backups/nextcode-20260715/remote-new-api.sql` 已被提交到 Git 历史。后者包含
 `channels`、`tokens`、`options`、`users` 与 `custom_oauth_providers` 等表的导出，字段范围内包含
 渠道密钥、API Key、OAuth client secret、访问令牌、用户认证和运行配置等敏感数据的可能载体。
+
+## 10. 架构维护记录
+
+本说明记录本次功能实际行为；当前模块边界、不可破坏约束和后续治理项另行维护在：
+
+```text
+docs/architecture/overview.md
+docs/architecture/invariants.md
+docs/architecture/health.md
+docs/adr/README.md
+```
+
+这些记录定义后续需求的处理方式：局部修复直接验证；跨模块功能先确认既有能力、单一状态所有者和
+失败/回滚行为；新增工作流、持久化状态、认证、计费或重试策略前先建立 ADR。此次梳理确认的下一批
+结构治理重点已落实 OAuth 尝试状态单一所有者与路由可靠性配置的事务批量保存；后续重点为部署脚本职责
+分层、`RelayInfo` 按稳定概念拆分，以及路由可靠性表单的 Schema 单一来源。

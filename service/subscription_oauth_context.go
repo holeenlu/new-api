@@ -5,10 +5,7 @@ import "github.com/gin-gonic/gin"
 const subscriptionOAuthRequestStateKey = "subscription_oauth_request_state"
 
 type subscriptionOAuthRequestState struct {
-	generation        uint64
-	recoveryProbe     bool
-	lease             *SubscriptionOAuthLease
-	responseScoped    bool
+	attempt           *SubscriptionOAuthAttemptTarget
 	retryDisabled     bool
 	credentialPreview string
 	credentialPath    []string

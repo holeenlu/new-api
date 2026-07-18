@@ -135,6 +135,41 @@ Do NOT directly import or call `encoding/json` in business code. `json.RawMessag
 - In React components, use `useTranslation()` and call `t('English key')` for user-facing text.
 - Follow `web/default/AGENTS.md` for detailed frontend conventions, including TypeScript, component structure, styling, accessibility, testing, and build checks.
 
+### Architecture Evolution
+
+Treat a requested feature as a user outcome to evaluate, not an instruction to
+add a new screen, route, state store, or workflow verbatim. Before a
+cross-module change, inspect the existing implementation and decide whether the
+correct result is to extend, consolidate, replace, or decline the requested
+shape. Explain a materially different recommendation before making it.
+
+Classify changes before implementation:
+
+- **Local**: contained bug fixes and presentation changes may be implemented
+  directly with focused verification.
+- **Cross-module**: new settings, APIs, or behavior spanning modules must name
+  the existing capability being extended, the single owner of new state, and
+  the failure/rollback behavior.
+- **Architectural**: new workflows, persistence models, retry policies,
+  authentication contracts, billing behavior, or provider integrations require
+  an ADR under `docs/adr/` before implementation.
+
+Follow the architecture records in `docs/architecture/`. `overview.md` records
+ownership boundaries, `invariants.md` lists release-blocking guarantees, and
+`health.md` tracks approved structural follow-up. Update the relevant record
+when a change alters it. `SOURCE_CHANGES_FOR_AUTHOR.md` is a functional change
+catalogue, not a substitute for architecture ownership or a decision record.
+
+Prefer deleting obsolete compatibility paths and consolidating duplicate state
+over adding another abstraction. Do not create a second source of truth for a
+setting, retry ledger, credential state, or request lifecycle. A temporary
+compatibility path must state its removal trigger in an ADR or code comment.
+
+For substantial changes, finish with a concise account of behavior changed,
+state ownership, code consolidated or removed, compatibility retained, and
+verification actually run. Do not report a build, test, or deployment as passed
+when merge conflicts, environmental restrictions, or failed checks prevented it.
+
 ### Project Governance
 
 **Protected project information:** The following project-related information is strictly protected and MUST NOT be modified, deleted, replaced, or removed under any circumstances:

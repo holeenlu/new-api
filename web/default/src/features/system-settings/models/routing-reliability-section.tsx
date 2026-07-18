@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -52,8 +52,8 @@ import {
 } from '../components/settings-form-layout'
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
+import { updateRoutingReliabilityOptions } from '../api'
 import { useResetForm } from '../hooks/use-reset-form'
-import { useUpdateOption } from '../hooks/use-update-option'
 import { safeNumberFieldProps } from '../utils/numeric-field'
 import {
   buildFormDefaults,
@@ -71,7 +71,7 @@ export function RoutingReliabilitySection({
   defaultValues,
 }: RoutingReliabilitySectionProps) {
   const { t } = useTranslation()
-  const updateOption = useUpdateOption()
+  const [isSaving, setIsSaving] = useState(false)
   const baselineRef = useRef<NormalizedRoutingReliabilityValues>(
     normalizeDefaults(defaultValues)
   )
@@ -119,12 +119,15 @@ export function RoutingReliabilitySection({
       return
     }
 
-    for (const key of updates) {
-      const value = normalized[key]
-      await updateOption.mutateAsync({
-        key,
-        value,
+    setIsSaving(true)
+    try {
+      await updateRoutingReliabilityOptions({
+        options: Object.fromEntries(
+          updates.map((key) => [key, String(normalized[key])])
+        ),
       })
+    } finally {
+      setIsSaving(false)
     }
 
     baselineRef.current = normalized
@@ -136,7 +139,7 @@ export function RoutingReliabilitySection({
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
           <SettingsPageFormActions
             onSave={form.handleSubmit(onSubmit)}
-            isSaving={updateOption.isPending}
+            isSaving={isSaving}
           />
 
           <div className='flex min-w-0 flex-col gap-4'>

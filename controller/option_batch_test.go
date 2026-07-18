@@ -63,6 +63,49 @@ func TestUpdateModelPricingOptionsRejectsWholeInvalidBatch(t *testing.T) {
 	require.Zero(t, count)
 }
 
+func TestUpdateRoutingReliabilityOptionsPersistsWholeValidatedBatch(t *testing.T) {
+	prepareOptionBatchTest(t)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/option/routing-reliability", optionBatchUpdateRequest{
+		Options: map[string]string{
+			"RetryTimes":                                "3",
+			"SubscriptionOAuthUpstreamRetryTimes":       "4",
+			"SubscriptionOAuthCapacityCycleTimes":       "2",
+			"SubscriptionOAuthCapacityWaitSeconds":      "5",
+			"SubscriptionOAuthRetry429":                 "true",
+			"AutomaticDisableStatusCodes":               "401, 500-599",
+			"AutomaticRetryStatusCodes":                 "500-599",
+			"monitor_setting.auto_test_channel_minutes": "10",
+			"monitor_setting.channel_test_mode":         "passive_recovery",
+		},
+	}, 1)
+
+	UpdateRoutingReliabilityOptions(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var options []model.Option
+	require.NoError(t, model.DB.Order("key asc").Find(&options).Error)
+	require.Len(t, options, 9)
+}
+
+func TestUpdateRoutingReliabilityOptionsRejectsWholeInvalidBatch(t *testing.T) {
+	prepareOptionBatchTest(t)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/option/routing-reliability", optionBatchUpdateRequest{
+		Options: map[string]string{
+			"RetryTimes":                           "3",
+			"SubscriptionOAuthCapacityWaitSeconds": "31",
+		},
+	}, 1)
+
+	UpdateRoutingReliabilityOptions(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.False(t, response.Success)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.Option{}).Count(&count).Error)
+	require.Zero(t, count)
+}
+
 func TestUpdateModelPricingOptionsRejectsUnsafeValuesAndExpressions(t *testing.T) {
 	tests := []struct {
 		name    string
