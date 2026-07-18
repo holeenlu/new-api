@@ -1429,16 +1429,17 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
+	channel := &model.Channel{
+		Type:    req.Type,
+		Key:     key,
+		BaseURL: &baseURL,
+	}
 	if req.Type == constant.ChannelTypeCodex {
-		models, err := fetchCodexUpstreamModelIDs(c.Request.Context(), 0, 0, baseURL, key, "")
+		models, err := service.FetchCodexChannelModels(channel)
 		if err != nil {
 			response := gin.H{
 				"success": false,
 				"message": fmt.Sprintf("获取 Codex 上游模型失败: %s", err.Error()),
-			}
-			var apiErr *types.NewAPIError
-			if errors.As(err, &apiErr) {
-				response["error_code"] = apiErr.GetErrorCode()
 			}
 			c.JSON(http.StatusOK, response)
 			return
@@ -1469,9 +1470,9 @@ func FetchModels(c *gin.Context) {
 
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, url, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
+		c.JSON(http.StatusOK, gin.H{
 			"success": false,
-			"message": err.Error(),
+			"message": fmt.Sprintf("获取模型列表失败: %s", err.Error()),
 		})
 		return
 	}
@@ -1535,6 +1536,7 @@ func FetchModels(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
+		"message": "",
 		"data":    models,
 	})
 }

@@ -324,25 +324,6 @@ func fetchCodexUpstreamModelCatalog(
 	return codex.FetchUpstreamModelCatalog(ctx, client, baseURL, key)
 }
 
-func fetchCodexUpstreamModelIDs(
-	ctx context.Context,
-	channelID int,
-	keyIndex int,
-	baseURL string,
-	key string,
-	proxyURL string,
-) ([]string, error) {
-	catalog, err := fetchCodexUpstreamModelCatalog(ctx, channelID, keyIndex, baseURL, key, proxyURL)
-	if err != nil {
-		return nil, err
-	}
-	models := make([]string, 0, len(catalog))
-	for _, item := range catalog {
-		models = append(models, item.Name())
-	}
-	return normalizeModelNames(models), nil
-}
-
 type channelUpstreamModelCatalog struct {
 	IDs      []string
 	Metadata map[string]dto.UpstreamModelMetadata
