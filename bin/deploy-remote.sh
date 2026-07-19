@@ -152,4 +152,6 @@ version=$(printf '%s' "$status_json" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
 }
 printf 'ARCHIVE_SHA256=%s\nAPP_VERSION=%s\nSTART_TIME=%s\n' "$expected_sha" "$version" "$start_time" >"$state_file"
 chmod 600 "$state_file"
+docker image rm "$build_image" >/dev/null 2>&1 || true
+docker image prune --force --filter 'label=org.opencontainers.image.title=new-api' >/dev/null || true
 switched=false

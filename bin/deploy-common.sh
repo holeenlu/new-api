@@ -116,6 +116,12 @@ deploy_build_image() {
   return 1
 }
 
+deploy_report_storage() {
+  local stage=$1
+  deploy_log "Docker storage summary (${stage})"
+  docker system df || deploy_log "Warning: unable to read Docker storage usage"
+}
+
 deploy_prune_build_cache() {
   local mode=${DEPLOY_PRUNE_BUILD_CACHE:-true}
   if [[ "$mode" == "false" || "$mode" == "0" ]]; then
@@ -123,17 +129,33 @@ deploy_prune_build_cache() {
   fi
 
   if [[ "$mode" == "all" ]]; then
-    deploy_log "Pruning all Buildx cache"
+    deploy_log "Removing all Buildx cache"
     docker buildx prune --all --force || deploy_log "Warning: Buildx cache cleanup failed"
     return 0
   fi
   [[ "$mode" == "true" || "$mode" == "1" ]] || deploy_die "DEPLOY_PRUNE_BUILD_CACHE must be false, true, or all"
-  local keep_storage=${DEPLOY_BUILD_CACHE_KEEP_STORAGE:-20GB}
-  local unused_for=${DEPLOY_BUILD_CACHE_UNUSED_FOR:-24h}
-  deploy_log "Pruning Buildx cache unused for ${unused_for}; keeping at most ${keep_storage}"
-  if ! docker buildx prune --force --filter "until=${unused_for}" --keep-storage "$keep_storage"; then
+  local max_used_space=${DEPLOY_BUILD_CACHE_MAX_USED_SPACE:-${DEPLOY_BUILD_CACHE_RESERVED_SPACE:-10GB}}
+  deploy_log "Pruning Buildx cache; keeping at most ${max_used_space} of regular build layers"
+  if ! docker buildx prune --all --force --filter type=regular --max-used-space "$max_used_space"; then
     deploy_log "Warning: Buildx cache cleanup failed; deployment will continue"
   fi
+}
+
+deploy_prune_audit_cache_volumes() {
+  deploy_flag_enabled DEPLOY_PRUNE_AUDIT_VOLUMES false || return 0
+
+  local volume
+  local volumes=()
+  while IFS= read -r volume; do
+    [[ -n "$volume" ]] && volumes+=("$volume")
+  done < <(docker volume ls --format '{{.Name}}' | grep -E '^new-api-(audit-go-(mod|build)|go-(mod|build)-cache(-race)?)$' || true)
+  ((${#volumes[@]} == 0)) && return 0
+
+  deploy_log "Removing unreferenced local Go audit/cache volumes"
+  for volume in "${volumes[@]}"; do
+    docker volume rm "$volume" >/dev/null 2>&1 || \
+      deploy_log "Keeping in-use cache volume: $volume"
+  done
 }
 
 deploy_assert_image_platform() {
@@ -399,6 +421,7 @@ deploy_server_main() {
 
   local app_version archive_sha remote_start_time version start_time status_json
   app_version=$(deploy_build_version "$ROOT_DIR")
+  deploy_report_storage "before ${DEPLOY_NAME} build"
   deploy_build_image "$ROOT_DIR" "$BUILD_IMAGE" linux/amd64 "$app_version" "$goproxy" "$goproxy_fallback" "$no_cache" \
     || deploy_die "$DEPLOY_NAME local source build failed"
   deploy_assert_image_platform "$BUILD_IMAGE" linux/amd64
@@ -455,5 +478,7 @@ deploy_server_main() {
   if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
     ssh_remote "$DEPLOY_TARGET" "docker image prune --force --filter 'label=org.opencontainers.image.title=new-api'" || deploy_log "Warning: image cleanup failed"
   fi
+  deploy_prune_audit_cache_volumes
+  deploy_report_storage "after ${DEPLOY_NAME} deployment"
   deploy_log "$DEPLOY_NAME deployment completed: version=$app_version start_time=$remote_start_time"
 }

@@ -47,6 +47,7 @@ COMPOSE=(
 
 deploy_log "Validating local test environment configuration"
 "${COMPOSE[@]}" config -q
+deploy_report_storage "before local build"
 deploy_build_image "$ROOT_DIR" "$IMAGE" "$PLATFORM" "$APP_VERSION" "$GOPROXY" "$GOPROXY_FALLBACK" "$NO_CACHE"
 deploy_assert_image_platform "$IMAGE" "$PLATFORM"
 deploy_assert_image_runs "$IMAGE" "$APP_VERSION" "$PLATFORM"
@@ -128,5 +129,7 @@ if deploy_flag_enabled DEPLOY_PRUNE_DANGLING_IMAGES true; then
     deploy_log "Warning: local dangling image cleanup failed"
   fi
 fi
+deploy_prune_audit_cache_volumes
+deploy_report_storage "after local deployment"
 
 deploy_log "Local test environment ready: url=http://127.0.0.1:3000 image=${IMAGE_ID#sha256:}"
