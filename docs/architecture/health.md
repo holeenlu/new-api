@@ -11,7 +11,7 @@ The customized branch adds or changes the following coherent domains:
 | Credential reliability | `service/subscription_oauth_*.go`, `service/retry_data_policy.go`, `controller/relay.go` | Capacity slots, pacing, circuit recovery, classified errors, retry boundaries, and data-policy isolation |
 | Model administration | `controller/channel_*`, `model/channel_*metadata.go` | Per-channel catalogues, model capability metadata, upstream model checks, and multi-key management |
 | Privacy and disclosure | `common/upstream_location.go`, `relay/common/location_privacy.go` | Network-profile discovery, client location filtering, and controlled response disclosure |
-| Pricing and options | `controller/option.go`, `model/option.go`, model-pricing UI | Validated transactional model-price saves and configurable completion ratios |
+| Pricing and options | `controller/option.go`, `controller/ratio_sync.go`, `controller/official_api_price_catalog.go`, `model/option.go`, model-pricing UI | Validated transactional model-price saves, configurable completion ratios, and reviewed official API pricing sources |
 | Deployment | `bin/deploy-*.sh`, Compose/Caddy files, Dockerfiles | Per-target artifacts, checksummed transfer, backup, rollback, and endpoint verification |
 | Default frontend | `web/default/src/features/channels`, `features/system-settings`, `lib` | OAuth configuration, channel governance, operational privacy, routing reliability, and localized errors |
 

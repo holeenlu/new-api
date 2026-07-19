@@ -45,6 +45,24 @@ func TestUpdateModelPricingOptionsPersistsValidatedBatch(t *testing.T) {
 	require.Len(t, options, 2)
 }
 
+func TestUpdateModelPricingOptionsPersistsPricingInputMode(t *testing.T) {
+	prepareOptionBatchTest(t)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/option/model-pricing", modelPricingOptionsUpdateRequest{
+		Options: map[string]string{
+			"ModelRatio":            `{"gpt-5":0.625}`,
+			"ModelPricingInputMode": `{"gpt-5":"price"}`,
+		},
+	}, 1)
+
+	UpdateModelPricingOptions(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var option model.Option
+	require.NoError(t, model.DB.First(&option, "key = ?", "ModelPricingInputMode").Error)
+	require.Equal(t, `{"gpt-5":"price"}`, option.Value)
+}
+
 func TestUpdateModelPricingOptionsRejectsWholeInvalidBatch(t *testing.T) {
 	prepareOptionBatchTest(t)
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/option/model-pricing", modelPricingOptionsUpdateRequest{
@@ -115,6 +133,12 @@ func TestUpdateModelPricingOptionsRejectsUnsafeValuesAndExpressions(t *testing.T
 			name: "negative ratio",
 			options: map[string]string{
 				"ModelRatio": `{"unsafe":-1}`,
+			},
+		},
+		{
+			name: "invalid pricing input mode",
+			options: map[string]string{
+				"ModelPricingInputMode": `{"unsafe":"per-token"}`,
 			},
 		},
 		{

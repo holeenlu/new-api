@@ -72,11 +72,11 @@ import {
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { updateModelPricingOptions } from '@/features/system-settings/api'
 import {
   useSystemOptions,
   getOptionValue,
 } from '@/features/system-settings/hooks/use-system-options'
-import { useUpdateOption } from '@/features/system-settings/hooks/use-update-option'
 import { normalizeJsonString } from '@/features/system-settings/models/utils'
 import type { ModelSettings } from '@/features/system-settings/types'
 import { safeJsonParse } from '@/features/system-settings/utils/json-parser'
@@ -159,8 +159,6 @@ export function ModelMutateDrawer({
   // Fetch system options for ratio configuration
   const { data: systemOptionsData } = useSystemOptions()
 
-  const updateOption = useUpdateOption()
-
   // Get model settings from system options
   const modelSettings = useMemo(() => {
     if (!systemOptionsData?.data) return null
@@ -182,6 +180,7 @@ export function ModelMutateDrawer({
       'claude.thinking_adapter_enabled': true,
       'claude.thinking_adapter_budget_tokens_percentage': 0.8,
       ModelPrice: '',
+      ModelPricingInputMode: '{}',
       ModelRatio: '',
       CacheRatio: '',
       CompletionRatio: '',
@@ -320,6 +319,12 @@ export function ModelMutateDrawer({
           modelSettings.ModelRatio,
           { fallback: {}, silent: true }
         )
+        const pricingInputModeMap = safeJsonParse<
+          Record<string, PricingSubMode>
+        >(modelSettings.ModelPricingInputMode, {
+          fallback: {},
+          silent: true,
+        })
         const cacheMap = safeJsonParse<Record<string, number>>(
           modelSettings.CacheRatio,
           { fallback: {}, silent: true }
@@ -354,12 +359,16 @@ export function ModelMutateDrawer({
         // Determine pricing mode
         if (price !== undefined && price !== null) {
           setPricingMode('per-request')
+          setPricingSubMode('ratio')
           form.reset({
             ...baseModelData,
             price: price.toString(),
           })
         } else {
           setPricingMode('per-token')
+          setPricingSubMode(
+            pricingInputModeMap[modelName] === 'price' ? 'price' : 'ratio'
+          )
           if (ratio !== undefined && ratio !== null) {
             const tokenPrice = ratio * 2
             setPromptPrice(tokenPrice.toString())
@@ -384,6 +393,7 @@ export function ModelMutateDrawer({
       } else {
         // If system settings not loaded yet, just load base model data
         setPricingMode('per-token')
+        setPricingSubMode('ratio')
         form.reset(baseModelData)
         setAdvancedOpen(false)
       }
@@ -472,6 +482,12 @@ export function ModelMutateDrawer({
               modelSettings.ModelRatio,
               { fallback: {}, silent: true }
             )
+            const pricingInputModeMap = safeJsonParse<
+              Record<string, PricingSubMode>
+            >(modelSettings.ModelPricingInputMode, {
+              fallback: {},
+              silent: true,
+            })
             const cacheMap = safeJsonParse<Record<string, number>>(
               modelSettings.CacheRatio,
               { fallback: {}, silent: true }
@@ -502,6 +518,7 @@ export function ModelMutateDrawer({
               delete imageMap[oldModelName]
               delete audioMap[oldModelName]
               delete audioCompletionMap[oldModelName]
+              delete pricingInputModeMap[oldModelName]
             }
 
             // Remove current model name from all maps first (always, to handle mode switches or clearing)
@@ -513,6 +530,7 @@ export function ModelMutateDrawer({
             delete imageMap[finalModelName]
             delete audioMap[finalModelName]
             delete audioCompletionMap[finalModelName]
+            delete pricingInputModeMap[finalModelName]
 
             // Only add new entries if user provided new configuration
             if (hasRatioConfig) {
@@ -523,6 +541,9 @@ export function ModelMutateDrawer({
               ) {
                 priceMap[finalModelName] = Number.parseFloat(values.price)
               } else if (pricingMode === 'per-token') {
+                if (pricingSubMode === 'price') {
+                  pricingInputModeMap[finalModelName] = 'price'
+                }
                 if (values.ratio && values.ratio !== '') {
                   ratioMap[finalModelName] = Number.parseFloat(values.ratio)
                 }
@@ -558,27 +579,27 @@ export function ModelMutateDrawer({
             }
 
             // Update system options if there are changes
-            const updates: Array<{ key: string; value: string }> = []
+            const updates: Record<string, string> = {}
 
             const newModelPrice = normalizeJsonString(JSON.stringify(priceMap))
             if (
               newModelPrice !== normalizeJsonString(modelSettings.ModelPrice)
             ) {
-              updates.push({ key: 'ModelPrice', value: newModelPrice })
+              updates.ModelPrice = newModelPrice
             }
 
             const newModelRatio = normalizeJsonString(JSON.stringify(ratioMap))
             if (
               newModelRatio !== normalizeJsonString(modelSettings.ModelRatio)
             ) {
-              updates.push({ key: 'ModelRatio', value: newModelRatio })
+              updates.ModelRatio = newModelRatio
             }
 
             const newCacheRatio = normalizeJsonString(JSON.stringify(cacheMap))
             if (
               newCacheRatio !== normalizeJsonString(modelSettings.CacheRatio)
             ) {
-              updates.push({ key: 'CacheRatio', value: newCacheRatio })
+              updates.CacheRatio = newCacheRatio
             }
 
             const newCompletionRatio = normalizeJsonString(
@@ -588,24 +609,21 @@ export function ModelMutateDrawer({
               newCompletionRatio !==
               normalizeJsonString(modelSettings.CompletionRatio)
             ) {
-              updates.push({
-                key: 'CompletionRatio',
-                value: newCompletionRatio,
-              })
+              updates.CompletionRatio = newCompletionRatio
             }
 
             const newImageRatio = normalizeJsonString(JSON.stringify(imageMap))
             if (
               newImageRatio !== normalizeJsonString(modelSettings.ImageRatio)
             ) {
-              updates.push({ key: 'ImageRatio', value: newImageRatio })
+              updates.ImageRatio = newImageRatio
             }
 
             const newAudioRatio = normalizeJsonString(JSON.stringify(audioMap))
             if (
               newAudioRatio !== normalizeJsonString(modelSettings.AudioRatio)
             ) {
-              updates.push({ key: 'AudioRatio', value: newAudioRatio })
+              updates.AudioRatio = newAudioRatio
             }
 
             const newAudioCompletionRatio = normalizeJsonString(
@@ -615,15 +633,28 @@ export function ModelMutateDrawer({
               newAudioCompletionRatio !==
               normalizeJsonString(modelSettings.AudioCompletionRatio)
             ) {
-              updates.push({
-                key: 'AudioCompletionRatio',
-                value: newAudioCompletionRatio,
-              })
+              updates.AudioCompletionRatio = newAudioCompletionRatio
             }
 
-            // Apply all updates (including deletions when clearing fields)
-            for (const update of updates) {
-              await updateOption.mutateAsync(update)
+            const newPricingInputMode = normalizeJsonString(
+              JSON.stringify(pricingInputModeMap)
+            )
+            if (
+              newPricingInputMode !==
+              normalizeJsonString(modelSettings.ModelPricingInputMode)
+            ) {
+              updates.ModelPricingInputMode = newPricingInputMode
+            }
+
+            if (Object.keys(updates).length > 0) {
+              const pricingResponse = await updateModelPricingOptions({
+                options: updates,
+              })
+              if (!pricingResponse.success) {
+                throw new Error(
+                  pricingResponse.message || 'Failed to update pricing'
+                )
+              }
             }
           }
 
@@ -652,7 +683,7 @@ export function ModelMutateDrawer({
       pricingMode,
       oldModelName,
       modelSettings,
-      updateOption,
+      pricingSubMode,
     ]
   )
 

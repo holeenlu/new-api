@@ -352,6 +352,19 @@ func validateModelPricingOption(key, value string) error {
 				return fmt.Errorf("%s[%s] 必须是有限的非负数", key, modelName)
 			}
 		}
+	case "ModelPricingInputMode":
+		var modes map[string]string
+		if err := common.UnmarshalJsonStr(value, &modes); err != nil {
+			return fmt.Errorf("ModelPricingInputMode 必须是字符串映射: %w", err)
+		}
+		for modelName, mode := range modes {
+			if strings.TrimSpace(modelName) == "" {
+				return fmt.Errorf("ModelPricingInputMode 不允许空模型名")
+			}
+			if mode != "ratio" && mode != "price" {
+				return fmt.Errorf("ModelPricingInputMode[%s] 必须是 ratio 或 price", modelName)
+			}
+		}
 	case "billing_setting.billing_mode":
 		var values map[string]string
 		if err := common.UnmarshalJsonStr(value, &values); err != nil {
@@ -437,7 +450,7 @@ func UpdateModelPricingOptions(c *gin.Context) {
 		common.ApiErrorMsg(c, "无效的参数")
 		return
 	}
-	if len(request.Options) > 11 {
+	if len(request.Options) > 12 {
 		common.ApiErrorMsg(c, "模型价格配置项数量超过限制")
 		return
 	}

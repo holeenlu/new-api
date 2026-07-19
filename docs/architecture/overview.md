@@ -55,6 +55,18 @@ lease to an adaptor, but must not become a second independent retry ledger.
   metadata; `model/official_model_metadata.go` provides public-specification
   fallbacks.
 
+### Model pricing sync
+
+- `controller/ratio_sync.go` owns the administrator-facing comparison and
+  explicit sync workflow.
+- `controller/official_api_price_catalog.go` owns read-only, reviewed OpenAI
+  and Anthropic public API token-price catalogues. It does not query or use
+  subscription OAuth credentials.
+- Model-pricing Options remain the only persisted price state; a catalogue
+  source only proposes differences until an administrator applies them.
+- `ModelPricingInputMode` is UI-state within that pricing domain. It preserves
+  the token-price editor view but never changes runtime billing.
+
 ### Privacy and upstream network profile
 
 - `relay/common/location_privacy.go` is the final request-body privacy filter.

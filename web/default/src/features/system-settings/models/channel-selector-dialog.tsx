@@ -45,8 +45,10 @@ import {
   CHANNEL_STATUS_CONFIG,
   DEFAULT_ENDPOINT,
   ENDPOINT_OPTIONS,
+  OFFICIAL_ANTHROPIC_PRICING_ID,
   MODELS_DEV_PRESET_ID,
   OFFICIAL_CHANNEL_ID,
+  OFFICIAL_OPENAI_PRICING_ID,
 } from './constants'
 
 type ChannelSelectorDialogProps = {
@@ -65,6 +67,15 @@ type ChannelSelectorDialogProps = {
 function isOfficialChannel(channel: UpstreamChannel): boolean {
   return (
     channel.id === OFFICIAL_CHANNEL_ID || channel.id === MODELS_DEV_PRESET_ID
+      || channel.id === OFFICIAL_OPENAI_PRICING_ID
+      || channel.id === OFFICIAL_ANTHROPIC_PRICING_ID
+  )
+}
+
+function isOfficialAPIPricingChannel(channel: UpstreamChannel): boolean {
+  return (
+    channel.id === OFFICIAL_OPENAI_PRICING_ID ||
+    channel.id === OFFICIAL_ANTHROPIC_PRICING_ID
   )
 }
 
@@ -224,6 +235,14 @@ export function ChannelSelectorDialog({
           const currentEndpoint =
             channelEndpoints[channel.id] || DEFAULT_ENDPOINT
           const endpointType = getEndpointType(currentEndpoint)
+
+          if (isOfficialAPIPricingChannel(channel)) {
+            return (
+              <span className='text-muted-foreground text-sm'>
+                {t('Official')}
+              </span>
+            )
+          }
 
           const handleTypeChange = (value: string) => {
             if (value === 'custom') {

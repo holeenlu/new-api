@@ -42,6 +42,20 @@ export const MODELS_DEV_PRESET_NAME = 'models.dev 价格预设'
 export const MODELS_DEV_PRESET_BASE_URL = 'https://models.dev'
 export const MODELS_DEV_PRESET_ENDPOINT = 'https://models.dev/api.json'
 
+export const OFFICIAL_OPENAI_PRICING_ID = -102
+export const OFFICIAL_OPENAI_PRICING_NAME = 'OpenAI 官方 API 价格'
+export const OFFICIAL_OPENAI_PRICING_BASE_URL =
+  'https://platform.openai.com/pricing'
+export const OFFICIAL_OPENAI_PRICING_ENDPOINT = 'official_openai_api_pricing'
+
+export const OFFICIAL_ANTHROPIC_PRICING_ID = -103
+export const OFFICIAL_ANTHROPIC_PRICING_NAME =
+  'Claude Code（Anthropic 官方 API）价格'
+export const OFFICIAL_ANTHROPIC_PRICING_BASE_URL =
+  'https://docs.anthropic.com/en/docs/about-claude/pricing'
+export const OFFICIAL_ANTHROPIC_PRICING_ENDPOINT =
+  'official_anthropic_api_pricing'
+
 export const OPENROUTER_ENDPOINT = 'openrouter'
 
 // Backend channel type for OpenRouter (see constant/channel.go: ChannelTypeOpenRouter = 20)
