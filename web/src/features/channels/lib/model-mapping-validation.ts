@@ -40,48 +40,6 @@ export function formatModelsArray(models: string[]): string {
 }
 
 /**
- * Add identity mappings for fetched upstream models without replacing custom
- * redirects already configured by the operator.
- */
-export function mergeFetchedModelsIntoMapping(
-  modelMapping: string,
-  models: string[]
-): string {
-  const trimmedMapping = modelMapping.trim()
-  const mapping: Record<string, string> = {}
-
-  if (trimmedMapping) {
-    try {
-      const parsed = JSON.parse(trimmedMapping)
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return modelMapping
-      }
-      for (const [source, target] of Object.entries(parsed)) {
-        if (typeof target === 'string') {
-          mapping[source] = target
-        }
-      }
-    } catch {
-      return modelMapping
-    }
-  }
-
-  const existingSources = new Set(
-    Object.keys(mapping)
-      .map((model) => model.trim())
-      .filter(Boolean)
-  )
-  for (const model of models) {
-    const normalizedModel = model.trim()
-    if (!normalizedModel || existingSources.has(normalizedModel)) continue
-    mapping[normalizedModel] = normalizedModel
-    existingSources.add(normalizedModel)
-  }
-
-  return Object.keys(mapping).length > 0 ? JSON.stringify(mapping, null, 2) : ''
-}
-
-/**
  * Normalize model name
  */
 export function normalizeModelName(model: string): string {

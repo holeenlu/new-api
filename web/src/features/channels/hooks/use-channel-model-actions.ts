@@ -25,7 +25,6 @@ import { fetchModels, fetchUpstreamModels } from '../api'
 import { MODEL_FETCHABLE_TYPES } from '../constants'
 import {
   formatModelsArray,
-  mergeFetchedModelsIntoMapping,
   parseModelsString,
   type ChannelFormValues,
 } from '../lib'
@@ -124,17 +123,6 @@ export function useChannelModelActions(props: UseChannelModelActionsProps) {
         shouldDirty: true,
         shouldValidate: true,
       })
-      const currentModelMapping = form.getValues('model_mapping') || ''
-      const mergedModelMapping = mergeFetchedModelsIntoMapping(
-        currentModelMapping,
-        modelList
-      )
-      if (mergedModelMapping !== currentModelMapping) {
-        form.setValue('model_mapping', mergedModelMapping, {
-          shouldDirty: true,
-          shouldValidate: true,
-        })
-      }
       toast.success(t('Fetched {{count}} models', { count: modelList.length }))
     } catch (error) {
       toast.error(
