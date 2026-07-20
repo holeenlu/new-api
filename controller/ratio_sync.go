@@ -41,12 +41,6 @@ const (
 	modelsDevPresetID              = -101
 	modelsDevPresetName            = "models.dev 价格预设"
 	modelsDevPresetBaseURL         = "https://models.dev"
-	officialOpenAIPresetID         = -102
-	officialOpenAIPresetName       = "OpenAI 官方 API 价格"
-	officialOpenAIPresetBaseURL    = "https://platform.openai.com/pricing"
-	officialAnthropicPresetID      = -103
-	officialAnthropicPresetName    = "Claude Code（Anthropic 官方 API）价格"
-	officialAnthropicPresetBaseURL = "https://docs.anthropic.com/en/docs/about-claude/pricing"
 	modelsDevHost                  = "models.dev"
 	modelsDevPath                  = "/api.json"
 	modelsDevInputCostRatioBase    = 1000.0
@@ -185,10 +179,6 @@ func FetchUpstreamRatios(c *gin.Context) {
 			}
 		}
 		for _, u := range req.Upstreams {
-			if isOfficialAPIPricingSource(u.ID) {
-				upstreams = append(upstreams, officialAPIPricingUpstream(u))
-				continue
-			}
 			if channel, ok := channelsByID[u.ID]; ok && !supportsUpstreamPricingSync(channel.Type) {
 				blockedResults = append(blockedResults, upstreamResult{
 					Name: fmt.Sprintf("%s(%d)", u.Name, u.ID),
@@ -230,11 +220,6 @@ func FetchUpstreamRatios(c *gin.Context) {
 					BaseURL:  strings.TrimRight(base, "/"),
 					Endpoint: "",
 				})
-			}
-		}
-		for _, id := range req.ChannelIDs {
-			if isOfficialAPIPricingSource(int(id)) {
-				upstreams = append(upstreams, officialAPIPricingUpstream(dto.UpstreamDTO{ID: int(id)}))
 			}
 		}
 	}
@@ -281,11 +266,6 @@ func FetchUpstreamRatios(c *gin.Context) {
 			uniqueName := chItem.Name
 			if chItem.ID != 0 {
 				uniqueName = fmt.Sprintf("%s(%d)", chItem.Name, chItem.ID)
-			}
-
-			if data, ok := officialAPIPricingRatioData(chItem.ID); ok {
-				ch <- upstreamResult{Name: uniqueName, Data: data}
-				return
 			}
 
 			isOpenRouter := chItem.Endpoint == "openrouter"
@@ -1085,15 +1065,6 @@ func GetSyncableChannels(c *gin.Context) {
 		BaseURL: modelsDevPresetBaseURL,
 		Status:  1,
 	})
-
-	for _, source := range officialAPIPricingSources() {
-		syncableChannels = append(syncableChannels, dto.SyncableChannel{
-			ID:      source.ID,
-			Name:    source.Name,
-			BaseURL: source.BaseURL,
-			Status:  common.ChannelStatusEnabled,
-		})
-	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

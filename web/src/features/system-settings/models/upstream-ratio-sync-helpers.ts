@@ -20,12 +20,8 @@ import type { RatioType } from '../types'
 import {
   MODELS_DEV_PRESET_ID,
   MODELS_DEV_PRESET_NAME,
-  OFFICIAL_ANTHROPIC_PRICING_ID,
-  OFFICIAL_ANTHROPIC_PRICING_NAME,
   OFFICIAL_CHANNEL_ID,
   OFFICIAL_CHANNEL_NAME,
-  OFFICIAL_OPENAI_PRICING_ID,
-  OFFICIAL_OPENAI_PRICING_NAME,
   RATIO_TYPE_OPTIONS,
 } from './constants'
 
@@ -172,11 +168,6 @@ export function getUpstreamDisplayName(sourceName: string): string {
   const synthesizedPresets = [
     { name: OFFICIAL_CHANNEL_NAME, id: OFFICIAL_CHANNEL_ID },
     { name: MODELS_DEV_PRESET_NAME, id: MODELS_DEV_PRESET_ID },
-    { name: OFFICIAL_OPENAI_PRICING_NAME, id: OFFICIAL_OPENAI_PRICING_ID },
-    {
-      name: OFFICIAL_ANTHROPIC_PRICING_NAME,
-      id: OFFICIAL_ANTHROPIC_PRICING_ID,
-    },
   ]
 
   for (const preset of synthesizedPresets) {
