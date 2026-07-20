@@ -150,7 +150,6 @@ func GetAllChannels(c *gin.Context) {
 		"page_size":   pageInfo.GetPageSize(),
 		"type_counts": typeCounts,
 	})
-	return
 }
 
 func FixChannelsAbilities(c *gin.Context) {
@@ -288,7 +287,6 @@ func SearchChannels(c *gin.Context) {
 			"type_counts": typeCounts,
 		},
 	})
-	return
 }
 
 func GetChannel(c *gin.Context) {
@@ -310,7 +308,6 @@ func GetChannel(c *gin.Context) {
 		"message": "",
 		"data":    channel,
 	})
-	return
 }
 
 // GetChannelKey 获取渠道密钥（需要通过安全验证中间件）

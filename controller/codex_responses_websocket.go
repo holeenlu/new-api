@@ -58,6 +58,12 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	var previousRequest map[string]any
 
 	engine := gin.New()
+	// This chain mirrors the /v1 relay group in router/relay-router.go
+	// (RouteTag → SystemPerformanceCheck → TokenAuth → ModelRequestRateLimit →
+	// Distribute) so a WebSocket response turn is authenticated, routed, and
+	// rate-limited identically to POST /v1/responses. BodyStorageCleanup is added
+	// explicitly because this is a fresh sub-engine rather than the global router.
+	// Keep it in sync when the relay middleware chain changes.
 	engine.Use(middleware.BodyStorageCleanup())
 	engine.Use(middleware.RouteTag("relay"))
 	engine.Use(middleware.SystemPerformanceCheck())

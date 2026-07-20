@@ -254,7 +254,6 @@ func BatchSetChannelTag(c *gin.Context) {
 		"message": "",
 		"data":    len(channelBatch.Ids),
 	})
-	return
 }
 
 func GetTagModels(c *gin.Context) {
@@ -295,5 +294,4 @@ func GetTagModels(c *gin.Context) {
 		"message": "",
 		"data":    longestModels,
 	})
-	return
 }

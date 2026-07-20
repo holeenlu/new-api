@@ -1,5 +1,14 @@
 # ADR 0001: Official API pricing catalogues
 
+Status: Superseded — the hardcoded catalogues (`controller/official_api_price_catalog.go`
+and the `OFFICIAL_*_PRICING_*` sync sources) were removed. Model-price sync now
+relies only on live sources: the models.dev preset, the official ratio preset,
+and other new-api/one-api instances that expose a pricing endpoint. A hardcoded
+per-model catalogue proved unmaintainable — every new upstream model required a
+source-code edit and redeploy before it could be priced, which is exactly the
+"incomplete prices" failure this record's Consequences warned about. The
+sections below are retained as historical context.
+
 ## Context
 
 Model pricing sync previously depended on third-party catalogues or a selected

@@ -276,18 +276,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryParam.MarkSubscriptionOAuthFailure()
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
-		newAPIError = service.ApplyChannelErrorPolicy(channel.Type, newAPIError)
+		newAPIError = recordChannelAttemptError(c, channel, newAPIError)
 		relayInfo.LastError = newAPIError
-
-		if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, newAPIError) {
-			logger.LogWarn(c, fmt.Sprintf(
-				"subscription OAuth capacity failover: channel=%d credential=%s",
-				channel.Id,
-				service.SubscriptionOAuthCredentialPreview(c),
-			))
-		} else {
-			processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-		}
 
 		if isSubscriptionOAuth {
 			if !shouldContinueSubscriptionOAuthRetry(c, relayInfo, retryParam, newAPIError) {
@@ -625,6 +615,34 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		)
 	}
 
+}
+
+// recordChannelAttemptError applies the channel error policy to a failed relay
+// attempt and records the outcome against channel health: a subscription-OAuth
+// capacity failover is logged without penalizing the channel, while every other
+// failure is charged to the channel via processChannelError. It returns the
+// policy-adjusted error so the caller can store it as the last error for retry
+// decisions. Sharing it keeps per-attempt error accounting identical across
+// every relay entry point (Relay and CodexAlphaSearch).
+func recordChannelAttemptError(c *gin.Context, channel *model.Channel, apiError *types.NewAPIError) *types.NewAPIError {
+	apiError = service.ApplyChannelErrorPolicy(channel.Type, apiError)
+	if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, apiError) {
+		logger.LogWarn(c, fmt.Sprintf(
+			"subscription OAuth capacity failover: channel=%d credential=%s",
+			channel.Id,
+			service.SubscriptionOAuthCredentialPreview(c),
+		))
+	} else {
+		processChannelError(c, *types.NewChannelError(
+			channel.Id,
+			channel.Type,
+			channel.Name,
+			channel.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+			channel.GetAutoBan(),
+		), apiError)
+	}
+	return apiError
 }
 
 func RelayMidjourney(c *gin.Context) {
