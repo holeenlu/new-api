@@ -21,6 +21,8 @@ services:
       REDIS_CONN_STRING: "${REDIS_CONN_STRING}"
       SESSION_SECRET: "${SESSION_SECRET}"
       CRYPTO_SECRET: "${CRYPTO_SECRET}"
+      SESSION_COOKIE_SECURE: "true"
+      SESSION_COOKIE_TRUSTED_URL: "https://cc00-ai.kdan.cc"
       TZ: "${TZ:-UTC}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
@@ -31,7 +33,7 @@ services:
       GLOBAL_WEB_RATE_LIMIT_ENABLE: "${GLOBAL_WEB_RATE_LIMIT_ENABLE:-false}"
       CRITICAL_RATE_LIMIT_ENABLE: "${CRITICAL_RATE_LIMIT_ENABLE:-false}"
       SEARCH_RATE_LIMIT_ENABLE: "${SEARCH_RATE_LIMIT_ENABLE:-false}"
-      CLAUDE_CODE_OAUTH_MAX_CONCURRENCY: "${CLAUDE_CODE_OAUTH_MAX_CONCURRENCY:-10}"
+      CLAUDE_CODE_OAUTH_MAX_CONCURRENCY: "${CLAUDE_CODE_OAUTH_MAX_CONCURRENCY:-5}"
       CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS: "${CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS:-750}"
       CODEX_OAUTH_MAX_CONCURRENCY: "${CODEX_OAUTH_MAX_CONCURRENCY:-10}"
       CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS: "${CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS:-750}"
@@ -116,7 +118,7 @@ services:
       - new-api-network
 
   gateway:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     container_name: new-api-port-proxy
     restart: unless-stopped
     logging: *default-logging
@@ -125,13 +127,20 @@ services:
         condition: service_healthy
     ports:
       - "192.168.172.80:3000:3000"
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
     volumes:
       - ./Caddyfile.192.168.172.80:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     networks:
       - new-api-network
 
 volumes:
   pg_data:
+  caddy_data:
+  caddy_config:
 
 networks:
   new-api-network:

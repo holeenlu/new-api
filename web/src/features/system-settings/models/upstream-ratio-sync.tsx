@@ -27,7 +27,7 @@ import { Button } from '@/components/ui/button'
 import {
   fetchUpstreamRatios,
   getUpstreamChannels,
-  updateSystemOption,
+  updateModelPricingOptions,
 } from '../api'
 import type {
   DifferencesMap,
@@ -202,37 +202,44 @@ export function UpstreamRatioSync({ modelRatios }: UpstreamRatioSyncProps) {
     },
   })
 
-  const { mutate: syncMutate, isPending: isSyncPending } = useMutation({
-    mutationFn: async (updates: Array<{ key: string; value: string }>) => {
-      for (const update of updates) {
-        await updateSystemOption(update)
-      }
-    },
-    onSuccess: () => {
-      toast.success(t('Prices synced successfully'))
-      queryClient.invalidateQueries({ queryKey: ['system-options'] })
-
-      setDifferences((prevDiffs) => {
-        const newDiffs = { ...prevDiffs }
-        Object.entries(resolutions).forEach(([model, ratios]) => {
-          Object.keys(ratios).forEach((ratioType) => {
-            if (newDiffs[model]?.[ratioType as RatioType]) {
-              delete newDiffs[model][ratioType as RatioType]
-              if (Object.keys(newDiffs[model]).length === 0) {
-                delete newDiffs[model]
-              }
-            }
-          })
+  const { mutateAsync: syncMutateAsync, isPending: isSyncPending } =
+    useMutation({
+      mutationFn: async (updates: Array<{ key: string; value: string }>) => {
+        const result = await updateModelPricingOptions({
+          options: Object.fromEntries(
+            updates.map(({ key, value }) => [key, value])
+          ),
         })
-        return newDiffs
-      })
+        if (!result.success) {
+          throw new Error(result.message || t('Failed to sync prices'))
+        }
+        return result
+      },
+      onSuccess: async () => {
+        await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+        toast.success(t('Prices synced successfully'))
 
-      setResolutions({})
-    },
-    onError: (error: Error) => {
-      toast.error(error.message || t('Failed to sync prices'))
-    },
-  })
+        setDifferences((prevDiffs) => {
+          const newDiffs = { ...prevDiffs }
+          Object.entries(resolutions).forEach(([model, ratios]) => {
+            Object.keys(ratios).forEach((ratioType) => {
+              if (newDiffs[model]?.[ratioType as RatioType]) {
+                delete newDiffs[model][ratioType as RatioType]
+                if (Object.keys(newDiffs[model]).length === 0) {
+                  delete newDiffs[model]
+                }
+              }
+            })
+          })
+          return newDiffs
+        })
+
+        setResolutions({})
+      },
+      onError: (error: Error) => {
+        toast.error(error.message || t('Failed to sync prices'))
+      },
+    })
 
   const handleOpenChannelDialog = () => {
     setChannelDialogOpen(true)
@@ -393,14 +400,14 @@ export function UpstreamRatioSync({ modelRatios }: UpstreamRatioSyncProps) {
         value: JSON.stringify(value, null, 2),
       }))
 
-      return new Promise<boolean>((resolve) => {
-        syncMutate(updates, {
-          onSuccess: () => resolve(true),
-          onError: () => resolve(false),
-        })
-      })
+      try {
+        await syncMutateAsync(updates)
+        return true
+      } catch {
+        return false
+      }
     },
-    [resolutions, syncMutate]
+    [resolutions, syncMutateAsync]
   )
 
   const findSourceChannel = (
