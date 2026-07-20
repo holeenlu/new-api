@@ -132,23 +132,15 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	resp, err := client.Do(req)
 	if err != nil {
 		written, _ := info.UpstreamAttemptState()
-		if written {
-			lease.Release()
-		} else {
-			lease.Abandon()
-		}
+		lease.FinishFailedAttempt(written)
 		return nil, err
 	}
 	if resp == nil || resp.Body == nil {
 		written, _ := info.UpstreamAttemptState()
-		if written {
-			lease.Release()
-		} else {
-			lease.Abandon()
-		}
+		lease.FinishFailedAttempt(written)
 		return nil, errors.New("codex alpha search: upstream returned an empty response")
 	}
-	resp.Body = &codexOAuthResponseBody{ReadCloser: resp.Body, lease: lease}
+	resp.Body = service.NewSubscriptionOAuthResponseBody(resp.Body, lease)
 	return resp, nil
 }
 

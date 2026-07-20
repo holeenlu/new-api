@@ -652,7 +652,7 @@ export function ModelMutateDrawer({
               })
               if (!pricingResponse.success) {
                 throw new Error(
-                  pricingResponse.message || 'Failed to update pricing'
+                  pricingResponse.message || t('Failed to update pricing')
                 )
               }
             }
@@ -684,6 +684,7 @@ export function ModelMutateDrawer({
       oldModelName,
       modelSettings,
       pricingSubMode,
+      t,
     ]
   )
 

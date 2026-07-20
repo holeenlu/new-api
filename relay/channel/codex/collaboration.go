@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -47,7 +49,7 @@ func normalizeCollaborationSpawnAgentModel(data string) string {
 			continue
 		}
 		model := gjson.Get(argumentsJSON, "model")
-		modelID := collaborationModelID(model.String())
+		modelID := ratio_setting.CanonicalCodexModelAlias(model.String())
 		if model.Type != gjson.String || modelID == "" || modelID == model.String() {
 			continue
 		}
@@ -79,17 +81,4 @@ func isCollaborationSpawnAgentCall(item gjson.Result) bool {
 	}
 	return (strings.HasSuffix(name, "__spawn_agent") || strings.HasSuffix(name, ".spawn_agent")) &&
 		(strings.Contains(name, "collaboration") || strings.Contains(name, "multi_agent"))
-}
-
-func collaborationModelID(model string) string {
-	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "sol":
-		return "gpt-5.6-sol"
-	case "terra":
-		return "gpt-5.6-terra"
-	case "luna":
-		return "gpt-5.6-luna"
-	default:
-		return model
-	}
 }

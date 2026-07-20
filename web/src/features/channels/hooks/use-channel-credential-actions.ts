@@ -54,25 +54,28 @@ export function useChannelCredentialActions(
     setIsChannelKeyLoading(false)
   }, [])
 
-  const fetchChannelKey = useCallback(async () => {
-    if (!channelId) {
-      throw new Error('Channel is not selected')
-    }
-
-    setIsChannelKeyLoading(true)
-    try {
-      const res = await getChannelKey(channelId)
-      if (!res.success) {
-        throw new Error(res.message || t('Failed to fetch channel key'))
+  const fetchChannelKey = useCallback(
+    async (proofToken?: string) => {
+      if (!channelId) {
+        throw new Error('Channel is not selected')
       }
 
-      setChannelKey(res.data?.key ?? '')
-      toast.success(t('Channel key unlocked'))
-      return res
-    } finally {
-      setIsChannelKeyLoading(false)
-    }
-  }, [channelId, t])
+      setIsChannelKeyLoading(true)
+      try {
+        const res = await getChannelKey(channelId, proofToken)
+        if (!res.success) {
+          throw new Error(res.message || t('Failed to fetch channel key'))
+        }
+
+        setChannelKey(res.data?.key ?? '')
+        toast.success(t('Channel key unlocked'))
+        return res
+      } finally {
+        setIsChannelKeyLoading(false)
+      }
+    },
+    [channelId, t]
+  )
 
   const revealChannelKey = useCallback(async () => {
     if (!channelId) return
@@ -91,7 +94,7 @@ export function useChannelCredentialActions(
         toast.error(error.message)
       }
     }
-  }, [channelId, fetchChannelKey, withVerification])
+  }, [channelId, fetchChannelKey, withVerification, t])
 
   const refreshCodexCredential = useCallback(async () => {
     if (!channelId) return

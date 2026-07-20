@@ -323,10 +323,10 @@ func TestCodexOAuthResponseBodyReleasesSlotOnce(t *testing.T) {
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 910002, 0, `{"account_id":"response-body-account"}`)
 	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
 	require.NoError(t, err)
-	body := &codexOAuthResponseBody{
-		ReadCloser: io.NopCloser(strings.NewReader("ok")),
-		lease:      lease,
-	}
+	body := service.NewSubscriptionOAuthResponseBody(
+		io.NopCloser(strings.NewReader("ok")),
+		lease,
+	)
 
 	require.NoError(t, body.Close())
 	require.NoError(t, body.Close())

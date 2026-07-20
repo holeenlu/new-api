@@ -17,19 +17,33 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-const DEFAULT_ERROR_MESSAGE = '请求失败'
+import i18next from 'i18next'
 
+// English base messages for stable backend error codes. Chinese and every other
+// locale are resolved through i18next at display time, so structured error
+// codes localize for all languages instead of being pinned to Chinese.
 const ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
-  model_at_capacity: '所选模型当前容量不足，网关将尝试同分组内的备用渠道。',
+  model_at_capacity:
+    'The selected model is at capacity; the gateway will try a backup channel in the same group.',
   model_not_supported:
-    'OAuth 账号无法使用此模型，请获取上游模型列表或选择其他模型。',
-  oauth_forbidden: 'OAuth 账号无权访问此资源，请检查订阅状态和账号权限。',
-  oauth_unauthorized: 'OAuth 凭证无效或已过期，请重新授权或刷新渠道凭证。',
+    'This OAuth account cannot use this model. Fetch the upstream model list or choose another model.',
+  oauth_forbidden:
+    'The OAuth account is not allowed to access this resource. Check the subscription status and account permissions.',
+  oauth_unauthorized:
+    'The OAuth credential is invalid or expired. Re-authorize or refresh the channel credential.',
   upstream_account_disabled:
-    '上游账号或组织已被停用，相关 OAuth 凭证已隔离，请联系管理员。',
+    'The upstream account or organization has been disabled; the related OAuth credential has been quarantined. Contact an administrator.',
   upstream_quota_exhausted:
-    '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。',
-  upstream_rate_limited: '上游账号触发临时频率限制，请稍后重试。',
+    'The upstream account quota is exhausted; the related OAuth credential has been quarantined. Contact an administrator.',
+  upstream_rate_limited:
+    'The upstream account hit a temporary rate limit. Please retry later.',
+}
+
+// isChineseLocale reports whether the active UI language is Chinese (zhCN/zhTW).
+// The prose-rewrite layer below only produces Simplified Chinese, so it must not
+// run for other locales.
+function isChineseLocale(): boolean {
+  return (i18next.language || '').toLowerCase().startsWith('zh')
 }
 
 const TOKEN_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
@@ -227,19 +241,27 @@ export function localizeErrorCode(
   errorCode: string | undefined
 ): string | undefined {
   if (!errorCode) return undefined
-  return ERROR_CODE_MESSAGES[errorCode]
+  const message = ERROR_CODE_MESSAGES[errorCode]
+  if (!message) return undefined
+  return i18next.t(message)
 }
 
 /**
- * Converts provider, transport, and API errors to Simplified Chinese for UI
- * display while retaining URLs, model names, request IDs, and protocol codes.
+ * Converts provider, transport, and API errors for UI display. The Simplified
+ * Chinese prose-rewrite layer is applied only in Chinese locales; other locales
+ * keep the upstream text verbatim rather than being forced into Chinese.
  */
 export function localizeErrorMessage(
   value: unknown,
-  fallback = DEFAULT_ERROR_MESSAGE
+  fallback?: string
 ): string {
   const source = extractErrorText(value).trim()
-  if (!source) return fallback
+  const resolvedFallback = fallback ?? i18next.t('Request failed')
+  if (!source) return resolvedFallback
+
+  if (!isChineseLocale()) {
+    return source
+  }
 
   const localized = replaceKnownErrorText(source)
   if (localized !== source || /[\u3400-\u9fff]/.test(localized)) {

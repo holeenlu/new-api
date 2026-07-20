@@ -154,18 +154,11 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	var requestBody io.Reader
 	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
 	if passThroughEnabled {
-		storage, err := common.GetBodyStorage(c)
-		if err != nil {
-			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		body, cleanup, apiErr := buildPrivacyFilteredPassThroughBody(c, info)
+		if apiErr != nil {
+			return apiErr
 		}
-		body, size, closer, err := relaycommon.NewPrivacyFilteredPassThroughJSONBody(storage, info.ChannelSetting.Proxy)
-		if err != nil {
-			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-		}
-		if closer != nil {
-			defer closer.Close()
-		}
-		info.UpstreamRequestBodySize = size
+		defer cleanup()
 		requestBody = body
 	} else {
 		convertedRequest, err := adaptor.ConvertClaudeRequest(c, info, request)
@@ -179,11 +172,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		}
 
 		// remove disabled fields for Claude API
-		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-			jsonData, err = relaycommon.RemoveDisabledFieldsForSubscriptionOAuth(jsonData, info.ChannelOtherSettings)
-		} else {
-			jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
-		}
+		jsonData, err = relaycommon.RemoveDisabledFieldsForChannel(jsonData, info)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}

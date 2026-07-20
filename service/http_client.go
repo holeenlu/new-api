@@ -329,7 +329,15 @@ func GetHttpClientWithResponseHeaderTimeout(proxyURL string, timeout time.Durati
 		return baseClient, err
 	}
 
-	cacheKey := strings.TrimSpace(proxyURL) + "\x00" + timeout.String()
+	// Derive the cache key from the normalized proxy URL so InvalidateProxyClient,
+	// which evicts these variants by normalized cacheKey prefix, can reliably drop
+	// them; keying on the raw URL would leave stale timeout clients pointing at an
+	// old proxy after invalidation.
+	canonicalKey, err := NormalizeProxyURL(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	cacheKey := canonicalKey + "\x00" + timeout.String()
 	responseTimeoutLock.Lock()
 	defer responseTimeoutLock.Unlock()
 	if client, ok := responseTimeoutClients[cacheKey]; ok {

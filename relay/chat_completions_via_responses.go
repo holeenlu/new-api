@@ -90,11 +90,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
-	if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-		chatJSON, err = relaycommon.RemoveDisabledFieldsForSubscriptionOAuth(chatJSON, info.ChannelOtherSettings)
-	} else {
-		chatJSON, err = relaycommon.RemoveDisabledFields(chatJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
-	}
+	chatJSON, err = relaycommon.RemoveDisabledFieldsForChannel(chatJSON, info)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -141,11 +137,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
-	if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-		jsonData, err = relaycommon.RemoveDisabledFieldsForSubscriptionOAuth(jsonData, info.ChannelOtherSettings)
-	} else {
-		jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
-	}
+	jsonData, err = relaycommon.RemoveDisabledFieldsForChannel(jsonData, info)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}

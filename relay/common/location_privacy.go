@@ -62,7 +62,10 @@ func isLocationPrivacyCandidateKey(key string) bool {
 func FilterUpstreamLocationData(data []byte, channelProxy ...string) ([]byte, bool, error) {
 	mode := rootcommon.GetUpstreamLocationMode()
 	var request map[string]interface{}
-	if err := rootcommon.Unmarshal(data, &request); err != nil {
+	// Decode with json.Number so unrelated numeric fields (seeds, IDs,
+	// timestamps) survive the unmarshal/remarshal round-trip without float64
+	// precision loss when the body is re-encoded after sanitization.
+	if err := rootcommon.UnmarshalWithNumber(data, &request); err != nil {
 		return nil, false, err
 	}
 	if mode == rootcommon.UpstreamLocationModeClient {

@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
 
@@ -137,14 +138,7 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 	if request.Model == "" {
 		return nil, errors.New("model is required")
 	}
-	switch strings.ToLower(strings.TrimSpace(request.Model)) {
-	case "sol":
-		request.Model = "gpt-5.6-sol"
-	case "terra":
-		request.Model = "gpt-5.6-terra"
-	case "luna":
-		request.Model = "gpt-5.6-luna"
-	}
+	request.Model = ratio_setting.CanonicalCodexModelAlias(request.Model)
 	if request.Input == nil {
 		return nil, errors.New("input is required")
 	}

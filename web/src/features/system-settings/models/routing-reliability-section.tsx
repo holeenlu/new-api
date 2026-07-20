@@ -121,16 +121,24 @@ export function RoutingReliabilitySection({
 
     setIsSaving(true)
     try {
-      await updateRoutingReliabilityOptions({
+      const result = await updateRoutingReliabilityOptions({
         options: Object.fromEntries(
           updates.map((key) => [key, String(normalized[key])])
         ),
       })
+      if (!result.success) {
+        throw new Error(result.message || t('Failed to update setting'))
+      }
+
+      baselineRef.current = normalized
+      toast.success(t('Setting updated successfully'))
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t('Failed to update setting')
+      )
     } finally {
       setIsSaving(false)
     }
-
-    baselineRef.current = normalized
   }
 
   return (

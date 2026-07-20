@@ -197,6 +197,19 @@ func (l *SubscriptionOAuthLease) Abandon() {
 	l.releaseOnce.Do(func() { l.release(subscriptionOAuthLeaseAbandoned) })
 }
 
+// FinishFailedAttempt releases the lease after a failed request attempt. A
+// request that reached the provider (written) is Released so a recovery probe
+// counts as a real failure; one that never reached it is Abandoned so the
+// circuit stays retryable. This encodes the release invariant once for every
+// subscription OAuth adaptor.
+func (l *SubscriptionOAuthLease) FinishFailedAttempt(written bool) {
+	if written {
+		l.Release()
+		return
+	}
+	l.Abandon()
+}
+
 // ReleaseResponseBody releases ordinary request capacity as soon as the body
 // closes. A half-open recovery probe is retained until ResolveResponse records
 // its outcome, preventing a successful probe from briefly reopening cooldown.
@@ -351,7 +364,9 @@ func acquireSubscriptionOAuthCapacity(
 	if state.nextStart.After(startAt) {
 		startAt = state.nextStart
 	}
-	state.nextStart = startAt.Add(minRequestInterval)
+	previousNextStart := state.nextStart
+	advancedNextStart := startAt.Add(minRequestInterval)
+	state.nextStart = advancedNextStart
 	state.mu.Unlock()
 
 	lease := &SubscriptionOAuthLease{
@@ -366,6 +381,14 @@ func acquireSubscriptionOAuthCapacity(
 		}
 		now := time.Now()
 		state.lastTouched = now
+		if outcome == subscriptionOAuthLeaseAbandoned && minRequestInterval > 0 &&
+			state.nextStart.Equal(advancedNextStart) {
+			// This attempt never reached the provider and we were the last to
+			// advance the pacing cursor, so return the reserved slot; otherwise a
+			// cancelled request permanently delays the next request on the
+			// credential.
+			state.nextStart = previousNextStart
+		}
 		if recoveryProbe && state.generation == generation && state.recoveryInFlight {
 			state.recoveryInFlight = false
 			switch outcome {

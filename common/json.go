@@ -10,6 +10,16 @@ func Unmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+// UnmarshalWithNumber decodes JSON while preserving numbers as json.Number
+// instead of float64. Use it when the decoded value is re-marshaled and must
+// retain exact integer representation (large IDs, seeds, timestamps) that a
+// float64 round-trip would corrupt.
+func UnmarshalWithNumber(data []byte, v any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return decoder.Decode(v)
+}
+
 func UnmarshalJsonStr(data string, v any) error {
 	return json.Unmarshal(StringToByteSlice(data), v)
 }

@@ -110,7 +110,7 @@ export function getStreamReadyStateError(
     status !== undefined &&
     status !== 200
   ) {
-    return `HTTP ${status}：${localizeErrorMessage(ERROR_MESSAGES.CONNECTION_CLOSED)}`
+    return `HTTP ${status}: ${localizeErrorMessage(ERROR_MESSAGES.CONNECTION_CLOSED)}`
   }
 
   return null

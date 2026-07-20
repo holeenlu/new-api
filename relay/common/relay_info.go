@@ -865,6 +865,17 @@ func RemoveDisabledFieldsForSubscriptionOAuth(jsonData []byte, channelOtherSetti
 	return removeDisabledFields(jsonData, channelOtherSettings)
 }
 
+// RemoveDisabledFieldsForChannel applies the provider safety filter with the
+// policy that matches the channel: subscription OAuth channels always filter,
+// ordinary channels honor the passthrough settings. It is the single owner of
+// that branch so relay handlers do not each re-derive it.
+func RemoveDisabledFieldsForChannel(jsonData []byte, info *RelayInfo) ([]byte, error) {
+	if IsSubscriptionOAuthChannel(info.ChannelType) {
+		return RemoveDisabledFieldsForSubscriptionOAuth(jsonData, info.ChannelOtherSettings)
+	}
+	return RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+}
+
 func removeDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings) ([]byte, error) {
 	if !hasRemovableDisabledField(jsonData, channelOtherSettings) {
 		return jsonData, nil

@@ -205,10 +205,10 @@ func TestClaudeCodeOAuthResponseBodyReleasesSlotOnce(t *testing.T) {
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, 900002, 0, "sk-ant-oat01-response-body")
 	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 2, 0)
 	require.NoError(t, err)
-	body := &claudeCodeOAuthResponseBody{
-		ReadCloser: io.NopCloser(strings.NewReader("ok")),
-		lease:      lease,
-	}
+	body := service.NewSubscriptionOAuthResponseBody(
+		io.NopCloser(strings.NewReader("ok")),
+		lease,
+	)
 
 	require.NoError(t, body.Close())
 	require.NoError(t, body.Close())

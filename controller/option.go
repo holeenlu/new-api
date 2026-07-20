@@ -641,34 +641,16 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
-	case "AutomaticDisableStatusCodes":
-		_, err = operation_setting.ParseHTTPStatusCodeRanges(option.Value.(string))
-		if err != nil {
+	case "AutomaticDisableStatusCodes", "AutomaticRetryStatusCodes",
+		"SubscriptionOAuthUpstreamRetryTimes", "SubscriptionOAuthCapacityCycleTimes",
+		"SubscriptionOAuthCapacityWaitSeconds":
+		// Delegate to the shared routing-reliability validator so the single-key
+		// endpoint and the batch endpoint enforce identical bounds.
+		if err = validateRoutingReliabilityOption(option.Key, option.Value.(string)); err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": err.Error(),
 			})
-			return
-		}
-	case "AutomaticRetryStatusCodes":
-		_, err = operation_setting.ParseHTTPStatusCodeRanges(option.Value.(string))
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
-	case "SubscriptionOAuthUpstreamRetryTimes", "SubscriptionOAuthCapacityCycleTimes":
-		value, parseErr := strconv.Atoi(option.Value.(string))
-		if parseErr != nil || value < 0 || value > 10 {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": "value must be an integer between 0 and 10"})
-			return
-		}
-	case "SubscriptionOAuthCapacityWaitSeconds":
-		value, parseErr := strconv.Atoi(option.Value.(string))
-		if parseErr != nil || value < 0 || value > 30 {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": "value must be an integer between 0 and 30"})
 			return
 		}
 	case "console_setting.api_info":

@@ -161,8 +161,7 @@ func Distribute() func(c *gin.Context) {
 		service.ApplyRelayDataPolicyHeaders(c, channel, 1)
 		c.Next()
 		finalChannelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
-		isSubscriptionChannel := finalChannelType == constant.ChannelTypeCodex ||
-			finalChannelType == constant.ChannelTypeClaudeCode
+		isSubscriptionChannel := constant.IsSubscriptionOAuthChannel(finalChannelType)
 		subscriptionAffinitySucceeded := !isSubscriptionChannel || c.GetBool("relay_affinity_success")
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && subscriptionAffinitySucceeded {
 			service.RecordChannelAffinity(c, channel.Id)

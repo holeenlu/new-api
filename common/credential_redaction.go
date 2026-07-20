@@ -1,6 +1,9 @@
 package common
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 var (
 	oauthCallbackURLPattern = regexp.MustCompile(`(?i)https?://[^\s"'<>]*(?:[?&](?:code|state|access_token|refresh_token)=[^\s"'<>]*)+`)
@@ -11,12 +14,33 @@ var (
 	proxyUserinfoPattern    = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://[^/@\s:]+:)[^@/\s]+@`)
 )
 
+// redactionTriggerNeedles is a strict lowercase superset of every substring the
+// redaction patterns above can match. If a log line contains none of them, no
+// pattern can match, so the six regex passes are skipped. Keep this list in sync
+// when adding a pattern.
+var redactionTriggerNeedles = []string{
+	"://", "bearer", "token", "code", "secret", "key", "auth", "passw", "sig", "credential",
+}
+
 // RedactSensitiveCredentials removes OAuth credentials and callback URLs from log text.
 func RedactSensitiveCredentials(value string) string {
+	if !mightContainSensitiveCredential(value) {
+		return value
+	}
 	value = oauthCallbackURLPattern.ReplaceAllString(value, "[REDACTED_OAUTH_CALLBACK_URL]")
 	value = bearerTokenPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = oauthJSONSecretPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = claudeOAuthTokenPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = secretQueryPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	return proxyUserinfoPattern.ReplaceAllString(value, `${1}[REDACTED]@`)
+}
+
+func mightContainSensitiveCredential(value string) bool {
+	lower := strings.ToLower(value)
+	for _, needle := range redactionTriggerNeedles {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
 }

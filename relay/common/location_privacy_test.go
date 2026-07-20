@@ -186,6 +186,24 @@ func TestFilterUpstreamLocationDataSanitizesDirectLocationFields(t *testing.T) {
 	require.JSONEq(t, `{"model":"gpt-5","metadata":{}}`, string(out))
 }
 
+func TestFilterUpstreamLocationDataPreservesLargeIntegerFields(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+
+	// 9007199254740993 == 2^53 + 1 is not representable as a float64, so a
+	// map[string]interface{} round-trip that decodes numbers to float64 would
+	// corrupt it to 9007199254740992. The filter must preserve it exactly even
+	// though it re-marshals the body to strip the location field.
+	input := []byte(`{"model":"gpt-5","seed":9007199254740993,"user_location":{"type":"approximate","country":"CN"}}`)
+
+	out, changed, err := FilterUpstreamLocationData(input)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Contains(t, string(out), "9007199254740993")
+	require.NotContains(t, string(out), "9007199254740992")
+	require.NotContains(t, string(out), "user_location")
+}
+
 func restoreLocationSettings(t *testing.T) {
 	t.Helper()
 	originalMode := rootcommon.GetUpstreamLocationMode()

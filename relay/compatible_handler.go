@@ -167,11 +167,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 
 		// remove disabled fields for OpenAI API
-		if relaycommon.IsSubscriptionOAuthChannel(info.ChannelType) {
-			jsonData, err = relaycommon.RemoveDisabledFieldsForSubscriptionOAuth(jsonData, info.ChannelOtherSettings)
-		} else {
-			jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
-		}
+		jsonData, err = relaycommon.RemoveDisabledFieldsForChannel(jsonData, info)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}

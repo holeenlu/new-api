@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -39,65 +38,14 @@ var (
 )
 
 func InitOAuthRuntimeSettings() {
-	ClaudeCodeOAuthMaxConcurrency = rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10)
-	ClaudeCodeOAuthMinRequestInterval = time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750)) * time.Millisecond
-	if ClaudeCodeOAuthMaxConcurrency < 1 {
-		ClaudeCodeOAuthMaxConcurrency = 1
-	} else if ClaudeCodeOAuthMaxConcurrency > 10 {
-		ClaudeCodeOAuthMaxConcurrency = 10
-	}
-	if ClaudeCodeOAuthMinRequestInterval < 0 {
-		ClaudeCodeOAuthMinRequestInterval = 0
-	} else if ClaudeCodeOAuthMinRequestInterval > 5*time.Second {
-		ClaudeCodeOAuthMinRequestInterval = 5 * time.Second
-	}
-}
-
-type claudeCodeOAuthResponseBody struct {
-	io.ReadCloser
-	lease *service.SubscriptionOAuthLease
-}
-
-func (b *claudeCodeOAuthResponseBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.lease.ReleaseResponseBody()
-	return err
+	ClaudeCodeOAuthMaxConcurrency, ClaudeCodeOAuthMinRequestInterval = service.ClampSubscriptionOAuthCapacity(
+		rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10),
+		time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750))*time.Millisecond,
+	)
 }
 
 func acquireClaudeCodeOAuthCapacity(c *gin.Context, info *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
-	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
-		info.ChannelType,
-		info.ChannelId,
-		info.ChannelMultiKeyIndex,
-		info.ApiKey,
-	)
-	lease, err := service.AcquireSubscriptionOAuthCapacity(
-		c.Request.Context(),
-		fingerprint,
-		ClaudeCodeOAuthMaxConcurrency,
-		ClaudeCodeOAuthMinRequestInterval,
-	)
-	if err == nil {
-		service.BindSubscriptionOAuthLease(c, lease)
-		return lease, nil
-	}
-	if !service.IsSubscriptionOAuthCapacityError(err) {
-		status := http.StatusServiceUnavailable
-		if c.Request.Context().Err() != nil {
-			status = 499
-		}
-		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, status, types.ErrOptionWithSkipRetry())
-	}
-	retryAfter := service.SubscriptionOAuthCapacityRetryAfter(err)
-	c.Header("Retry-After", strconv.Itoa(service.SubscriptionOAuthCapacityRetryAfterSeconds(err)))
-	apiError := types.NewErrorWithStatusCode(
-		err,
-		types.ErrorCodeOAuthChannelConcurrencyLimit,
-		http.StatusServiceUnavailable,
-		types.ErrOptionWithNoRecordErrorLog(),
-	)
-	apiError.RetryAfter = retryAfter
-	return nil, apiError
+	return service.AcquireSubscriptionOAuthChannelCapacity(c, info, ClaudeCodeOAuthMaxConcurrency, ClaudeCodeOAuthMinRequestInterval)
 }
 
 // ClaudeCodeIdentitySystem is the exact first system block Anthropic requires on
@@ -307,23 +255,15 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	resp, err := channel.DoApiRequest(a, c, info, requestBody)
 	if err != nil {
 		written, _ := info.UpstreamAttemptState()
-		if written {
-			lease.Release()
-		} else {
-			lease.Abandon()
-		}
+		lease.FinishFailedAttempt(written)
 		return nil, err
 	}
 	if resp == nil || resp.Body == nil {
 		written, _ := info.UpstreamAttemptState()
-		if written {
-			lease.Release()
-		} else {
-			lease.Abandon()
-		}
+		lease.FinishFailedAttempt(written)
 		return resp, nil
 	}
-	resp.Body = &claudeCodeOAuthResponseBody{ReadCloser: resp.Body, lease: lease}
+	resp.Body = service.NewSubscriptionOAuthResponseBody(resp.Body, lease)
 	return resp, nil
 }
 

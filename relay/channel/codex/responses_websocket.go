@@ -258,7 +258,6 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 		dialer.NetDialContext = transport.DialContext
 		dialer.TLSClientConfig = transport.TLSClientConfig
 	}
-	info.MarkUpstreamRequestWritten()
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
 	if response != nil && response.Body != nil {
 		response.Body.Close()
@@ -289,6 +288,10 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 		)
 	}
 	conn.EnableWriteCompression(false)
+	// Only record the upstream request as written after a successful handshake;
+	// a dial that never reached upstream must stay retryable so the failover
+	// policy is not suppressed.
+	info.MarkUpstreamRequestWritten()
 	s.conn = conn
 	s.channelID = info.ChannelId
 	s.model = strings.TrimSpace(info.UpstreamModelName)
@@ -300,15 +303,30 @@ func (s *ResponsesWebSocketSession) connect(c *gin.Context, adaptor *Adaptor, in
 
 func (s *ResponsesWebSocketSession) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter) {
 	defer writer.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-	defer conn.SetReadDeadline(time.Time{})
-	for {
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				_ = writer.CloseWithError(err)
-				return
+
+	// Unblock a stalled ReadMessage when the request is cancelled by closing the
+	// connection from a watcher goroutine; otherwise the reader (and its OAuth
+	// capacity lease) would stay blocked until the idle deadline fires, and a
+	// follow-up request could start a second concurrent reader on the same conn.
+	done := make(chan struct{})
+	defer close(done)
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				s.mu.Lock()
+				s.invalidateLocked(conn)
+				s.mu.Unlock()
+			case <-done:
 			}
-		}
+		}()
+	}
+
+	const idleTimeout = 5 * time.Minute
+	for {
+		// Refresh the deadline per message so it acts as an idle timeout rather
+		// than a fixed cap on total stream duration.
+		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		messageType, payload, err := conn.ReadMessage()
 		if err != nil {
 			s.mu.Lock()
@@ -328,24 +346,39 @@ func (s *ResponsesWebSocketSession) streamAsSSE(ctx context.Context, conn *webso
 			Type string `json:"type"`
 		}
 		if err := common.Unmarshal(payload, &event); err != nil {
+			s.mu.Lock()
+			s.invalidateLocked(conn)
+			s.mu.Unlock()
 			_ = writer.CloseWithError(err)
 			return
 		}
 		if event.Type == "response.done" {
 			var normalized map[string]any
 			if err := common.Unmarshal(payload, &normalized); err != nil {
+				s.mu.Lock()
+				s.invalidateLocked(conn)
+				s.mu.Unlock()
 				_ = writer.CloseWithError(err)
 				return
 			}
 			normalized["type"] = "response.completed"
 			payload, err = common.Marshal(normalized)
 			if err != nil {
+				s.mu.Lock()
+				s.invalidateLocked(conn)
+				s.mu.Unlock()
 				_ = writer.CloseWithError(err)
 				return
 			}
 			event.Type = "response.completed"
 		}
 		if _, err := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
+			// The downstream reader stopped consuming mid-stream. Invalidate the
+			// connection because in-flight events remain unread and reusing it
+			// would bleed stale events into the next response.
+			s.mu.Lock()
+			s.invalidateLocked(conn)
+			s.mu.Unlock()
 			return
 		}
 		if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.error" || event.Type == "error" {
