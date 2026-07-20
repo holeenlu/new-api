@@ -1,0 +1,20 @@
+{
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	default_sni 173.242.117.170
+	fallback_sni 173.242.117.170
+}
+
+http://173.242.117.170 {
+	redir https://173.242.117.170{uri} permanent
+}
+
+https://173.242.117.170 {
+	tls {
+		issuer acme {
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	reverse_proxy new-api:3000
+}

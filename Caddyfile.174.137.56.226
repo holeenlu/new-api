@@ -1,4 +1,19 @@
+{
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	default_sni 174.137.56.226
+	fallback_sni 174.137.56.226
+}
+
 http://174.137.56.226 {
+	redir https://nextcode.buildtoconnect.com{uri} permanent
+}
+
+https://174.137.56.226 {
+	tls internal
+	redir https://nextcode.buildtoconnect.com{uri} permanent
+}
+
+http://nextcode.buildtoconnect.com {
 	redir https://nextcode.buildtoconnect.com{uri} permanent
 }
 

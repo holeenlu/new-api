@@ -348,8 +348,8 @@ func (s *ResponsesWebSocketSession) streamAsSSE(ctx context.Context, conn *webso
 		if _, err := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
 			return
 		}
-		if event.Type == "response.completed" || event.Type == "error" {
-			if event.Type == "error" {
+		if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.error" || event.Type == "error" {
+			if event.Type == "response.failed" || event.Type == "response.error" || event.Type == "error" {
 				s.mu.Lock()
 				s.invalidateLocked(conn)
 				s.mu.Unlock()

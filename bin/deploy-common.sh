@@ -356,6 +356,7 @@ deploy_server_main() {
   local no_cache=${NO_CACHE:-false}
   local goproxy=${GOPROXY:-https://goproxy.cn,direct}
   local goproxy_fallback=${GOPROXY_FALLBACK:-https://proxy.golang.org,direct}
+  local public_health_attempts=${DEPLOY_PUBLIC_HEALTH_ATTEMPTS:-90}
   local local_archive remote_archive remote_script remote_lock remote_state control_path initial_env_file askpass_script
   local ssh_master_active=false
   local_archive=$(mktemp "${TMPDIR:-/tmp}/new-api-${DEPLOY_SLUG}.XXXXXX")
@@ -457,7 +458,8 @@ deploy_server_main() {
 
   remote_start_time=$(ssh_remote "$DEPLOY_TARGET" "sed -n 's/^START_TIME=//p' '$remote_state'")
   version=""; start_time=""
-  for ((attempt=1; attempt<=30; attempt++)); do
+  [[ "$public_health_attempts" =~ ^[1-9][0-9]*$ ]] || deploy_die "DEPLOY_PUBLIC_HEALTH_ATTEMPTS must be a positive integer"
+  for ((attempt=1; attempt<=public_health_attempts; attempt++)); do
     if status_json=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 --header 'Cache-Control: no-cache' "$HEALTH_URL?deploy_check=$remote_start_time" 2>/dev/null); then
       version=$(printf '%s' "$status_json" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
       start_time=$(printf '%s' "$status_json" | sed -n 's/.*"start_time":\([0-9][0-9]*\).*/\1/p')
@@ -466,6 +468,10 @@ deploy_server_main() {
     sleep 2
   done
   if [[ "$version" != "$app_version" || "$start_time" != "$remote_start_time" ]] || ! deploy_verify_relay_routes "${HEALTH_URL%/api/status}"; then
+    deploy_log "Public deployment verification failed for $DEPLOY_NAME; collecting diagnostics"
+    curl --noproxy '*' --verbose --max-time 10 --header 'Cache-Control: no-cache' "$HEALTH_URL?deploy_check=$remote_start_time" || true
+    ssh_remote "$DEPLOY_TARGET" "cd '$REMOTE_DIR' && docker compose --env-file .env -f '$COMPOSE_FILE' ps" || true
+    ssh_remote "$DEPLOY_TARGET" "cd '$REMOTE_DIR' && docker compose --env-file .env -f '$COMPOSE_FILE' logs --tail 120 '$PROXY_SERVICE' new-api" || true
     ssh_remote "$DEPLOY_TARGET" "cd '$REMOTE_DIR' && docker image inspect '$ROLLBACK_IMAGE' >/dev/null && docker tag '$ROLLBACK_IMAGE' '$TARGET_IMAGE' && docker compose --env-file .env -f '$COMPOSE_FILE' up -d --no-build --no-deps --force-recreate --remove-orphans new-api" || true
     deploy_die "$DEPLOY_NAME deployment verification failed"
   fi
@@ -481,4 +487,9 @@ deploy_server_main() {
   deploy_prune_audit_cache_volumes
   deploy_report_storage "after ${DEPLOY_NAME} deployment"
   deploy_log "$DEPLOY_NAME deployment completed: version=$app_version start_time=$remote_start_time"
+  # Cleanup must run while deploy_server_main locals are still in scope. The
+  # EXIT trap is retained for failure and signal paths, but successful return
+  # would otherwise execute it after those locals have been unset under -u.
+  deploy_server_cleanup
+  trap - EXIT
 }

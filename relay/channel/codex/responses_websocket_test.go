@@ -87,6 +87,50 @@ func TestResponsesWebSocketSessionUsesCodexUpstreamProtocol(t *testing.T) {
 	require.Contains(t, string(body), `"total_tokens":3`)
 }
 
+func TestResponsesWebSocketSessionStopsAfterTerminalFailureEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		_, _, err = conn.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"server_error","code":"upstream_failure","message":"upstream failed"}}}`)))
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	setCodexResponsesLiteEnabled(c, true)
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         980003,
+			ChannelType:       constant.ChannelTypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"access-token","account_id":"account-id"}`,
+			UpstreamModelName: "gpt-5.6-luna",
+			ChannelSetting:    dto.ChannelSettings{},
+		},
+	}
+	session := &ResponsesWebSocketSession{}
+	defer session.Close()
+	resp, err := session.doRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-luna","stream":true}`))
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), "event: response.failed")
+	require.Contains(t, string(body), "upstream failed")
+}
+
 func TestResponsesWebSocketSessionFallsBackToHTTPOnUpgradeRequired(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalInterval := CodexOAuthMinRequestInterval
