@@ -701,5 +701,4 @@ func refreshChannelRuntimeCache() {
 			model.InitChannelCache()
 		}()
 	}
-	service.ResetProxyClientCache()
 }
