@@ -31,8 +31,16 @@ func buildMaskedTokenResponses(tokens []*model.Token) []*model.Token {
 	return maskedTokens
 }
 
+// canManageOtherPrivilegedUserToken reports whether an actor may act on another
+// user's token. Management is confined to the privileged pool and is strictly
+// hierarchical: the owner must be a privileged (admin+) account AND the actor
+// must strictly outrank the owner. So a root user can manage an admin's tokens,
+// but an admin can manage neither a peer admin's nor a root user's — and a
+// regular user's token is never reachable by anyone else, staying private to its
+// owner. This stops an admin from reading a root user's (or a regular user's)
+// full API key or deleting/modifying their tokens.
 func canManageOtherPrivilegedUserToken(actorRole int, ownerRole int) bool {
-	return actorRole >= common.RoleAdminUser && ownerRole >= common.RoleAdminUser
+	return ownerRole >= common.RoleAdminUser && actorRole > ownerRole
 }
 
 func getManageableToken(c *gin.Context, tokenId int) (*model.Token, error) {

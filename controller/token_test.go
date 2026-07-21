@@ -574,7 +574,7 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	}
 }
 
-func TestAdminCanManageRootUserToken(t *testing.T) {
+func TestAdminCannotReadRootUserTokenKey(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}))
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
@@ -586,14 +586,13 @@ func TestAdminCanManageRootUserToken(t *testing.T) {
 	ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
 	GetTokenKey(ctx)
 
+	// An admin must not outrank a root user, so the full key stays hidden.
 	response := decodeAPIResponse(t, recorder)
-	require.True(t, response.Success, response.Message)
-	var keyData tokenKeyResponse
-	require.NoError(t, common.Unmarshal(response.Data, &keyData))
-	require.Equal(t, token.GetFullKey(), keyData.Key)
+	require.False(t, response.Success)
+	require.NotContains(t, recorder.Body.String(), token.Key)
 }
 
-func TestAdminCanUpdateAndDeleteRootUserToken(t *testing.T) {
+func TestAdminCannotUpdateOrDeleteRootUserToken(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}))
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
@@ -614,20 +613,21 @@ func TestAdminCanUpdateAndDeleteRootUserToken(t *testing.T) {
 	updateCtx, updateRecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
 	updateCtx.Set("role", common.RoleAdminUser)
 	UpdateToken(updateCtx)
-	require.True(t, decodeAPIResponse(t, updateRecorder).Success)
+	require.False(t, decodeAPIResponse(t, updateRecorder).Success)
 
-	updated, err := model.GetTokenById(token.Id)
+	unchanged, err := model.GetTokenById(token.Id)
 	require.NoError(t, err)
-	require.Equal(t, "updated-by-admin", updated.Name)
+	require.Equal(t, "root-token", unchanged.Name)
 
 	deleteCtx, deleteRecorder := newAuthenticatedContext(t, http.MethodDelete, "/api/token/"+strconv.Itoa(token.Id), nil, 1)
 	deleteCtx.Set("role", common.RoleAdminUser)
 	deleteCtx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
 	DeleteToken(deleteCtx)
-	require.True(t, decodeAPIResponse(t, deleteRecorder).Success)
+	require.False(t, decodeAPIResponse(t, deleteRecorder).Success)
 
+	// The root user's token must survive an admin's delete attempt.
 	_, err = model.GetTokenById(token.Id)
-	require.Error(t, err)
+	require.NoError(t, err)
 }
 
 func TestRootCanManageAdminUserToken(t *testing.T) {
@@ -693,7 +693,7 @@ func TestBatchTokenKeysAllowsAllPrivilegedTokensForRoot(t *testing.T) {
 	}, data.Keys)
 }
 
-func TestBatchTokenKeysAllowsRootTokenForAdmin(t *testing.T) {
+func TestBatchTokenKeysDeniesRootTokenForAdmin(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}))
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "admin", Password: "password", Role: common.RoleAdminUser, AffCode: "admin-aff"}).Error)
@@ -705,14 +705,10 @@ func TestBatchTokenKeysAllowsRootTokenForAdmin(t *testing.T) {
 	ctx.Set("role", common.RoleAdminUser)
 	GetTokenKeysBatch(ctx)
 
+	// A batch that includes a higher-privileged (root) token must be rejected in
+	// full, leaking no key — including the admin's own.
 	response := decodeAPIResponse(t, recorder)
-	require.True(t, response.Success, response.Message)
-	var data struct {
-		Keys map[int]string `json:"keys"`
-	}
-	require.NoError(t, common.Unmarshal(response.Data, &data))
-	require.Equal(t, map[int]string{
-		adminToken.Id: adminToken.GetFullKey(),
-		rootToken.Id:  rootToken.GetFullKey(),
-	}, data.Keys)
+	require.False(t, response.Success)
+	require.NotContains(t, recorder.Body.String(), rootToken.Key)
+	require.NotContains(t, recorder.Body.String(), adminToken.Key)
 }
