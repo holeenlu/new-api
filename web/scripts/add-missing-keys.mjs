@@ -472,7 +472,10 @@ for (const [locale, entries] of Object.entries(extraKeys)) {
 }
 
 const removedKeys = [
+  'Claude Code Account & Usage',
+  'Click to view Claude Code usage',
   'Maximum retryable failures per OAuth credential before same-tag failover',
+  'Weekly Sonnet Window',
 ]
 
 async function main() {

@@ -37,6 +37,8 @@ const ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
     'The upstream account quota is exhausted; the related OAuth credential has been quarantined. Contact an administrator.',
   upstream_rate_limited:
     'The upstream account hit a temporary rate limit. Please retry later.',
+  upstream_usage_limit:
+    'The upstream subscription usage window is exhausted; this OAuth credential is temporarily paused until its quota resets.',
 }
 
 // isChineseLocale reports whether the active UI language is Chinese (zhCN/zhTW).
@@ -111,6 +113,23 @@ function extractErrorText(value: unknown): string {
   }
 
   return ''
+}
+
+function extractErrorCode(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+
+  const record = value as Record<string, unknown>
+  for (const key of ['code', 'error_code']) {
+    const candidate = record[key]
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim()
+    }
+  }
+  for (const key of ['error', 'detail']) {
+    const nested = extractErrorCode(record[key])
+    if (nested) return nested
+  }
+  return undefined
 }
 
 function replaceKnownErrorText(message: string): string {
@@ -201,6 +220,22 @@ function replaceKnownErrorText(message: string): string {
     '已达到并发限制，请稍后重试'
   )
   localized = localized.replaceAll(
+    /\bsubscription OAuth usage window is exhausted;?\s*resets at\s*([^;]+);?\s*retry after\s*(\d+)\s*seconds?\b/gi,
+    '订阅 OAuth 用量窗口已耗尽，预计在 $1 自动恢复（剩余 $2 秒）'
+  )
+  localized = localized.replaceAll(
+    /\bupstream rate limit is active for this subscription OAuth credential;?\s*retry after\s*(\d+)\s*seconds?\b/gi,
+    '上游正在限制此订阅 OAuth 凭证的请求，请在 $1 秒后重试'
+  )
+  localized = localized.replaceAll(
+    /\bsubscription OAuth credential concurrency limit reached;?\s*retry after\s*(\d+)\s*seconds?\b/gi,
+    '订阅 OAuth 凭证已达到并发上限，请在 $1 秒后重试'
+  )
+  localized = localized.replaceAll(
+    /\bsubscription OAuth credential is temporarily unavailable;?\s*retry after\s*(\d+)\s*seconds?\b/gi,
+    '订阅 OAuth 凭证暂时不可用，请在 $1 秒后重试'
+  )
+  localized = localized.replaceAll(
     /\bsubscription OAuth credential is busy;?\s*retry after\s*(\d+)\s*seconds?:?\s*/gi,
     '订阅 OAuth 凭证正忙，请在 $1 秒后重试：'
   )
@@ -255,6 +290,9 @@ export function localizeErrorMessage(
   value: unknown,
   fallback?: string
 ): string {
+  const classified = localizeErrorCode(extractErrorCode(value))
+  if (classified) return classified
+
   const source = extractErrorText(value).trim()
   const resolvedFallback = fallback ?? i18next.t('Request failed')
   if (!source) return resolvedFallback

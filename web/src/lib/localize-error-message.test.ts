@@ -62,6 +62,30 @@ describe('localizeErrorMessage', () => {
     )
     assert.equal(
       localizeErrorMessage(
+        'subscription OAuth usage window is exhausted; resets at 2026-07-25T03:25:00Z; retry after 329940 seconds'
+      ),
+      '订阅 OAuth 用量窗口已耗尽，预计在 2026-07-25T03:25:00Z 自动恢复（剩余 329940 秒）'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'upstream rate limit is active for this subscription OAuth credential; retry after 762 seconds'
+      ),
+      '上游正在限制此订阅 OAuth 凭证的请求，请在 762 秒后重试'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'subscription OAuth credential concurrency limit reached; retry after 1 seconds'
+      ),
+      '订阅 OAuth 凭证已达到并发上限，请在 1 秒后重试'
+    )
+    assert.equal(
+      localizeErrorMessage(
+        'subscription OAuth credential is temporarily unavailable; retry after 30 seconds'
+      ),
+      '订阅 OAuth 凭证暂时不可用，请在 30 秒后重试'
+    )
+    assert.equal(
+      localizeErrorMessage(
         'Selected model is at capacity. Please try a different model.'
       ),
       '所选模型当前容量不足，请稍后重试或选择其他模型。'
@@ -93,6 +117,24 @@ describe('localizeErrorMessage', () => {
       localizeErrorCode('upstream_quota_exhausted'),
       '上游账号额度已耗尽，相关 OAuth 凭证已隔离，请联系管理员。'
     )
+    assert.equal(
+      localizeErrorCode('upstream_usage_limit'),
+      '上游订阅用量窗口已耗尽，该 OAuth 凭证已临时隔离，将在额度重置后自动恢复。'
+    )
     assert.equal(localizeErrorCode('unclassified_error'), undefined)
+  })
+
+  test('uses a structured Claude gateway code before prose matching', () => {
+    assert.equal(
+      localizeErrorMessage({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          code: 'upstream_usage_limit',
+          message: 'provider wording may change',
+        },
+      }),
+      '上游订阅用量窗口已耗尽，该 OAuth 凭证已临时隔离，将在额度重置后自动恢复。'
+    )
   })
 })
