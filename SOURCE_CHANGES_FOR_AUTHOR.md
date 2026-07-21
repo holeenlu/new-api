@@ -637,11 +637,12 @@ Codex 路径使用 `chatgpt.com/backend-api/codex`、官方客户端 OAuth clien
 重试边界已按请求记录 `(channel_id, key_index)`。随机、轮询和默认模式都会排除本请求已经使用的
 启用 Key；所有启用 Key 用尽后，该渠道不再进入候选列表。
 
-### 9.6 有意行为：构建版本固定显示 Git Release
+### 9.6 部署版本包含源码标识与编译时间
 
-按部署需求，`APP_VERSION` 只使用最近 Git Release tag。修改源码并重新编译不会改变页面显示版本；
-同一 Release 下的产物差异通过本次临时镜像压缩包 SHA-256 和运行容器 RootFS 校验，不向
-`APP_VERSION` 添加 commit、dirty 标记或构建时间。
+部署脚本将 `APP_VERSION` 构建为 `git describe --tags --always --dirty --abbrev=12` 加
+`+build.YYYYMMDDTHHMMSSZ`。`/system-settings/operations/update-checker` 的“当前版本”因此可同时
+显示本地源码提交/dirty 状态与 UTC 编译时间；镜像、运行服务和远端部署状态使用同一版本字符串进行校验。
+更新检查会忽略 `+build.*` 后缀，仅在源码标签恰好等于 GitHub Release tag 时显示“已是最新版本”。
 
 ### 9.7 已解决：批量模型价格保存缺少语义校验
 

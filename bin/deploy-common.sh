@@ -47,10 +47,14 @@ deploy_require_commands() {
 
 deploy_build_version() {
   local root_dir=$1
-  local release_version
-  release_version=$(git -C "$root_dir" describe --tags --abbrev=0 2>/dev/null || sed -n '1p' "$root_dir/VERSION")
-  [[ -n "$release_version" ]] || deploy_die "Unable to determine the release version"
-  printf '%s\n' "$release_version"
+  local source_version build_timestamp
+  source_version=$(git -C "$root_dir" describe --tags --always --dirty --abbrev=12 2>/dev/null || sed -n '1p' "$root_dir/VERSION")
+  [[ -n "$source_version" ]] || deploy_die "Unable to determine the source version"
+
+  build_timestamp=${BUILD_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
+  [[ "$build_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || \
+    deploy_die "BUILD_TIMESTAMP must use UTC format YYYYMMDDTHHMMSSZ"
+  printf '%s+build.%s\n' "$source_version" "$build_timestamp"
 }
 
 deploy_file_sha256() {

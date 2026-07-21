@@ -52,6 +52,7 @@ export function UpdateCheckerSection({
 
   const uptime = startTime ? formatTimestamp(startTime) : t('Unknown')
   const version = currentVersion || t('Unknown')
+  const sourceVersion = currentVersion?.split('+build.', 1)[0]
 
   const handleCheckUpdates = async () => {
     setChecking(true)
@@ -75,7 +76,7 @@ export function UpdateCheckerSection({
         throw new Error(t('Unexpected release payload'))
       }
 
-      if (currentVersion && data.tag_name === currentVersion) {
+      if (sourceVersion && data.tag_name === sourceVersion) {
         toast.success(
           t('You are running the latest version ({{version}}).', {
             version: data.tag_name,
