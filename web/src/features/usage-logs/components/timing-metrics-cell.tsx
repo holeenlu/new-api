@@ -195,7 +195,7 @@ export function StreamTpsCell(props: StreamTpsCellProps) {
                   <p>
                     {localizeErrorMessage(
                       props.streamStatus?.end_reason,
-                      '未知'
+                      t('Unknown')
                     )}
                   </p>
                   {(props.streamStatus?.error_count ?? 0) > 0 && (

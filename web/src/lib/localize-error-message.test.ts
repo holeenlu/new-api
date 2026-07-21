@@ -1,10 +1,28 @@
 import assert from 'node:assert/strict'
-import { describe, test } from 'node:test'
+import { before, describe, test } from 'node:test'
 
+import i18next from 'i18next'
+
+import zhCN from '../i18n/locales/zh.json'
 import {
   localizeErrorCode,
   localizeErrorMessage,
 } from './localize-error-message'
+
+// The localization layer is locale-aware: Chinese locales get the Simplified-
+// Chinese prose rewrite, and classified error codes resolve through i18next.t
+// against the loaded translations. Initialize the shared i18next instance as
+// Chinese (the module imports the same singleton) so these assertions exercise
+// that path instead of the verbatim/English fallback.
+before(async () => {
+  await i18next.init({
+    lng: 'zhCN',
+    fallbackLng: 'en',
+    resources: { zhCN },
+    nsSeparator: false,
+    interpolation: { escapeValue: false },
+  })
+})
 
 describe('localizeErrorMessage', () => {
   test('classifies an upstream EOF without losing the request URL', () => {

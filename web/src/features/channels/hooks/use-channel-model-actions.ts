@@ -23,6 +23,7 @@ import { toast } from 'sonner'
 
 import { fetchModels, fetchUpstreamModels } from '../api'
 import { MODEL_FETCHABLE_TYPES } from '../constants'
+import { CHANNEL_TYPE_ADVANCED_CUSTOM } from '../lib/advanced-custom'
 import {
   formatModelsArray,
   parseModelsString,
@@ -81,7 +82,13 @@ export function useChannelModelActions(props: UseChannelModelActionsProps) {
       toast.error(t("You don't have necessary permission"))
       return
     }
-    if (!editing && !form.getValues('key')?.trim()) {
+    // Advanced Custom channels can expose a keyless model-discovery route, so a
+    // new one may fetch models without an API key entered yet.
+    if (
+      !editing &&
+      type !== CHANNEL_TYPE_ADVANCED_CUSTOM &&
+      !form.getValues('key')?.trim()
+    ) {
       toast.error(t('Please enter API key first'))
       return
     }
