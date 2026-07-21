@@ -3,6 +3,7 @@ package responsesws
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -317,7 +318,20 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	if transport, ok := client.Transport.(*http.Transport); ok && transport != nil {
 		dialer.Proxy = transport.Proxy
 		dialer.NetDialContext = transport.DialContext
-		dialer.TLSClientConfig = transport.TLSClientConfig
+		// A WebSocket handshake is an HTTP/1.1 Upgrade, but the shared relay
+		// transport enables HTTP/2 (ForceAttemptHTTP2), so once it has served an
+		// HTTP/2 request Go mutates its TLSClientConfig to advertise "h2" in
+		// NextProtos. Copying that verbatim makes the TLS ALPN negotiate h2 against
+		// HTTP/2 edges (e.g. Cloudflare-fronted chatgpt.com); the upgrade request is
+		// then answered with HTTP/2 frames the dialer cannot parse ("malformed HTTP
+		// response"). Clone the config but pin ALPN to http/1.1 so the handshake
+		// succeeds while preserving proxy/TLS-verification settings.
+		tlsConfig := transport.TLSClientConfig.Clone()
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		tlsConfig.NextProtos = []string{"http/1.1"}
+		dialer.TLSClientConfig = tlsConfig
 	}
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
 	if response != nil && response.Body != nil {
