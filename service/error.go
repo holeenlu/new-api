@@ -200,7 +200,38 @@ func ParseUpstreamRetryDelay(headers http.Header, responseBody []byte, now time.
 			return delay
 		}
 	}
+	if delay := parseUnifiedUsageReset(headers, now); delay > 0 {
+		return delay
+	}
 	return parseRetryAfterValue(headers.Get("Retry-After"), now, maximumSubscriptionOAuthUsageLimitCooldown)
+}
+
+// parseUnifiedUsageReset reads the reset time of an exhausted Anthropic
+// subscription usage window from the anthropic-ratelimit-unified-* response
+// headers, which carry Unix-second reset timestamps that the JSON error body
+// does not. It only reports a reset when the unified status marks the account as
+// actually exhausted, so an acceleration/burst 429 that still advertises a
+// far-future window reset is not mistaken for a usage-window cooldown. The
+// top-level anthropic-ratelimit-unified-reset mirrors the current representative
+// window's reset, so per-window (5h/7d) headers do not need to be read here.
+func parseUnifiedUsageReset(headers http.Header, now time.Time) time.Duration {
+	if !unifiedRateLimitExhausted(headers) {
+		return 0
+	}
+	return parseUpstreamResetValue(headers.Get("anthropic-ratelimit-unified-reset"), now, true)
+}
+
+func unifiedRateLimitExhausted(headers http.Header) bool {
+	if strings.EqualFold(strings.TrimSpace(headers.Get("anthropic-ratelimit-unified-status")), "rejected") {
+		return true
+	}
+	for _, window := range []string{"anthropic-ratelimit-unified-5h-status", "anthropic-ratelimit-unified-7d-status"} {
+		switch strings.ToLower(strings.TrimSpace(headers.Get(window))) {
+		case "exceeded", "rate_limited":
+			return true
+		}
+	}
+	return false
 }
 
 func findUpstreamResetDelay(value any, now time.Time, absolute bool, depth int) time.Duration {

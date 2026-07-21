@@ -192,6 +192,32 @@ func TestIsSubscriptionOAuthUsageLimit(t *testing.T) {
 	require.True(t, IsSubscriptionOAuthUsageLimit(constant.ChannelTypeClaudeCode, localCooldown))
 }
 
+func TestSubscriptionOAuthUsageLimitFromResetWindowWithoutMarker(t *testing.T) {
+	newBare429 := func(retryAfter time.Duration) *types.NewAPIError {
+		err := types.WithClaudeError(
+			types.ClaudeError{Type: "rate_limit_error", Message: "This request would exceed your account's rate limit."},
+			http.StatusTooManyRequests,
+		)
+		err.UpstreamStatusCode = http.StatusTooManyRequests
+		err.RetryAfter = retryAfter
+		return err
+	}
+
+	// A subscription usage window resets in hours, well past the 15-minute burst
+	// cap: even without any usage-limit wording it must classify as a usage limit
+	// so routing cools the exhausted credential for its whole window.
+	window := newBare429(3 * time.Hour)
+	require.True(t, IsSubscriptionOAuthUsageLimit(constant.ChannelTypeClaudeCode, window))
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit,
+		ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, window).GetErrorCode())
+
+	// A genuine seconds-level burst stays a transient rate limit.
+	burst := newBare429(5 * time.Second)
+	require.False(t, IsSubscriptionOAuthUsageLimit(constant.ChannelTypeClaudeCode, burst))
+	require.Equal(t, types.ErrorCodeUpstreamRateLimited,
+		ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, burst).GetErrorCode())
+}
+
 func TestSubscriptionOAuthCredentialCooldownForError(t *testing.T) {
 	newErr := func(message string, retryAfter time.Duration) *types.NewAPIError {
 		err := types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
@@ -215,9 +241,16 @@ func TestSubscriptionOAuthCredentialCooldownForError(t *testing.T) {
 	require.Equal(t, 6*24*time.Hour, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(6*24*time.Hour)))
 	require.Equal(t, maximumSubscriptionOAuthUsageLimitCooldown, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(30*24*time.Hour)))
 
-	// A transient burst 429 keeps the short transient cooldown (capped at 15m).
+	// A transient burst 429 whose reset stays within the 15m cap keeps its short
+	// transient cooldown.
 	require.Equal(t, 5*time.Second, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(5*time.Second)))
-	require.Equal(t, maximumSubscriptionOAuthRetryAfter, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(1*time.Hour)))
+	require.Equal(t, 10*time.Minute, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(10*time.Minute)))
+
+	// A bare 429 whose reset exceeds the 15m burst cap is a usage window, not a
+	// burst: it is cooled for its whole reset (honored from err.RetryAfter)
+	// instead of being re-probed after the transient cap, even without any
+	// usage-limit wording.
+	require.Equal(t, 1*time.Hour, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(1*time.Hour)))
 }
 
 func TestApplyChannelErrorPolicyLeavesOtherChannelsUnchanged(t *testing.T) {

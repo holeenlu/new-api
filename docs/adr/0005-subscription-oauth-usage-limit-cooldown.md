@@ -30,21 +30,34 @@ temporary, credential-level circuit state rather than a persistent channel
 quarantine, but it receives its own retry transition and reset-aware cooldown.
 
 - `IsSubscriptionOAuthUsageLimit(channelType, err)` recognizes a usage-limit 429
-  by message markers (`usage limit`, `weekly limit`, `monthly limit`,
-  `plan limit`, `使用上限`, …), deliberately excluding generic "rate limit"
-  phrasing so a real burst limit is not over-cooled.
+  by two independent signals: (a) message markers (`usage limit`, `weekly limit`,
+  `monthly limit`, `plan limit`, `使用上限`, …), deliberately excluding generic
+  "rate limit" phrasing; and (b) reset magnitude — a `429` whose parsed reset
+  (`err.RetryAfter`) exceeds the 15-minute burst cap
+  (`maximumSubscriptionOAuthRetryAfter`) is a usage window regardless of wording,
+  because a window resets in hours-to-days while a genuine burst resets in
+  seconds-to-minutes. This keeps a real burst limit on the short transient
+  cooldown while catching an exhausted window whose 429 carries no usage-limit
+  text.
 - Claude Code inference classifies the response that actually rejected the
-  model request. HTTP `429` plus a generic `rate_limit_error` or wording such as
-  `This request would exceed your account's rate limit` is
-  `upstream_rate_limited`. Only an explicit provider code or message containing
-  usage-window semantics (`usage_limit`, `usage limit`, `weekly limit`, etc.)
-  is `upstream_usage_limit`. Structured reset fields and `Retry-After` determine
-  cooldown when present; an explicit usage limit without reset metadata uses
-  the existing one-hour fallback.
-- `GET https://api.anthropic.com/api/oauth/usage` is not part of inference
-  classification. The endpoint can independently return `403` or `429`, and
-  its availability is not reliable evidence about the model request that just
-  failed. The gateway therefore does not expose or call this endpoint.
+  model request. A generic `rate_limit_error` with a seconds-level `Retry-After`
+  (e.g. an acceleration/burst limit) stays `upstream_rate_limited`. A `429` is
+  `upstream_usage_limit` when it carries usage-window semantics
+  (`usage_limit`, `usage limit`, `weekly limit`, an explicit provider code) OR a
+  reset window longer than the burst cap (from a structured reset field, the
+  `Retry-After` header, or Anthropic's `anthropic-ratelimit-unified-reset`
+  header). Structured reset fields, unified headers, and `Retry-After` determine
+  the cooldown when present; a usage limit without reset metadata uses the
+  one-hour fallback.
+- The gateway still does not actively call
+  `GET https://api.anthropic.com/api/oauth/usage`: it is not reliable evidence
+  about the model request that just failed. It does, however, read the
+  `anthropic-ratelimit-unified-*` headers that Anthropic returns *passively on
+  the failed inference response itself* (`-status`, per-window `-5h-status` /
+  `-7d-status`, and the Unix-second `-unified-reset`). Those headers are only
+  treated as a usage-window reset when the unified status marks the account
+  exhausted (`rejected`, or a window `exceeded` / `rate_limited`), so a 429 whose
+  window is still available (`allowed`) does not inherit a multi-hour cooldown.
 - Codex can likewise return an opaque wrapper such as `exceeded retry limit,
   last status: 429 Too Many Requests` after a subscription window is exhausted.
   The controller correlates that ambiguous 429 with a fresh snapshot from the
@@ -54,14 +67,16 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
   behavior. Codex Wham correlation uses the same bounded 30-second evidence and
   five-second negative-cache policy.
 - `RelayErrorHandler` extracts `resets_at`, `resets_in_seconds`,
-  `reset_after_seconds`, and `retry_after` from structured error wrappers and
-  falls back to the `Retry-After` header. An absolute `resets_at` takes
-  precedence. Values must be positive and are bounded to eight days, which
-  covers a weekly window without allowing malformed input to sideline a
-  credential indefinitely.
+  `reset_after_seconds`, and `retry_after` from structured error wrappers, then
+  reads Anthropic's `anthropic-ratelimit-unified-reset` header (Unix seconds,
+  only when the unified status shows the window exhausted), and finally falls
+  back to the `Retry-After` header. An absolute `resets_at` takes precedence.
+  Values must be positive and are bounded to eight days, which covers a weekly
+  window without allowing malformed input to sideline a credential indefinitely.
 - `SubscriptionOAuthCredentialCooldownForError` honors a valid exact reset
   delay. If the upstream supplies no usable reset evidence, it uses a one-hour
-  fallback. Ordinary burst 429s keep the existing maximum 15-minute cooldown.
+  fallback. Ordinary burst 429s (reset within the 15-minute cap) keep the
+  existing maximum 15-minute cooldown.
 - The 429 retry path applies this cooldown both to the credential circuit
   (`failCurrentSubscriptionOAuthCredential`) and to the value returned to the
   caller.

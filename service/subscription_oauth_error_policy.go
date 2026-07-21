@@ -148,8 +148,26 @@ func IsSubscriptionOAuthUsageLimit(channelType int, err *types.NewAPIError) bool
 	if err.GetUpstreamStatusCode() != http.StatusTooManyRequests {
 		return false
 	}
+	if subscriptionOAuthUsageWindowReset(err) {
+		return true
+	}
 	lowerMessage, lowerCode := subscriptionOAuthErrorMarkerText(err)
 	return containsSubscriptionOAuthErrorMarker(lowerMessage, lowerCode, subscriptionOAuthUsageLimitMarkers)
+}
+
+// subscriptionOAuthUsageWindowReset recognizes a plan/usage-window exhaustion
+// from the reset window's magnitude, independent of message wording. A 429 whose
+// reset exceeds the transient burst cap resets in hours-to-days, not seconds, so
+// it must be cooled for its whole window rather than re-probed after the
+// 15-minute transient cap. The reset is populated onto err.RetryAfter by
+// RelayErrorHandler from a structured resets_at/resets_in_seconds body field,
+// Anthropic's anthropic-ratelimit-unified-reset header, or the Retry-After
+// header, so this catches an exhausted subscription window even when the message
+// carries no usage-limit wording.
+func subscriptionOAuthUsageWindowReset(err *types.NewAPIError) bool {
+	return err != nil &&
+		err.GetUpstreamStatusCode() == http.StatusTooManyRequests &&
+		err.RetryAfter > maximumSubscriptionOAuthRetryAfter
 }
 
 // QuarantineSubscriptionOAuthCredential persistently removes every reference
@@ -258,7 +276,8 @@ func classifySubscriptionOAuthError(err *types.NewAPIError) *types.NewAPIError {
 		return err.Reclassify(err.Err, types.ErrorCodeUpstreamAccountDisabled)
 	}
 	if err.GetUpstreamStatusCode() == http.StatusTooManyRequests &&
-		containsSubscriptionOAuthErrorMarker(lowerMessage, lowerCode, subscriptionOAuthUsageLimitMarkers) {
+		(subscriptionOAuthUsageWindowReset(err) ||
+			containsSubscriptionOAuthErrorMarker(lowerMessage, lowerCode, subscriptionOAuthUsageLimitMarkers)) {
 		return err.Reclassify(err.Err, types.ErrorCodeUpstreamUsageLimit)
 	}
 	if containsSubscriptionOAuthErrorMarker(lowerMessage, lowerCode, subscriptionOAuthQuotaExhaustedMarkers) {

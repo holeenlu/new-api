@@ -92,6 +92,33 @@ func TestParseUpstreamRetryDelayBoundsMalformedAndOversizedValues(t *testing.T) 
 	require.Zero(t, ParseUpstreamRetryDelay(http.Header{}, []byte(`{"error":{"resets_at":"invalid"}}`), now))
 }
 
+func TestParseUpstreamRetryDelayUsesUnifiedUsageResetHeader(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`)
+
+	rejected := http.Header{}
+	rejected.Set("anthropic-ratelimit-unified-status", "rejected")
+	rejected.Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+	rejected.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(3*time.Hour).Unix()))
+	require.Equal(t, 3*time.Hour, ParseUpstreamRetryDelay(rejected, body, now))
+
+	perWindow := http.Header{}
+	perWindow.Set("anthropic-ratelimit-unified-status", "allowed_warning")
+	perWindow.Set("anthropic-ratelimit-unified-7d-status", "exceeded")
+	perWindow.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(48*time.Hour).Unix()))
+	require.Equal(t, 48*time.Hour, ParseUpstreamRetryDelay(perWindow, body, now))
+
+	// A non-exhausted window must not turn a burst 429 into a multi-hour cooldown,
+	// even though the unified reset header is far in the future. Fall back to
+	// Retry-After instead.
+	allowed := http.Header{}
+	allowed.Set("anthropic-ratelimit-unified-status", "allowed")
+	allowed.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+	allowed.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(4*time.Hour).Unix()))
+	allowed.Set("Retry-After", "30")
+	require.Equal(t, 30*time.Second, ParseUpstreamRetryDelay(allowed, body, now))
+}
+
 func TestRelayErrorHandlerPreservesUsageResetFromBody(t *testing.T) {
 	response := &http.Response{
 		StatusCode: http.StatusTooManyRequests,
