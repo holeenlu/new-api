@@ -202,14 +202,15 @@ func stringValue(value any) string {
 }
 
 type responsesWebSocketSSEWriter struct {
-	mu      sync.Mutex
-	conn    *websocket.Conn
-	header  http.Header
-	status  int
-	pending []byte
-	raw     []byte
-	sent    int
-	err     error
+	mu          sync.Mutex
+	conn        *websocket.Conn
+	header      http.Header
+	status      int
+	pending     []byte
+	raw         []byte
+	sent        int
+	sawTerminal bool
+	err         error
 }
 
 func newResponsesWebSocketSSEWriter(conn *websocket.Conn) *responsesWebSocketSSEWriter {
@@ -263,6 +264,13 @@ func (w *responsesWebSocketSSEWriter) Finish() error {
 		return w.err
 	}
 	if w.sent > 0 {
+		if !w.sawTerminal {
+			// The relay streamed partial output then ended without a terminal event
+			// (e.g. the upstream dropped mid-stream). Emit a synthetic error frame so
+			// a strict Responses-WebSocket client does not hang awaiting
+			// response.completed.
+			return writeResponsesWebSocketError(w.conn, http.StatusBadGateway, "upstream stream ended before completion")
+		}
 		return nil
 	}
 	if w.status == 0 {
@@ -309,10 +317,27 @@ func (w *responsesWebSocketSSEWriter) writeSSEBlock(block []byte) {
 	if payload == "" || payload == "[DONE]" {
 		return
 	}
+	if responsesWebSocketPayloadIsTerminal(payload) {
+		w.sawTerminal = true
+	}
 	w.err = w.conn.WriteMessage(websocket.TextMessage, []byte(payload))
 	if w.err == nil {
 		w.sent++
 	}
+}
+
+// responsesWebSocketPayloadIsTerminal reports whether a forwarded event payload
+// is a stream-ending Responses event. It matches the quoted event-type value, so
+// a real terminal frame is never missed (its type is always present verbatim);
+// an unrelated payload that merely mentions one of these strings only risks a
+// false positive, which just suppresses the synthetic terminal — never a spurious
+// error after a clean stream.
+func responsesWebSocketPayloadIsTerminal(payload string) bool {
+	return strings.Contains(payload, `"response.completed"`) ||
+		strings.Contains(payload, `"response.failed"`) ||
+		strings.Contains(payload, `"response.incomplete"`) ||
+		strings.Contains(payload, `"response.error"`) ||
+		strings.Contains(payload, `"type":"error"`)
 }
 
 func writeResponsesWebSocketError(conn *websocket.Conn, status int, message string) error {

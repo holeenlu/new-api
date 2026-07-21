@@ -60,7 +60,10 @@ func CodexAlphaSearch(c *gin.Context) {
 
 	originModel := strings.TrimSpace(routing.Model)
 	var basePayload map[string]any
-	if err := common.Unmarshal(body, &basePayload); err != nil {
+	// Decode with json.Number so large integers in the passthrough body (ids,
+	// seeds, timestamps) survive the decode → re-marshal round-trip to the
+	// upstream instead of being widened to float64 and losing precision.
+	if err := common.UnmarshalWithNumber(body, &basePayload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(err, types.ErrorCodeInvalidRequest).ToOpenAIError()})
 		return
 	}

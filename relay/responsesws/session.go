@@ -222,8 +222,33 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 			logger.LogWarn(c, "responses websocket write failed on a new connection; falling back to HTTP: "+err.Error())
 			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
 		}
-		return nil, err
+		// A reused connection was silently dropped by the upstream (idle sockets can
+		// be closed well before the lifetime cap). Reconnect once and replay the
+		// buffered turn before failing, so a pinned WebSocket channel is as resilient
+		// to a dead connection as the HTTP path's failover.
+		logger.LogWarn(c, "responses websocket reused connection write failed; reconnecting: "+err.Error())
+		if err := s.connect(c, driver, info); err != nil {
+			if errors.Is(err, ErrUpgradeRequired) {
+				s.httpFallback = true
+				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+			}
+			return nil, err
+		}
+		justConnected = true
+		if err := s.conn.WriteMessage(websocket.TextMessage, body); err != nil {
+			s.invalidateLocked(s.conn)
+			s.httpFallback = true
+			logger.LogWarn(c, "responses websocket write failed after reconnect; falling back to HTTP: "+err.Error())
+			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+		}
 	}
+
+	// The response.create frame is now on the wire — whether over a freshly
+	// established, a reconnected, or a reused connection. connect() only marks a
+	// brand-new dial, so mark it here too, otherwise a reused-connection turn that
+	// already hit the upstream would look replay-safe to the retry idempotency
+	// guard. The flag is an idempotent atomic store.
+	info.MarkUpstreamRequestWritten()
 
 	conn := s.conn
 	var firstPayload []byte
@@ -231,7 +256,21 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		// Probe a fresh connection for a first event. An upstream that accepts the
 		// handshake but never speaks the Responses WebSocket protocol would
 		// otherwise stall the client until the idle timeout; fall back to HTTP.
+		// Close the connection if the client disconnects mid-probe so the blocked
+		// read (and its capacity lease) is released promptly instead of held for the
+		// full FirstEventTimeout.
+		probeDone := make(chan struct{})
+		if reqCtx := c.Request.Context(); reqCtx != nil {
+			go func() {
+				select {
+				case <-reqCtx.Done():
+					_ = conn.Close()
+				case <-probeDone:
+				}
+			}()
+		}
 		payload, probeErr := readInitialEvent(conn)
+		close(probeDone)
 		if probeErr != nil {
 			s.invalidateLocked(conn)
 			s.httpFallback = true
