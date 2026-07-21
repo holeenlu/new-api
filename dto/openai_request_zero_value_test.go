@@ -95,3 +95,23 @@ func TestGeneralOpenAIRequestGetSystemRoleName(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAIResponsesRequestPreservesGenerateWarmupFlag(t *testing.T) {
+	// Absent generate must be omitted so ordinary turns are not marked warm-up.
+	absent, err := common.Marshal(OpenAIResponsesRequest{Model: "gpt-5"})
+	require.NoError(t, err)
+	require.False(t, gjson.GetBytes(absent, "generate").Exists())
+
+	// An explicit generate:false (warm-up) must survive the unmarshal/remarshal
+	// round-trip so it reaches the upstream Responses WebSocket.
+	var req OpenAIResponsesRequest
+	require.NoError(t, common.Unmarshal([]byte(`{"model":"gpt-5","generate":false}`), &req))
+	require.NotNil(t, req.Generate)
+	require.False(t, *req.Generate)
+
+	encoded, err := common.Marshal(req)
+	require.NoError(t, err)
+	generate := gjson.GetBytes(encoded, "generate")
+	require.True(t, generate.Exists())
+	require.False(t, generate.Bool())
+}

@@ -408,3 +408,69 @@ func TestResponsesWebSocketSessionReturnsTypedLocalConcurrencyLimit(t *testing.T
 	require.Equal(t, time.Second, apiErr.RetryAfter)
 	require.Equal(t, "1", recorder.Header().Get("Retry-After"))
 }
+
+func TestResponsesWebSocketSessionRecyclesConnectionAtLifetime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	originalLifetime := responsesws.MaxConnectionLifetime
+	responsesws.MaxConnectionLifetime = 0
+	t.Cleanup(func() { responsesws.MaxConnectionLifetime = originalLifetime })
+	service.InitHttpClient()
+
+	var upgrades atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		upgrades.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"usage":{"total_tokens":3}}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	newTurn := func() (*gin.Context, *relaycommon.RelayInfo) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		info := &relaycommon.RelayInfo{
+			IsStream:  true,
+			RelayMode: relayconstant.RelayModeResponses,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:         970001,
+				ChannelType:       constant.ChannelTypeCodex,
+				ChannelBaseUrl:    server.URL,
+				ApiKey:            `{"access_token":"access-token","account_id":"lifetime-account"}`,
+				UpstreamModelName: "gpt-5.6-sol",
+				ChannelSetting:    dto.ChannelSettings{},
+			},
+		}
+		return c, info
+	}
+
+	session := &responsesws.Session{}
+	defer session.Close()
+
+	for turn := 0; turn < 2; turn++ {
+		c, info := newTurn()
+		resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Contains(t, string(body), "event: response.completed")
+		require.NoError(t, resp.Body.Close())
+	}
+
+	// The second turn must reconnect because the connection exceeded its lifetime.
+	require.Equal(t, int32(2), upgrades.Load())
+}

@@ -36,6 +36,12 @@ const (
 // falls back to HTTP. It is a var so tests can shorten it.
 var FirstEventTimeout = 30 * time.Second
 
+// MaxConnectionLifetime bounds how long one upstream connection is reused before
+// it is proactively recycled. OpenAI caps a Responses WebSocket connection at 60
+// minutes; recycling a little earlier avoids failing a turn when the upstream
+// closes mid-stream. It is a var so tests can shorten it.
+var MaxConnectionLifetime = 55 * time.Minute
+
 // ErrUpgradeRequired signals that the upstream declined the WebSocket upgrade and
 // the session should serve the turn (and the rest of the connection) over HTTP.
 var ErrUpgradeRequired = errors.New("responses websocket upgrade required")
@@ -69,6 +75,7 @@ type Driver interface {
 type Session struct {
 	mu            sync.Mutex
 	conn          *websocket.Conn
+	connectedAt   time.Time
 	channelID     int
 	model         string
 	httpFallback  bool
@@ -186,6 +193,13 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 	if s.httpFallback {
 		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+	}
+	if s.conn != nil && !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
+		// Proactively recycle the connection before the upstream's 60-minute cap
+		// so a long-lived session does not fail a turn when the upstream closes
+		// mid-stream. The block below re-establishes it.
+		logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
+		s.invalidateLocked(s.conn)
 	}
 	justConnected := false
 	if s.conn == nil {
@@ -342,6 +356,7 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	// is not suppressed.
 	info.MarkUpstreamRequestWritten()
 	s.conn = conn
+	s.connectedAt = time.Now()
 	s.channelID = info.ChannelId
 	s.model = strings.TrimSpace(info.UpstreamModelName)
 	s.lease = lease

@@ -867,16 +867,21 @@ type OpenAIResponsesRequest struct {
 	// This field is filtered by default and can be enabled via channel setting allow_safety_identifier.
 	SafetyIdentifier json.RawMessage `json:"safety_identifier,omitempty"`
 	Stream           *bool           `json:"stream,omitempty"`
-	StreamOptions    *StreamOptions  `json:"stream_options,omitempty"`
-	Temperature      *float64        `json:"temperature,omitempty"`
-	Text             json.RawMessage `json:"text,omitempty"`
-	ToolChoice       json.RawMessage `json:"tool_choice,omitempty"`
-	Tools            json.RawMessage `json:"tools,omitempty"` // 需要处理的参数很少，MCP 参数太多不确定，所以用 map
-	TopP             *float64        `json:"top_p,omitempty"`
-	Truncation       json.RawMessage `json:"truncation,omitempty"`
-	User             json.RawMessage `json:"user,omitempty"`
-	MaxToolCalls     *uint           `json:"max_tool_calls,omitempty"`
-	Prompt           json.RawMessage `json:"prompt,omitempty"`
+	// Generate is the Responses WebSocket warm-up flag: generate:false primes the
+	// connection (tools/instructions) without producing model output. It is a
+	// pointer so an explicit false is forwarded upstream while an absent value is
+	// omitted.
+	Generate      *bool           `json:"generate,omitempty"`
+	StreamOptions *StreamOptions  `json:"stream_options,omitempty"`
+	Temperature   *float64        `json:"temperature,omitempty"`
+	Text          json.RawMessage `json:"text,omitempty"`
+	ToolChoice    json.RawMessage `json:"tool_choice,omitempty"`
+	Tools         json.RawMessage `json:"tools,omitempty"` // 需要处理的参数很少，MCP 参数太多不确定，所以用 map
+	TopP          *float64        `json:"top_p,omitempty"`
+	Truncation    json.RawMessage `json:"truncation,omitempty"`
+	User          json.RawMessage `json:"user,omitempty"`
+	MaxToolCalls  *uint           `json:"max_tool_calls,omitempty"`
+	Prompt        json.RawMessage `json:"prompt,omitempty"`
 	// qwen
 	EnableThinking json.RawMessage `json:"enable_thinking,omitempty"`
 	// perplexity

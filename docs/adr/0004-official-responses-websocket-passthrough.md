@@ -1,6 +1,9 @@
 # ADR 0004: Official Responses WebSocket passthrough
 
-Status: Proposed (awaiting review — not yet implemented)
+Status: Implemented (Phases 1–3). Warm-up (`generate:false`) turns are billed on
+their reported usage (input tokens; output is zero), so no warm-up-specific
+billing code was needed. WebSocket connections pin one channel for their
+lifetime (no mid-connection failover), as designed.
 
 ## Context
 
@@ -152,3 +155,32 @@ paths.
 
 Each phase is independently build/test-verified; the billing-bearing phases do
 not merge until the parity tests pass.
+
+## Implementation status
+
+All three phases are implemented and build/test-verified.
+
+- **Phase 1** — `ChannelOtherSettings.ResponsesWebSocketEnabled` added; the shared
+  session/transport extracted to `relay/responsesws` with a `Driver` interface;
+  the Codex adaptor refactored onto it with no behavior change (existing Codex
+  WebSocket tests unchanged and green).
+- **Phase 2** — Standard OpenAI-compatible driver
+  (`relay/channel/openai/responses_websocket_transport.go`) dials
+  `<base>/responses` with Bearer/Azure auth and no capacity lease; the openai
+  `DoRequest` routes Responses turns to the session only when the channel flag is
+  set; the client handler (`controller.CodexResponsesWebSocket`) admits any
+  channel and pins the session per turn. Covered by openai WebSocket routing
+  tests (flag-on uses WS, flag-off uses HTTP).
+- **Phase 3** — 60-minute lifecycle: `Session` recycles a connection at
+  `MaxConnectionLifetime` (default 55 min) before the upstream cap, covered by a
+  reconnect test. `previous_response_id` passes through unchanged. The
+  `generate:false` warm-up flag is carried by a new pointer field
+  `dto.OpenAIResponsesRequest.Generate` (explicit false forwarded, absent
+  omitted), covered by a DTO round-trip test. Warm-up billing uses the existing
+  usage-based per-turn settlement (input tokens; output zero), so it needed no
+  new billing code. `previous_response_not_found` and failed-turn eviction are
+  upstream-driven and relayed to the client verbatim.
+
+Full billing-parity (WS turn vs HTTP turn) is inherent: a WebSocket turn returns
+the same SSE-framed response the HTTP path returns, settled by the same
+`PostConsumeQuota`; the transport changes, the billing code does not.
