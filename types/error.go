@@ -22,6 +22,7 @@ type OpenAIError struct {
 type ClaudeError struct {
 	Type    string `json:"type,omitempty"`
 	Message string `json:"message,omitempty"`
+	Code    any    `json:"code,omitempty"`
 }
 
 type ErrorType string
@@ -66,6 +67,7 @@ const (
 	ErrorCodeUpstreamAccountDisabled      ErrorCode = "upstream_account_disabled"
 	ErrorCodeUpstreamQuotaExhausted       ErrorCode = "upstream_quota_exhausted"
 	ErrorCodeUpstreamRateLimited          ErrorCode = "upstream_rate_limited"
+	ErrorCodeUpstreamUsageLimit           ErrorCode = "upstream_usage_limit"
 	ErrorCodeModelNotSupported            ErrorCode = "model_not_supported"
 	ErrorCodeModelAtCapacity              ErrorCode = "model_at_capacity"
 
@@ -149,7 +151,6 @@ func (e *NewAPIError) Reclassify(err error, errorCode ErrorCode) *NewAPIError {
 	}
 	classified := *e
 	classified.Err = err
-	classified.RelayError = nil
 	classified.errorType = ErrorTypeNewAPIError
 	classified.errorCode = errorCode
 	return &classified
@@ -218,6 +219,8 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 	case ErrorTypeOpenAIError:
 		if openAIError, ok := e.RelayError.(OpenAIError); ok {
 			result = openAIError
+		} else if openAIError, ok := e.RelayError.(*OpenAIError); ok && openAIError != nil {
+			result = *openAIError
 		}
 	case ErrorTypeClaudeError:
 		if claudeError, ok := e.RelayError.(ClaudeError); ok {
@@ -227,6 +230,8 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 				Param:   "",
 				Code:    e.errorCode,
 			}
+		} else if claudeError, ok := e.RelayError.(*ClaudeError); ok && claudeError != nil {
+			result = OpenAIError{Message: e.Error(), Type: claudeError.Type, Code: e.errorCode}
 		}
 	default:
 		result = OpenAIError{
@@ -236,8 +241,13 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 			Code:    e.errorCode,
 		}
 	}
-	if result.Message == "" {
+	if e.Error() != "" {
+		result.Message = e.Error()
+	} else if result.Message == "" {
 		result.Message = string(e.errorType)
+	}
+	if e.errorCode != "" {
+		result.Code = string(e.errorCode)
 	}
 	return result
 }
@@ -246,26 +256,79 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 	var result ClaudeError
 	switch e.errorType {
 	case ErrorTypeOpenAIError:
-		if openAIError, ok := e.RelayError.(OpenAIError); ok {
+		if _, ok := e.RelayError.(OpenAIError); ok {
 			result = ClaudeError{
 				Message: e.Error(),
-				Type:    fmt.Sprintf("%v", openAIError.Code),
+				Type:    claudeCompatibleErrorType(e.StatusCode, e.errorCode),
+				Code:    e.errorCode,
 			}
+		} else if _, ok := e.RelayError.(*OpenAIError); ok {
+			result = ClaudeError{Message: e.Error(), Type: claudeCompatibleErrorType(e.StatusCode, e.errorCode), Code: e.errorCode}
 		}
 	case ErrorTypeClaudeError:
 		if claudeError, ok := e.RelayError.(ClaudeError); ok {
 			result = claudeError
+		} else if claudeError, ok := e.RelayError.(*ClaudeError); ok && claudeError != nil {
+			result = *claudeError
 		}
 	default:
-		result = ClaudeError{
-			Message: e.Error(),
-			Type:    string(e.errorType),
+		switch relayError := e.RelayError.(type) {
+		case ClaudeError:
+			result = relayError
+		case *ClaudeError:
+			if relayError != nil {
+				result = *relayError
+			}
+		}
+		if result.Message == "" {
+			result.Message = e.Error()
 		}
 	}
-	if result.Message == "" {
+	if e.Error() != "" {
+		result.Message = e.Error()
+	} else if result.Message == "" {
 		result.Message = string(e.errorType)
 	}
+	if result.Type == "" {
+		result.Type = claudeCompatibleErrorType(e.StatusCode, e.errorCode)
+	}
+	if e.errorCode != "" {
+		result.Code = string(e.errorCode)
+	}
 	return result
+}
+
+func claudeCompatibleErrorType(statusCode int, errorCode ErrorCode) string {
+	switch errorCode {
+	case ErrorCodeOAuthUnauthorized:
+		return "authentication_error"
+	case ErrorCodeOAuthForbidden, ErrorCodeAccessDenied:
+		return "permission_error"
+	case ErrorCodeUpstreamRateLimited, ErrorCodeUpstreamUsageLimit, ErrorCodeOAuthChannelConcurrencyLimit:
+		return "rate_limit_error"
+	case ErrorCodeModelAtCapacity:
+		return "overloaded_error"
+	case ErrorCodeInvalidRequest, ErrorCodeBadRequestBody, ErrorCodeReadRequestBodyFailed:
+		return "invalid_request_error"
+	}
+	switch statusCode {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusServiceUnavailable:
+		return "overloaded_error"
+	default:
+		return "api_error"
+	}
 }
 
 type NewAPIErrorOptions func(*NewAPIError)

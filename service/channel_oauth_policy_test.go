@@ -40,6 +40,68 @@ func TestApplyChannelErrorPolicyAllowsConfiguredOAuth429Retry(t *testing.T) {
 	require.True(t, IsSubscriptionOAuthTransientError(constant.ChannelTypeCodex, got))
 }
 
+func TestApplyChannelErrorPolicyClassifiesClaudeRateLimitWithoutUsageLookup(t *testing.T) {
+	tests := []struct {
+		name     string
+		message  string
+		errType  string
+		wantCode types.ErrorCode
+	}{
+		{
+			name:     "account rate limit",
+			message:  "This request would exceed your account's rate limit. Please try again later.",
+			errType:  "rate_limit_error",
+			wantCode: types.ErrorCodeUpstreamRateLimited,
+		},
+		{
+			name:     "explicit subscription usage limit",
+			message:  "You have reached your usage limit. Please try again after your plan resets.",
+			errType:  "rate_limit_error",
+			wantCode: types.ErrorCodeUpstreamUsageLimit,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := types.WithClaudeError(
+				types.ClaudeError{Type: test.errType, Message: test.message},
+				http.StatusTooManyRequests,
+			)
+			err.UpstreamStatusCode = http.StatusTooManyRequests
+
+			got := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, err)
+
+			require.Equal(t, test.wantCode, got.GetErrorCode())
+		})
+	}
+}
+
+func TestApplyChannelErrorPolicyUsesClaudeStructuredCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     types.ErrorCode
+		wantCode types.ErrorCode
+	}{
+		{name: "usage window", code: "usage_limit_reached", wantCode: types.ErrorCodeUpstreamUsageLimit},
+		{name: "permanent quota", code: "insufficient_quota", wantCode: types.ErrorCodeUpstreamQuotaExhausted},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := types.WithClaudeError(types.ClaudeError{
+				Type:    "rate_limit_error",
+				Message: "request rejected",
+				Code:    test.code,
+			}, http.StatusTooManyRequests)
+			err.UpstreamStatusCode = http.StatusTooManyRequests
+
+			classified := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, err)
+
+			require.Equal(t, test.wantCode, classified.GetErrorCode())
+		})
+	}
+}
+
 func TestApplyChannelErrorPolicyLeavesSubscriptionOAuthServerErrorsRetryable(t *testing.T) {
 	for _, statusCode := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 524} {
 		for _, channelType := range []int{constant.ChannelTypeClaudeCode, constant.ChannelTypeCodex} {
@@ -91,6 +153,73 @@ func TestSubscriptionOAuth429NeverAutoDisablesCredential(t *testing.T) {
 	}
 }
 
+func TestIsSubscriptionOAuthUsageLimit(t *testing.T) {
+	newErr := func(message string, upstreamStatus int) *types.NewAPIError {
+		err := types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+		err.UpstreamStatusCode = upstreamStatus
+		return err
+	}
+	tests := []struct {
+		name        string
+		message     string
+		upstream    int
+		channelType int
+		want        bool
+	}{
+		{"english usage limit on 429", "You've reached your usage limit for this plan", http.StatusTooManyRequests, constant.ChannelTypeCodex, true},
+		{"provider usage limit code on 429", "request rejected", http.StatusTooManyRequests, constant.ChannelTypeCodex, true},
+		{"chinese usage limit on 429", "你已达到使用上限，请稍后再试", http.StatusTooManyRequests, constant.ChannelTypeCodex, true},
+		{"weekly limit on 429", "weekly limit exceeded", http.StatusTooManyRequests, constant.ChannelTypeClaudeCode, true},
+		{"generic burst rate limit is not a usage limit", "rate limit exceeded, retry shortly", http.StatusTooManyRequests, constant.ChannelTypeCodex, false},
+		{"usage limit text but not a 429", "usage limit reached", http.StatusInternalServerError, constant.ChannelTypeCodex, false},
+		{"usage limit on non-subscription channel", "usage limit reached", http.StatusTooManyRequests, constant.ChannelTypeOpenAI, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := newErr(test.message, test.upstream)
+			if test.name == "provider usage limit code on 429" {
+				err.RelayError = types.OpenAIError{Type: "usage_limit_reached", Message: test.message}
+			}
+			require.Equal(t, test.want, IsSubscriptionOAuthUsageLimit(test.channelType, err))
+		})
+	}
+	require.False(t, IsSubscriptionOAuthUsageLimit(constant.ChannelTypeCodex, nil))
+	localCooldown := types.NewErrorWithStatusCode(
+		errors.New("subscription OAuth usage window is exhausted"),
+		types.ErrorCodeUpstreamUsageLimit,
+		http.StatusServiceUnavailable,
+	)
+	require.True(t, IsSubscriptionOAuthUsageLimit(constant.ChannelTypeClaudeCode, localCooldown))
+}
+
+func TestSubscriptionOAuthCredentialCooldownForError(t *testing.T) {
+	newErr := func(message string, retryAfter time.Duration) *types.NewAPIError {
+		err := types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+		err.UpstreamStatusCode = http.StatusTooManyRequests
+		err.RetryAfter = retryAfter
+		return err
+	}
+	usageLimit := func(retryAfter time.Duration) *types.NewAPIError {
+		return newErr("You've reached your usage limit", retryAfter)
+	}
+	burst := func(retryAfter time.Duration) *types.NewAPIError {
+		return newErr("rate limit exceeded", retryAfter)
+	}
+
+	// Usage-limit exhaustion: use the long default only when no reset window is
+	// available, honor exact short and weekly resets, and cap a huge window so it cannot
+	// sideline the credential indefinitely.
+	require.Equal(t, subscriptionOAuthUsageLimitCooldown, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(0)))
+	require.Equal(t, 30*time.Second, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(30*time.Second)))
+	require.Equal(t, 2*time.Hour, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(2*time.Hour)))
+	require.Equal(t, 6*24*time.Hour, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(6*24*time.Hour)))
+	require.Equal(t, maximumSubscriptionOAuthUsageLimitCooldown, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, usageLimit(30*24*time.Hour)))
+
+	// A transient burst 429 keeps the short transient cooldown (capped at 15m).
+	require.Equal(t, 5*time.Second, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(5*time.Second)))
+	require.Equal(t, maximumSubscriptionOAuthRetryAfter, SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeCodex, burst(1*time.Hour)))
+}
+
 func TestApplyChannelErrorPolicyLeavesOtherChannelsUnchanged(t *testing.T) {
 	err := types.NewOpenAIError(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 
@@ -125,6 +254,84 @@ func TestApplyChannelErrorPolicyClassifiesOAuthAuthorizationErrors(t *testing.T)
 	}
 }
 
+func TestSubscriptionOAuthAuthorizationStatusRequiresExplicitEvidenceForQuarantine(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		message    string
+		statusCode int
+		persistent bool
+	}{
+		{name: "bare unauthorized", message: "upstream rejected request", statusCode: http.StatusUnauthorized},
+		{name: "bare forbidden", message: "request is not permitted", statusCode: http.StatusForbidden},
+		{name: "expired access token", message: "access token expired", statusCode: http.StatusUnauthorized},
+		{name: "generic forbidden marker", message: "oauth_forbidden", statusCode: http.StatusForbidden},
+		{name: "revoked refresh token", message: "refresh token has been revoked", statusCode: http.StatusUnauthorized, persistent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := types.NewOpenAIError(errors.New(test.message), types.ErrorCodeBadResponseStatusCode, test.statusCode)
+			err.UpstreamStatusCode = test.statusCode
+			classified := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, err)
+
+			require.True(t, IsSubscriptionOAuthAccountUnavailable(constant.ChannelTypeClaudeCode, classified))
+			require.Equal(t, test.persistent, IsSubscriptionOAuthPersistentAccountFailure(constant.ChannelTypeClaudeCode, classified))
+			require.Equal(t, test.persistent, ShouldDisableChannelForType(constant.ChannelTypeClaudeCode, classified))
+			if !test.persistent {
+				require.False(t, QuarantineSubscriptionOAuthCredential(types.ChannelError{
+					ChannelId:   1,
+					ChannelType: constant.ChannelTypeClaudeCode,
+					UsingKey:    "still-valid-token",
+				}, classified))
+			}
+		})
+	}
+}
+
+func TestSubscriptionOAuthAuthorizationClassificationIsIdempotent(t *testing.T) {
+	bare := types.NewOpenAIError(
+		errors.New("upstream rejected request"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusUnauthorized,
+	)
+	bare.UpstreamStatusCode = http.StatusUnauthorized
+	classified := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, bare)
+	classified = ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, classified)
+	require.False(t, IsSubscriptionOAuthPersistentAccountFailure(constant.ChannelTypeClaudeCode, classified))
+
+	explicit := types.NewOpenAIError(
+		errors.New("authentication failed"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+	explicit.RelayError = types.OpenAIError{
+		Message: "authentication failed",
+		Code:    types.ErrorCodeOAuthUnauthorized,
+	}
+	classified = ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, explicit)
+	require.False(t, IsSubscriptionOAuthPersistentAccountFailure(constant.ChannelTypeClaudeCode, classified))
+}
+
+func TestCodexExpiredAccessTokenRefreshesBeforeQuarantine(t *testing.T) {
+	err := types.NewOpenAIError(errors.New("access token expired"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized)
+	err.UpstreamStatusCode = http.StatusUnauthorized
+	classified := ApplyChannelErrorPolicy(constant.ChannelTypeCodex, err)
+
+	require.True(t, ShouldRefreshCodexOAuthCredential(constant.ChannelTypeCodex, classified))
+	require.False(t, ShouldRefreshCodexOAuthCredential(constant.ChannelTypeClaudeCode, classified))
+	require.False(t, IsSubscriptionOAuthPersistentAccountFailure(constant.ChannelTypeCodex, classified))
+}
+
+func TestPermanentCodexOAuthRefreshFailureRequiresTokenEndpointEvidence(t *testing.T) {
+	require.True(t, IsPermanentCodexOAuthRefreshFailure(&CodexOAuthUpstreamError{
+		StatusCode: http.StatusBadRequest,
+		Message:    "OAuth credential refresh was rejected; reauthorize the account",
+	}))
+	require.False(t, IsPermanentCodexOAuthRefreshFailure(&CodexOAuthUpstreamError{
+		StatusCode: http.StatusServiceUnavailable,
+		Message:    "OAuth authorization service is temporarily unavailable",
+	}))
+	require.False(t, IsPermanentCodexOAuthRefreshFailure(errors.New("context deadline exceeded")))
+}
+
 func TestApplyChannelErrorPolicyClassifiesOAuthAccountFailures(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -135,15 +342,18 @@ func TestApplyChannelErrorPolicyClassifiesOAuthAccountFailures(t *testing.T) {
 	}{
 		{name: "organization disabled", message: "This organization has been disabled.", statusCode: http.StatusForbidden, wantCode: types.ErrorCodeUpstreamAccountDisabled},
 		{name: "credit balance", message: "Your credit balance is too low", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
-		{name: "current quota", message: "You exceeded your current quota", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
+		{name: "ambiguous current quota", message: "You exceeded your current quota", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
 		{name: "chinese insufficient balance", message: "余额不足", statusCode: http.StatusForbidden, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
-		{name: "chinese quota exhausted", message: "额度已用完", statusCode: http.StatusForbidden, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
-		{name: "chinese call limit", message: "调用次数已达上限", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
+		{name: "ambiguous chinese quota", message: "额度已用完", statusCode: http.StatusForbidden, wantCode: types.ErrorCodeOAuthForbidden},
+		{name: "ambiguous chinese call limit", message: "调用次数已达上限", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
 		{name: "provider error code", message: "quota rejected", code: "insufficient_quota", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
 		{name: "credit exhausted", message: "credit exhausted", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
-		{name: "out of quota", message: "out of quota", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
-		{name: "no quota available", message: "no quota available", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamQuotaExhausted},
+		{name: "ambiguous out of quota", message: "out of quota", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
+		{name: "ambiguous no quota available", message: "no quota available", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
+		{name: "stream unauthorized code", message: "authentication failed", code: types.ErrorCodeOAuthUnauthorized, statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeOAuthUnauthorized},
+		{name: "stream forbidden code", message: "permission denied", code: types.ErrorCodeOAuthForbidden, statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeOAuthForbidden},
 		{name: "ordinary rate limit", message: "too many requests", code: "rate_limit_error", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
+		{name: "usage window exhausted", message: "You've reached your usage limit", code: "usage_limit_reached", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamUsageLimit},
 	}
 
 	for _, test := range tests {
@@ -154,7 +364,8 @@ func TestApplyChannelErrorPolicyClassifiesOAuthAccountFailures(t *testing.T) {
 			require.Equal(t, test.wantCode, got.GetErrorCode())
 			require.Equal(t, test.statusCode, got.GetUpstreamStatusCode())
 			require.True(t, types.IsSkipRetryError(got))
-			require.Equal(t, test.wantCode != types.ErrorCodeUpstreamRateLimited, IsSubscriptionOAuthAccountUnavailable(constant.ChannelTypeCodex, got))
+			wantUnavailable := test.wantCode != types.ErrorCodeUpstreamRateLimited && test.wantCode != types.ErrorCodeUpstreamUsageLimit
+			require.Equal(t, wantUnavailable, IsSubscriptionOAuthAccountUnavailable(constant.ChannelTypeCodex, got))
 		})
 	}
 }

@@ -41,6 +41,72 @@ func TestParseRetryAfterCapsOversizedValues(t *testing.T) {
 	require.Equal(t, maximumSubscriptionOAuthRetryAfter, ParseRetryAfterHeader("999999999999999999", time.Now()))
 }
 
+func TestParseUpstreamRetryDelayUsesStructuredUsageReset(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		body string
+		want time.Duration
+	}{
+		{
+			name: "relative reset",
+			body: `{"error":{"type":"usage_limit_reached","resets_in_seconds":18000}}`,
+			want: 5 * time.Hour,
+		},
+		{
+			name: "absolute reset takes precedence",
+			body: fmt.Sprintf(`{"error":{"resets_at":%d,"resets_in_seconds":12}}`, now.Add(6*24*time.Hour).Unix()),
+			want: 6 * 24 * time.Hour,
+		},
+		{
+			name: "websocket style wrapper",
+			body: `{"type":"error","status":429,"body":{"error":{"type":"usage_limit_reached","reset_after_seconds":7}}}`,
+			want: 7 * time.Second,
+		},
+		{
+			name: "stale absolute falls back to relative",
+			body: fmt.Sprintf(`{"error":{"resets_at":%d,"resets_in_seconds":45}}`, now.Add(-time.Minute).Unix()),
+			want: 45 * time.Second,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			delay := ParseUpstreamRetryDelay(http.Header{"Retry-After": []string{"90"}}, []byte(test.body), now)
+			require.Equal(t, test.want, delay)
+		})
+	}
+}
+
+func TestParseUpstreamRetryDelayBoundsMalformedAndOversizedValues(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	require.Equal(t, 2*time.Minute, ParseUpstreamRetryDelay(
+		http.Header{"Retry-After": []string{"120"}},
+		[]byte(`{"error":{"resets_in_seconds":-1}}`),
+		now,
+	))
+	require.Equal(t, maximumSubscriptionOAuthUsageLimitCooldown, ParseUpstreamRetryDelay(
+		http.Header{},
+		[]byte(`{"error":{"resets_in_seconds":999999999999999999}}`),
+		now,
+	))
+	require.Zero(t, ParseUpstreamRetryDelay(http.Header{}, []byte(`{"error":{"resets_at":"invalid"}}`), now))
+}
+
+func TestRelayErrorHandlerPreservesUsageResetFromBody(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"message":"You've reached your usage limit","type":"usage_limit_reached","resets_in_seconds":21600}}`,
+		)),
+	}
+
+	err := RelayErrorHandler(context.Background(), response)
+
+	require.NotNil(t, err)
+	require.Equal(t, 6*time.Hour, err.RetryAfter)
+}
+
 func TestResetStatusCode(t *testing.T) {
 	t.Parallel()
 

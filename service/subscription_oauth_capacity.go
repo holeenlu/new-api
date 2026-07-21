@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +31,13 @@ var (
 )
 
 type subscriptionOAuthCapacityError struct {
-	cause      error
-	retryAfter time.Duration
+	cause          error
+	retryAfter     time.Duration
+	cooldownReason subscriptionOAuthCooldownReason
 }
 
 func (e *subscriptionOAuthCapacityError) Error() string {
-	return e.cause.Error()
+	return e.message(time.Now())
 }
 
 func (e *subscriptionOAuthCapacityError) Unwrap() error {
@@ -44,11 +46,51 @@ func (e *subscriptionOAuthCapacityError) Unwrap() error {
 
 type subscriptionOAuthLeaseOutcome int
 
+type subscriptionOAuthCooldownReason int
+
 const (
 	subscriptionOAuthLeaseFailed subscriptionOAuthLeaseOutcome = iota
 	subscriptionOAuthLeaseSucceeded
 	subscriptionOAuthLeaseAbandoned
 )
+
+const (
+	subscriptionOAuthCooldownTransient subscriptionOAuthCooldownReason = iota
+	subscriptionOAuthCooldownRateLimit
+	subscriptionOAuthCooldownUsageLimit
+)
+
+func (e *subscriptionOAuthCapacityError) message(now time.Time) string {
+	if e == nil {
+		return "subscription OAuth credential is temporarily unavailable"
+	}
+	retryAfterSeconds := max(int((e.retryAfter+time.Second-1)/time.Second), 1)
+	if errors.Is(e.cause, errSubscriptionOAuthCapacityReached) {
+		return fmt.Sprintf(
+			"subscription OAuth credential concurrency limit reached; retry after %d seconds",
+			retryAfterSeconds,
+		)
+	}
+	switch e.cooldownReason {
+	case subscriptionOAuthCooldownRateLimit:
+		return fmt.Sprintf(
+			"upstream rate limit is active for this subscription OAuth credential; retry after %d seconds",
+			retryAfterSeconds,
+		)
+	case subscriptionOAuthCooldownUsageLimit:
+		resetAt := now.Add(e.retryAfter).UTC().Format(time.RFC3339)
+		return fmt.Sprintf(
+			"subscription OAuth usage window is exhausted; resets at %s; retry after %d seconds",
+			resetAt,
+			retryAfterSeconds,
+		)
+	default:
+		return fmt.Sprintf(
+			"subscription OAuth credential is temporarily unavailable; retry after %d seconds",
+			retryAfterSeconds,
+		)
+	}
+}
 
 type subscriptionOAuthLocalState struct {
 	mu sync.Mutex
@@ -61,6 +103,7 @@ type subscriptionOAuthLocalState struct {
 	generation       uint64
 	cooldownUntil    time.Time
 	cooldownDuration time.Duration
+	cooldownReason   subscriptionOAuthCooldownReason
 	recoveryPending  bool
 	recoveryInFlight bool
 }
@@ -270,19 +313,7 @@ func AcquireSubscriptionOAuthCapacity(
 	maxConcurrency int,
 	minRequestInterval time.Duration,
 ) (*SubscriptionOAuthLease, error) {
-	return acquireSubscriptionOAuthCapacity(ctx, fingerprint, maxConcurrency, minRequestInterval, true)
-}
-
-// AcquireSubscriptionOAuthManagementCapacity shares credential capacity and
-// pacing with inference requests without consuming the half-open recovery
-// probe or changing circuit state.
-func AcquireSubscriptionOAuthManagementCapacity(
-	ctx context.Context,
-	fingerprint string,
-	maxConcurrency int,
-	minRequestInterval time.Duration,
-) (*SubscriptionOAuthLease, error) {
-	return acquireSubscriptionOAuthCapacity(ctx, fingerprint, maxConcurrency, minRequestInterval, false)
+	return acquireSubscriptionOAuthCapacity(ctx, fingerprint, maxConcurrency, minRequestInterval)
 }
 
 func acquireSubscriptionOAuthCapacity(
@@ -290,7 +321,6 @@ func acquireSubscriptionOAuthCapacity(
 	fingerprint string,
 	maxConcurrency int,
 	minRequestInterval time.Duration,
-	allowRecoveryProbe bool,
 ) (*SubscriptionOAuthLease, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -328,30 +358,30 @@ func acquireSubscriptionOAuthCapacity(
 	if state.recoveryPending {
 		if state.cooldownUntil.After(now) {
 			retryAfter := time.Until(state.cooldownUntil)
+			cooldownReason := state.cooldownReason
 			state.mu.Unlock()
 			return nil, &subscriptionOAuthCapacityError{
-				cause:      errSubscriptionOAuthCredentialCool,
-				retryAfter: retryAfter,
-			}
-		}
-		if !allowRecoveryProbe {
-			state.mu.Unlock()
-			return nil, &subscriptionOAuthCapacityError{
-				cause:      errSubscriptionOAuthCredentialCool,
-				retryAfter: time.Second,
+				cause:          errSubscriptionOAuthCredentialCool,
+				retryAfter:     retryAfter,
+				cooldownReason: cooldownReason,
 			}
 		}
 		if state.recoveryInFlight {
+			cooldownReason := state.cooldownReason
 			state.mu.Unlock()
 			return nil, &subscriptionOAuthCapacityError{
-				cause:      errSubscriptionOAuthCredentialCool,
-				retryAfter: time.Second,
+				cause:          errSubscriptionOAuthCredentialCool,
+				retryAfter:     time.Second,
+				cooldownReason: cooldownReason,
 			}
 		}
 	}
 	if state.active >= maxConcurrency {
 		state.mu.Unlock()
-		return nil, errSubscriptionOAuthCapacityReached
+		return nil, &subscriptionOAuthCapacityError{
+			cause:      errSubscriptionOAuthCapacityReached,
+			retryAfter: time.Second,
+		}
 	}
 
 	recoveryProbe := state.recoveryPending
@@ -395,6 +425,7 @@ func acquireSubscriptionOAuthCapacity(
 			case subscriptionOAuthLeaseSucceeded:
 				state.generation++
 				state.cooldownUntil = time.Time{}
+				state.cooldownReason = subscriptionOAuthCooldownTransient
 				state.recoveryPending = false
 			case subscriptionOAuthLeaseAbandoned:
 				// Keep the circuit half-open and immediately eligible for another
@@ -429,6 +460,14 @@ func IsSubscriptionOAuthCapacityError(err error) bool {
 	return errors.Is(err, errSubscriptionOAuthCapacityReached) || errors.Is(err, errSubscriptionOAuthCredentialCool)
 }
 
+func IsSubscriptionOAuthActiveCapacityError(err error) bool {
+	return errors.Is(err, errSubscriptionOAuthCapacityReached)
+}
+
+func IsSubscriptionOAuthCooldownCapacityError(err error) bool {
+	return errors.Is(err, errSubscriptionOAuthCredentialCool)
+}
+
 // SubscriptionOAuthCapacityRetryAfter returns when a rejected credential can
 // reasonably be retried. Active-concurrency saturation has no exact release
 // time, so callers retain the one-second fallback.
@@ -445,10 +484,44 @@ func SubscriptionOAuthCapacityRetryAfterSeconds(err error) int {
 	return max(int((retryAfter+time.Second-1)/time.Second), 1)
 }
 
+func IsSubscriptionOAuthUsageLimitCapacityError(err error) bool {
+	var capacityError *subscriptionOAuthCapacityError
+	return errors.As(err, &capacityError) &&
+		capacityError.cooldownReason == subscriptionOAuthCooldownUsageLimit
+}
+
+func IsSubscriptionOAuthRateLimitCapacityError(err error) bool {
+	var capacityError *subscriptionOAuthCapacityError
+	return errors.As(err, &capacityError) &&
+		capacityError.cooldownReason == subscriptionOAuthCooldownRateLimit
+}
+
+func SubscriptionOAuthCapacityErrorMessage(err error, now time.Time) string {
+	var capacityError *subscriptionOAuthCapacityError
+	if errors.As(err, &capacityError) {
+		return capacityError.message(now)
+	}
+	return err.Error()
+}
+
 // CooldownSubscriptionOAuthCredential opens the credential circuit only when
 // the failure belongs to the current generation. A zero expected generation is
 // reserved for administrative/test use and applies unconditionally.
 func CooldownSubscriptionOAuthCredential(fingerprint string, expectedGeneration uint64, duration time.Duration) bool {
+	return cooldownSubscriptionOAuthCredential(
+		fingerprint,
+		expectedGeneration,
+		duration,
+		subscriptionOAuthCooldownTransient,
+	)
+}
+
+func cooldownSubscriptionOAuthCredential(
+	fingerprint string,
+	expectedGeneration uint64,
+	duration time.Duration,
+	reason subscriptionOAuthCooldownReason,
+) bool {
 	if strings.TrimSpace(fingerprint) == "" || duration <= 0 {
 		return false
 	}
@@ -475,6 +548,7 @@ func CooldownSubscriptionOAuthCredential(fingerprint string, expectedGeneration 
 	state.generation++
 	state.cooldownDuration = duration
 	state.cooldownUntil = now.Add(duration)
+	state.cooldownReason = reason
 	state.recoveryPending = true
 	state.recoveryInFlight = false
 	return true
@@ -506,6 +580,7 @@ func MarkSubscriptionOAuthCredentialHealthy(fingerprint string, expectedGenerati
 	}
 	state.generation++
 	state.cooldownUntil = time.Time{}
+	state.cooldownReason = subscriptionOAuthCooldownTransient
 	state.recoveryPending = false
 	state.recoveryInFlight = false
 	return true

@@ -199,6 +199,11 @@ func CodexAlphaSearch(c *gin.Context) {
 		} else if !errors.As(requestErr, &apiError) {
 			apiError = types.NewErrorWithStatusCode(requestErr, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
 		}
+		if refreshErr, retry := refreshCodexCredentialForRetry(c, info, retryParam, channel, apiError); retry {
+			continue
+		} else if refreshErr != nil {
+			apiError = refreshErr
+		}
 		apiError = recordChannelAttemptError(c, channel, apiError)
 		lastError = apiError
 		if !shouldContinueSubscriptionOAuthRetry(c, info, retryParam, apiError) {

@@ -890,13 +890,6 @@ func TestChannel(c *gin.Context) {
 		requestCtx = c.Request.Context()
 	}
 	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
-	if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, result.newAPIError) {
-		service.QuarantineSubscriptionOAuthCredential(
-			*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
-				common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-			result.newAPIError,
-		)
-	}
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -974,14 +967,6 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		shouldBanChannel := false
 		newAPIError := result.newAPIError
-		credentialQuarantined := false
-		if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, newAPIError) {
-			credentialQuarantined = service.QuarantineSubscriptionOAuthCredential(
-				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
-					common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				newAPIError,
-			)
-		}
 		// request error disables the channel
 		if newAPIError != nil {
 			shouldBanChannel = service.ShouldDisableChannelForType(channel.Type, result.newAPIError)
@@ -1003,7 +988,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		}
 
 		// disable channel
-		if !credentialQuarantined && allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+		if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
 			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 			summary.Disabled++
 		}
@@ -1065,6 +1050,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
 	for _, channel := range channels {
+		if constant.IsSubscriptionOAuthChannel(channel.Type) {
+			continue
+		}
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
 		}

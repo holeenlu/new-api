@@ -25,6 +25,16 @@ These rules are release-blocking unless an explicit ADR changes them.
 - A credential rejected for account, authorization, quota, model entitlement,
   or capacity reasons cannot be selected again contrary to its corresponding
   request-local and process-local policy.
+- Subscription OAuth management operations cannot mutate inference capacity,
+  cooldown, recovery or persisted quarantine state. Batch inference tests never
+  select subscription OAuth channels.
+- Codex access-token authorization failures receive at most one refresh attempt
+  per client request before any durable quarantine decision.
+- Subscription OAuth requests are bounded both per credential and across the
+  complete request; only active concurrency saturation participates in capacity
+  cycling. A deployment may explicitly pause Claude Code's process-local
+  concurrency, pacing and cooldown gate, but this cannot disable request-local
+  replay safety, same-group routing boundaries or durable credential isolation.
 - A request that may already have been accepted upstream is not automatically
   replayed unless an explicit, reviewed idempotency policy permits it.
 

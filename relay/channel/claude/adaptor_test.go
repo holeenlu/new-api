@@ -156,19 +156,49 @@ func TestClaudeCodeOAuthRuntimeKeyUsesCredentialFingerprint(t *testing.T) {
 }
 
 func TestInitOAuthRuntimeSettingsReadsLoadedEnvironment(t *testing.T) {
+	originalLimitsEnabled := ClaudeCodeOAuthLocalLimitsEnabled
 	originalMaxConcurrency := ClaudeCodeOAuthMaxConcurrency
 	originalInterval := ClaudeCodeOAuthMinRequestInterval
 	t.Cleanup(func() {
+		ClaudeCodeOAuthLocalLimitsEnabled = originalLimitsEnabled
 		ClaudeCodeOAuthMaxConcurrency = originalMaxConcurrency
 		ClaudeCodeOAuthMinRequestInterval = originalInterval
 	})
+	t.Setenv("CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED", "false")
 	t.Setenv("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", "6")
 	t.Setenv("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", "200")
 
 	InitOAuthRuntimeSettings()
 
+	require.False(t, ClaudeCodeOAuthLocalLimitsEnabled)
 	require.Equal(t, 6, ClaudeCodeOAuthMaxConcurrency)
 	require.Equal(t, 200*time.Millisecond, ClaudeCodeOAuthMinRequestInterval)
+}
+
+func TestClaudeCodeOAuthLocalLimitsCanBePaused(t *testing.T) {
+	originalLimitsEnabled := ClaudeCodeOAuthLocalLimitsEnabled
+	ClaudeCodeOAuthLocalLimitsEnabled = false
+	t.Cleanup(func() { ClaudeCodeOAuthLocalLimitsEnabled = originalLimitsEnabled })
+
+	channelID := 900005
+	key := "sk-ant-oat01-paused"
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeClaudeCode, channelID, 0, key)
+	lease, err := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 1, 0)
+	require.NoError(t, err)
+	defer lease.Release()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	bypassLease, err := acquireClaudeCodeOAuthCapacity(c, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:   channelID,
+			ChannelType: constant.ChannelTypeClaudeCode,
+			ApiKey:      key,
+		},
+	})
+
+	require.NoError(t, err)
+	require.Nil(t, bypassLease)
 }
 
 func TestClaudeCodeLocalConcurrencyLimitRemainsRetryable(t *testing.T) {

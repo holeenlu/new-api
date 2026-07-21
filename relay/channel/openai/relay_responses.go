@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const maxResponsesStreamPreflightBytes = 64 << 10
@@ -161,22 +162,27 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		if isSubscriptionOAuth {
 			streamError := streamResponse.GetOpenAIError()
-			if streamError != nil {
-				candidate := types.WithOpenAIError(*streamError, http.StatusTooManyRequests)
-				candidate.UpstreamStatusCode = http.StatusTooManyRequests
+			terminalFailure := streamResponse.Type == "response.failed" ||
+				streamResponse.Type == "response.error" || streamResponse.Type == "error"
+			if terminalFailure && streamError == nil {
+				streamError = &types.OpenAIError{Type: "unknown_error", Message: "upstream Responses stream failed without error details"}
+			}
+			if terminalFailure {
+				upstreamStatus := responsesStreamErrorStatus(data, streamError)
+				candidate := types.WithOpenAIError(*streamError, upstreamStatus)
+				candidate.UpstreamStatusCode = upstreamStatus
+				candidate.RetryAfter = service.ParseUpstreamRetryDelay(http.Header{}, []byte(data), time.Now())
 				candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
-				if service.IsSubscriptionOAuthModelAtCapacity(info.ChannelType, candidate) {
-					info.MarkUpstreamFailureResponse()
-					if !downstreamCommitted.Load() {
-						if streamResponse.Type == "response.failed" {
-							relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
-						}
-						preflightError = candidate
-						sr.Stop(candidate)
-						return
+				info.MarkUpstreamFailureResponse()
+				if !downstreamCommitted.Load() {
+					if streamResponse.Type == "response.failed" {
+						relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
 					}
-					sr.Error(candidate)
+					preflightError = candidate
+					sr.Stop(candidate)
+					return
 				}
+				sr.Error(candidate)
 			}
 			if !downstreamCommitted.Load() {
 				switch streamResponse.Type {
@@ -257,4 +263,45 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	return usage, nil
+}
+
+func responsesStreamErrorStatus(data string, streamError *types.OpenAIError) int {
+	for _, path := range []string{
+		"error.status_code",
+		"response.error.status_code",
+		"error.status",
+		"response.error.status",
+		"status_code",
+	} {
+		status := int(gjson.Get(data, path).Int())
+		if status >= 400 && status <= 599 {
+			return status
+		}
+	}
+	if streamError == nil {
+		return http.StatusBadGateway
+	}
+	marker := strings.ToLower(streamError.Type + " " + fmt.Sprint(streamError.Code) + " " + streamError.Message)
+	switch {
+	case strings.Contains(marker, "authentication"), strings.Contains(marker, "unauthorized"):
+		return http.StatusUnauthorized
+	case strings.Contains(marker, "permission"), strings.Contains(marker, "forbidden"):
+		return http.StatusForbidden
+	case strings.Contains(marker, "request_too_large"):
+		return http.StatusRequestEntityTooLarge
+	case strings.Contains(marker, "invalid_request"):
+		return http.StatusBadRequest
+	case strings.Contains(marker, "not_found"):
+		return http.StatusNotFound
+	case strings.Contains(marker, "rate_limit"), strings.Contains(marker, "usage_limit"),
+		strings.Contains(marker, "model_at_capacity"), strings.Contains(marker, "insufficient_quota"):
+		return http.StatusTooManyRequests
+	case strings.Contains(marker, "service_unavailable"), strings.Contains(marker, "server_is_overloaded"),
+		strings.Contains(marker, "server_overloaded"), strings.Contains(marker, "overloaded"):
+		return http.StatusServiceUnavailable
+	case strings.Contains(marker, "server_error"), strings.Contains(marker, "internal_error"):
+		return http.StatusInternalServerError
+	default:
+		return http.StatusBadGateway
+	}
 }

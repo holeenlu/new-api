@@ -68,6 +68,9 @@ func AcquireSubscriptionOAuthChannelCapacity(
 	maxConcurrency int,
 	minRequestInterval time.Duration,
 ) (*SubscriptionOAuthLease, error) {
+	if info != nil && info.IsChannelTest {
+		return &SubscriptionOAuthLease{}, nil
+	}
 	fingerprint := SubscriptionOAuthCredentialFingerprint(
 		info.ChannelType,
 		info.ChannelId,
@@ -88,10 +91,19 @@ func AcquireSubscriptionOAuthChannelCapacity(
 		if c != nil {
 			c.Header("Retry-After", strconv.Itoa(SubscriptionOAuthCapacityRetryAfterSeconds(err)))
 		}
+		errorCode := types.ErrorCodeOAuthChannelConcurrencyLimit
+		statusCode := http.StatusServiceUnavailable
+		if IsSubscriptionOAuthUsageLimitCapacityError(err) {
+			errorCode = types.ErrorCodeUpstreamUsageLimit
+			statusCode = http.StatusTooManyRequests
+		} else if IsSubscriptionOAuthRateLimitCapacityError(err) {
+			errorCode = types.ErrorCodeUpstreamRateLimited
+			statusCode = http.StatusTooManyRequests
+		}
 		apiError := types.NewErrorWithStatusCode(
 			err,
-			types.ErrorCodeOAuthChannelConcurrencyLimit,
-			http.StatusServiceUnavailable,
+			errorCode,
+			statusCode,
 			types.ErrOptionWithNoRecordErrorLog(),
 		)
 		apiError.RetryAfter = SubscriptionOAuthCapacityRetryAfter(err)

@@ -11,6 +11,18 @@ import (
 
 const maximumSubscriptionOAuthRetryAfter = 15 * time.Minute
 
+const maximumSubscriptionOAuthRequestAttempts = 10
+
+// A plan/usage-limit exhaustion (multi-hour or weekly cap) resets in hours-to-days,
+// so its credential is cooled down far longer than a transient burst 429. The
+// default applies when the upstream sends no usable reset window; the maximum
+// caps a misread window so a credential cannot be sidelined indefinitely — the
+// next probe after expiry self-corrects if the account is still limited.
+const (
+	subscriptionOAuthUsageLimitCooldown        = 1 * time.Hour
+	maximumSubscriptionOAuthUsageLimitCooldown = 8 * 24 * time.Hour
+)
+
 type SubscriptionOAuthRetryDecision int
 
 const (
@@ -37,6 +49,7 @@ type subscriptionOAuthCredentialRetry struct {
 type subscriptionOAuthTracker struct {
 	current        *SubscriptionOAuthAttemptTarget
 	credentials    map[string]*subscriptionOAuthCredentialRetry
+	refreshTried   map[string]struct{}
 	capacityCycles int
 	capacityWait   time.Duration
 	capacityOrder  []SubscriptionOAuthAttemptTarget
@@ -114,10 +127,31 @@ func (p *RetryParam) ensureSubscriptionOAuthTracker() *subscriptionOAuthTracker 
 	if p.oauth == nil {
 		p.oauth = &subscriptionOAuthTracker{
 			credentials:  make(map[string]*subscriptionOAuthCredentialRetry),
+			refreshTried: make(map[string]struct{}),
 			capacitySeen: make(map[string]struct{}),
 		}
 	}
 	return p.oauth
+}
+
+// ClaimSubscriptionOAuthCredentialRefresh permits one refresh attempt for the
+// current credential during a client request. The credential fingerprint is
+// stable across Codex access-token rotation, so concurrent retry branches in
+// the same request cannot refresh repeatedly.
+func (p *RetryParam) ClaimSubscriptionOAuthCredentialRefresh() bool {
+	if p == nil || p.totalAttempts >= maximumSubscriptionOAuthRequestAttempts {
+		return false
+	}
+	target := p.SubscriptionOAuthAttemptTarget()
+	if target == nil || target.Fingerprint == "" {
+		return false
+	}
+	tracker := p.ensureSubscriptionOAuthTracker()
+	if _, exists := tracker.refreshTried[target.Fingerprint]; exists {
+		return false
+	}
+	tracker.refreshTried[target.Fingerprint] = struct{}{}
+	return true
 }
 
 func (p *RetryParam) NextCapacityCycleBackoff() (time.Duration, bool) {
@@ -203,6 +237,10 @@ func (p *RetryParam) RestartSubscriptionOAuthCapacityCycle() bool {
 // selected more than the configured per-credential limit.
 func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) bool {
 	state := p.ensureSubscriptionOAuthTracker()
+	if p.totalAttempts >= maximumSubscriptionOAuthRequestAttempts {
+		p.clearSubscriptionOAuthAttemptTarget()
+		return false
+	}
 	credential := state.credentials[fingerprint]
 	if credential == nil {
 		credential = &subscriptionOAuthCredentialRetry{}
@@ -279,6 +317,17 @@ func (p *RetryParam) handleSubscriptionOAuthCapacityFailure() {
 	p.advanceCapacityReplay()
 }
 
+func (p *RetryParam) handleSubscriptionOAuthKnownCooldown() {
+	target := p.SubscriptionOAuthAttemptTarget()
+	if target == nil {
+		return
+	}
+	if p.Boundary != nil {
+		p.Boundary.FailCredential(target.Fingerprint)
+	}
+	p.clearSubscriptionOAuthAttemptTarget()
+}
+
 // RejectSubscriptionOAuthReplayTarget advances past a stale replay target
 // that can no longer be loaded or matched to its original credential.
 func (p *RetryParam) RejectSubscriptionOAuthReplayTarget() {
@@ -297,7 +346,7 @@ func (p *RetryParam) handleSubscriptionOAuthAccountUnavailable() {
 	if target == nil {
 		return
 	}
-	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
 }
 
 // handleSubscriptionOAuthModelUnavailable excludes the credential only from
@@ -315,17 +364,11 @@ func (p *RetryParam) handleSubscriptionOAuthModelUnavailable() {
 	p.advanceCapacityReplay()
 }
 
-// handleSubscriptionOAuthModelCapacity removes a temporarily saturated
-// credential from the current request and opens its short cooldown before the
-// next same-group credential is selected. This is intentionally distinct from
-// a model-entitlement failure, which is request-local and does not cool down
-// the OAuth account.
+// handleSubscriptionOAuthModelCapacity excludes only the credential/model
+// combination represented by this request. A provider model-capacity signal
+// must not make unrelated models on the same account unavailable.
 func (p *RetryParam) handleSubscriptionOAuthModelCapacity() {
-	target := p.SubscriptionOAuthAttemptTarget()
-	if target == nil {
-		return
-	}
-	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+	p.handleSubscriptionOAuthModelUnavailable()
 }
 
 // DecideSubscriptionOAuthContinuation is the single state transition entry
@@ -339,7 +382,8 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 		return SubscriptionOAuthRetryStop, 0
 	}
 
-	stop := observation.DownstreamStarted || observation.RetryDisabled || observation.SpecificChannel
+	stop := observation.DownstreamStarted || observation.RetryDisabled || observation.SpecificChannel ||
+		p.totalAttempts >= maximumSubscriptionOAuthRequestAttempts
 	if IsSubscriptionOAuthAccountUnavailable(observation.ChannelType, observation.Error) {
 		p.handleSubscriptionOAuthAccountUnavailable()
 		if stop {
@@ -365,7 +409,30 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 		}
 		return SubscriptionOAuthSwitchCredential, 0
 	}
-	if IsSubscriptionOAuthConcurrencyLimit(observation.ChannelType, observation.Error) {
+	if IsSubscriptionOAuthUsageLimit(observation.ChannelType, observation.Error) {
+		cooldown := SubscriptionOAuthCredentialCooldownForError(observation.ChannelType, observation.Error)
+		if IsSubscriptionOAuthKnownCooldownFailure(observation.ChannelType, observation.Error) {
+			p.handleSubscriptionOAuthKnownCooldown()
+		} else {
+			target := p.SubscriptionOAuthAttemptTarget()
+			if target == nil {
+				return SubscriptionOAuthRetryStop, cooldown
+			}
+			p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownUsageLimit)
+		}
+		if stop {
+			return SubscriptionOAuthRetryStop, cooldown
+		}
+		return SubscriptionOAuthSwitchCredential, cooldown
+	}
+	if IsSubscriptionOAuthKnownCooldownFailure(observation.ChannelType, observation.Error) {
+		p.handleSubscriptionOAuthKnownCooldown()
+		if stop {
+			return SubscriptionOAuthRetryStop, observation.Error.RetryAfter
+		}
+		return SubscriptionOAuthSwitchCredential, observation.Error.RetryAfter
+	}
+	if IsSubscriptionOAuthActiveCapacityFailure(observation.ChannelType, observation.Error) {
 		p.handleSubscriptionOAuthCapacityFailure()
 		if stop {
 			return SubscriptionOAuthRetryStop, observation.Error.RetryAfter
@@ -375,16 +442,16 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 
 	statusCode := observation.Error.GetUpstreamStatusCode()
 	if statusCode == http.StatusTooManyRequests {
-		retryAfter := SubscriptionOAuthRetryCooldown(observation.Error.RetryAfter)
+		cooldown := SubscriptionOAuthCredentialCooldownForError(observation.ChannelType, observation.Error)
 		decision := p.decideSubscriptionOAuthRetry(
 			observation.UpstreamRequestWritten,
 			observation.UpstreamResponseStarted,
 			observation.ExplicitFailureResponse,
 			stop,
 			statusCode,
-			observation.Error.RetryAfter,
+			cooldown,
 		)
-		return decision, retryAfter
+		return decision, cooldown
 	}
 	if stop || !observation.Retryable {
 		return SubscriptionOAuthRetryStop, 0
@@ -395,7 +462,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 		observation.ExplicitFailureResponse,
 		false,
 		statusCode,
-		observation.Error.RetryAfter,
+		0,
 	), 0
 }
 
@@ -407,14 +474,14 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 	explicitFailureResponse bool,
 	downstreamStarted bool,
 	statusCode int,
-	retryAfter time.Duration,
+	cooldown time.Duration,
 ) SubscriptionOAuthRetryDecision {
 	target := p.SubscriptionOAuthAttemptTarget()
 	if target == nil {
 		return SubscriptionOAuthRetryStop
 	}
 	if statusCode == http.StatusTooManyRequests {
-		p.failCurrentSubscriptionOAuthCredential(target, SubscriptionOAuthRetryCooldown(retryAfter))
+		p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownRateLimit)
 		if downstreamStarted || !common.SubscriptionOAuthRetry429 {
 			return SubscriptionOAuthRetryStop
 		}
@@ -432,7 +499,7 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 	}
 	credential.failures++
 	if target.RecoveryProbe {
-		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
 		return SubscriptionOAuthSwitchCredential
 	}
 	maxFailures := common.SubscriptionOAuthUpstreamRetryTimes
@@ -440,7 +507,7 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 		return SubscriptionOAuthRetryStop
 	}
 	if credential.failures >= maxFailures {
-		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown)
+		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
 		return SubscriptionOAuthSwitchCredential
 	}
 
@@ -464,14 +531,41 @@ func SubscriptionOAuthRetryCooldown(retryAfter time.Duration) time.Duration {
 	return retryAfter
 }
 
-func (p *RetryParam) failCurrentSubscriptionOAuthCredential(target *SubscriptionOAuthAttemptTarget, cooldown time.Duration) {
+// SubscriptionOAuthCredentialCooldownForError picks how long a rejected
+// credential stays out of routing. A plan/usage-limit exhaustion is cooled down
+// for its exact reset window, or the conservative default when none is known,
+// so requests fail over to other channels until it recovers, instead of
+// the short transient-429 cooldown that re-probed the exhausted account within
+// minutes. All other 429s keep the transient cooldown.
+func SubscriptionOAuthCredentialCooldownForError(channelType int, err *types.NewAPIError) time.Duration {
+	if err == nil {
+		return subscriptionOAuthCredentialCooldown
+	}
+	if IsSubscriptionOAuthUsageLimit(channelType, err) {
+		cooldown := err.RetryAfter
+		if cooldown <= 0 {
+			cooldown = subscriptionOAuthUsageLimitCooldown
+		}
+		if cooldown > maximumSubscriptionOAuthUsageLimitCooldown {
+			cooldown = maximumSubscriptionOAuthUsageLimitCooldown
+		}
+		return cooldown
+	}
+	return SubscriptionOAuthRetryCooldown(err.RetryAfter)
+}
+
+func (p *RetryParam) failCurrentSubscriptionOAuthCredential(
+	target *SubscriptionOAuthAttemptTarget,
+	cooldown time.Duration,
+	reason subscriptionOAuthCooldownReason,
+) {
 	if target == nil {
 		return
 	}
 	if p.Boundary != nil {
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
-	CooldownSubscriptionOAuthCredential(target.Fingerprint, target.Generation, cooldown)
+	cooldownSubscriptionOAuthCredential(target.Fingerprint, target.Generation, cooldown, reason)
 	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }

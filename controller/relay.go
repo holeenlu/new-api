@@ -18,9 +18,11 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -276,6 +278,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryParam.MarkSubscriptionOAuthFailure()
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+		if refreshErr, retry := refreshCodexCredentialForRetry(c, relayInfo, retryParam, channel, newAPIError); retry {
+			continue
+		} else if refreshErr != nil {
+			newAPIError = refreshErr
+		}
 		newAPIError = recordChannelAttemptError(c, channel, newAPIError)
 		relayInfo.LastError = newAPIError
 
@@ -311,6 +318,47 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 }
 
+func refreshCodexCredentialForRetry(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	retryParam *service.RetryParam,
+	channel *model.Channel,
+	apiError *types.NewAPIError,
+) (*types.NewAPIError, bool) {
+	if c == nil || info == nil || retryParam == nil || channel == nil ||
+		!service.ShouldRefreshCodexOAuthCredential(channel.Type, apiError) ||
+		c.Writer.Written() {
+		return apiError, false
+	}
+	written, _ := info.UpstreamAttemptState()
+	if (written && !info.HasUpstreamFailureResponse()) || !retryParam.ClaimSubscriptionOAuthCredentialRefresh() {
+		return apiError, false
+	}
+	oauthKey, err := codex.ParseOAuthKey(common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	if err != nil || strings.TrimSpace(oauthKey.AccessToken) == "" {
+		return apiError, false
+	}
+	_, _, err = service.RefreshCodexChannelCredential(c.Request.Context(), channel.Id, service.CodexCredentialRefreshOptions{
+		ResetCaches:         true,
+		ExpectedAccessToken: oauthKey.AccessToken,
+	})
+	if err == nil {
+		logger.LogInfo(c, fmt.Sprintf("refreshed Codex OAuth credential after upstream authorization rejection: channel=%d", channel.Id))
+		return nil, true
+	}
+	logger.LogWarn(c, fmt.Sprintf("Codex OAuth credential refresh failed: channel=%d error=%s", channel.Id, err.Error()))
+	if !service.IsPermanentCodexOAuthRefreshFailure(err) {
+		return apiError, false
+	}
+	refreshError := types.NewErrorWithStatusCode(
+		fmt.Errorf("Codex OAuth refresh credential was rejected; reauthorization is required: %w", err),
+		types.ErrorCodeOAuthUnauthorized,
+		http.StatusUnauthorized,
+	)
+	refreshError.UpstreamStatusCode = http.StatusUnauthorized
+	return refreshError, false
+}
+
 func shouldRetryOrdinaryRelay(c *gin.Context, info *relaycommon.RelayInfo, apiError *types.NewAPIError, retryTimes int) bool {
 	if !shouldRetry(c, apiError, retryTimes) || c == nil || c.Writer == nil || c.Writer.Written() {
 		return false
@@ -327,6 +375,12 @@ func shouldContinueSubscriptionOAuthRetry(
 ) bool {
 	written, responseStarted := info.UpstreamAttemptState()
 	_, specificChannel := c.Get("specific_channel_id")
+	internalWebSocketPin := c.GetBool(responsesWebSocketInternalPinKey)
+	if internalWebSocketPin {
+		// This pin is an implementation detail of the reusable upstream
+		// WebSocket, not an administrator/user request to force one channel.
+		specificChannel = false
+	}
 	decision, retryAfter := retryParam.DecideSubscriptionOAuthContinuation(service.SubscriptionOAuthRetryObservation{
 		ChannelType:             c.GetInt("channel_type"),
 		Error:                   apiError,
@@ -334,13 +388,18 @@ func shouldContinueSubscriptionOAuthRetry(
 		UpstreamResponseStarted: responseStarted,
 		ExplicitFailureResponse: info.HasUpstreamFailureResponse(),
 		DownstreamStarted:       c.Writer.Written(),
-		RetryDisabled:           service.IsSubscriptionOAuthRetryDisabled(c),
+		RetryDisabled:           service.IsSubscriptionOAuthRetryDisabled(c) && !internalWebSocketPin,
 		SpecificChannel:         specificChannel,
 		Retryable:               shouldRetry(c, apiError, common.SubscriptionOAuthUpstreamRetryTimes),
 	})
 	if retryAfter > 0 {
 		seconds := int((retryAfter + time.Second - 1) / time.Second)
 		c.Header("Retry-After", strconv.Itoa(max(seconds, 1)))
+	}
+	if decision == service.SubscriptionOAuthSwitchCredential {
+		if session := responsesws.SessionFromContext(c); session != nil {
+			session.ResetChannelForRetry()
+		}
 	}
 	return decision != service.SubscriptionOAuthRetryStop
 }
@@ -508,7 +567,7 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
-	if service.IsSubscriptionOAuthConcurrencyLimit(c.GetInt("channel_type"), openaiErr) {
+	if service.IsSubscriptionOAuthCapacityFailure(c.GetInt("channel_type"), openaiErr) {
 		return true
 	}
 	if !relaycommon.IsSubscriptionOAuthChannel(c.GetInt("channel_type")) &&
@@ -561,12 +620,10 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	// the actual upstream/network error in runtime and persisted error logs.
 	errorDetail := err.ErrorWithStatusCode()
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d): %s; detail: %s", channelError.ChannelId, errorSummary, errorDetail))
-	if service.IsSubscriptionOAuthAccountUnavailable(channelError.ChannelType, err) {
-		service.QuarantineSubscriptionOAuthCredential(channelError, err)
-	}
+	credentialQuarantined := service.QuarantineSubscriptionOAuthCredential(channelError, err)
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannelForType(channelError.ChannelType, err) && channelError.AutoBan {
+	if !credentialQuarantined && service.ShouldDisableChannelForType(channelError.ChannelType, err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, errorSummary)
 		})
@@ -625,8 +682,11 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 // decisions. Sharing it keeps per-attempt error accounting identical across
 // every relay entry point (Relay and CodexAlphaSearch).
 func recordChannelAttemptError(c *gin.Context, channel *model.Channel, apiError *types.NewAPIError) *types.NewAPIError {
+	if channel.Type == constant.ChannelTypeCodex {
+		apiError = correlateCodexOAuthUsageLimit(c, channel, apiError)
+	}
 	apiError = service.ApplyChannelErrorPolicy(channel.Type, apiError)
-	if service.IsSubscriptionOAuthConcurrencyLimit(channel.Type, apiError) {
+	if service.IsSubscriptionOAuthCapacityFailure(channel.Type, apiError) {
 		logger.LogWarn(c, fmt.Sprintf(
 			"subscription OAuth capacity failover: channel=%d credential=%s",
 			channel.Id,

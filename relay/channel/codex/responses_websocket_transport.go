@@ -4,11 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
@@ -63,8 +60,7 @@ func (a *Adaptor) DoHTTPFallback(c *gin.Context, info *relaycommon.RelayInfo, bo
 	return doCodexHTTPResponseRequest(c, a, info, bytes.NewReader(body))
 }
 
-// OnUpstreamConnected implements responsesws.Driver.
-func (a *Adaptor) OnUpstreamConnected(c *gin.Context, info *relaycommon.RelayInfo) {
-	common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(info.ChannelId))
-	service.DisableSubscriptionOAuthRetry(c)
-}
+// OnUpstreamConnected implements responsesws.Driver. Session pinning is owned
+// by responsesws.Session; the relay remains free to fail over before any
+// downstream event is committed.
+func (a *Adaptor) OnUpstreamConnected(_ *gin.Context, _ *relaycommon.RelayInfo) {}

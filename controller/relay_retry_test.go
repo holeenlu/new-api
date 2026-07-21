@@ -2,15 +2,18 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -103,6 +106,81 @@ func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
 	)
 
 	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
+}
+
+func TestBoundSubscriptionOAuthWebSocketSwitchesOnUsageLimitBeforeOutput(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	c.Set(responsesWebSocketInternalPinKey, true)
+	c.Set("specific_channel_id", "41")
+	service.DisableSubscriptionOAuthRetry(c)
+	responsesws.SetSession(c, &responsesws.Session{})
+
+	initial := &model.Channel{
+		Id: 41, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-a","account_id":"usage-limited"}`,
+		Group:   "default",
+	}
+	initial.SetOtherSettings(dto.ChannelOtherSettings{})
+	backup := &model.Channel{
+		Id: 42, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-b","account_id":"usage-available"}`,
+		Group:   "default",
+	}
+	backup.SetOtherSettings(dto.ChannelOtherSettings{})
+
+	retryParam := &service.RetryParam{Boundary: service.NewRetryBoundary(initial, "default")}
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
+	apiError := types.NewErrorWithStatusCode(
+		errors.New("You've reached your usage limit"),
+		types.ErrorCodeUpstreamUsageLimit,
+		http.StatusTooManyRequests,
+	)
+	apiError.UpstreamStatusCode = http.StatusTooManyRequests
+	apiError.RetryAfter = 5 * time.Hour
+
+	require.True(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
+	require.False(t, retryParam.Boundary.Allows(initial))
+	require.True(t, retryParam.Boundary.Allows(backup))
+}
+
+func TestCorrelateCodexOAuthUsageLimitUsesCurrentCredentialWhamSnapshot(t *testing.T) {
+	service.InitHttpClient()
+	resetAt := time.Now().Add(5 * time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/backend-api/wham/usage", r.URL.Path)
+		require.Equal(t, "Bearer token-a", r.Header.Get("Authorization"))
+		require.Equal(t, "account-a", r.Header.Get("chatgpt-account-id"))
+		_, _ = w.Write([]byte(`{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"reset_at":` +
+			fmt.Sprint(resetAt) + `}}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	key := `{"access_token":"token-a","account_id":"account-a"}`
+	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
+	channel := &model.Channel{
+		Id:      31,
+		Type:    constant.ChannelTypeCodex,
+		Key:     key,
+		BaseURL: common.GetPointer(server.URL),
+	}
+	apiError := types.NewOpenAIError(
+		errors.New("exceeded retry limit, last status: 429 Too Many Requests"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+	apiError.UpstreamStatusCode = http.StatusTooManyRequests
+
+	correlated := correlateCodexOAuthUsageLimit(c, channel, apiError)
+
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, correlated.GetErrorCode())
+	require.Greater(t, correlated.RetryAfter, 4*time.Hour)
 }
 
 func TestClearStaleRetryAfter(t *testing.T) {

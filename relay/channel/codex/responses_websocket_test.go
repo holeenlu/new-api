@@ -358,9 +358,45 @@ func TestResponsesWebSocketHandshakePreservesUpstream429(t *testing.T) {
 	var apiErr *types.NewAPIError
 	require.ErrorAs(t, err, &apiErr)
 	require.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
-	require.Equal(t, types.ErrorCodeBadResponseStatusCode, apiErr.GetErrorCode())
+	require.Equal(t, types.ErrorCode("unknown_error"), apiErr.GetErrorCode())
 	require.Equal(t, 9*time.Second, apiErr.RetryAfter)
 	require.Zero(t, session.ChannelID())
+}
+
+func TestResponsesWebSocketHandshakePreservesUsageResetMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":18000}}`))
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	_, err := (&responsesws.Session{}).DoRequest(c, &Adaptor{}, &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         980013,
+			ChannelType:       constant.ChannelTypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"access-token","account_id":"handshake-usage-limit"}`,
+			UpstreamModelName: "gpt-5.6-sol",
+		},
+	}, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, 5*time.Hour, apiErr.RetryAfter)
+	classified := service.ApplyChannelErrorPolicy(constant.ChannelTypeCodex, apiErr)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, classified.GetErrorCode())
 }
 
 func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {

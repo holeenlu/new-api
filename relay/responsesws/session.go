@@ -137,6 +137,24 @@ func (s *Session) ChannelID() int {
 	return s.channelID
 }
 
+// ResetChannelForRetry releases the current upstream connection and its
+// channel binding before the relay selects another compatible credential. It
+// is used only while the current turn is still replay-safe; the relay owns that
+// decision because it knows whether downstream output has started.
+func (s *Session) ResetChannelForRetry() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.invalidateLocked(s.conn)
+	s.channelID = 0
+	s.model = ""
+	s.httpFallback = false
+	s.pendingID = 0
+	s.pendingModel = ""
+	s.mu.Unlock()
+}
+
 func (s *Session) ConfirmHTTPFallbackSuccess() {
 	if s == nil {
 		return
@@ -373,9 +391,6 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		dialer.TLSClientConfig = tlsConfig
 	}
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
-	if response != nil && response.Body != nil {
-		response.Body.Close()
-	}
 	if err != nil {
 		logger.LogError(c, "responses websocket handshake failed: "+err.Error())
 		if response != nil && response.StatusCode > 0 && response.StatusCode != http.StatusUpgradeRequired {
@@ -387,6 +402,9 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 			}
 			info.MarkUpstreamResponseStarted()
 			info.MarkUpstreamFailureResponse()
+			if response.Body != nil {
+				return service.RelayErrorHandler(c.Request.Context(), response)
+			}
 			apiError := types.NewErrorWithStatusCode(
 				fmt.Errorf("responses websocket handshake failed with status %d", response.StatusCode),
 				types.ErrorCodeBadResponseStatusCode,
@@ -396,6 +414,9 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 			apiError.RetryAfter = service.ParseRetryAfterHeader(response.Header.Get("Retry-After"), time.Now())
 			return apiError
 		}
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
 		// Either the upstream explicitly asked to upgrade elsewhere (426) or the dial
 		// produced no usable HTTP response at all — a malformed/HTTP-2 framed reply,
 		// a TLS error, or a connection-level failure. In every one of these cases the
@@ -403,6 +424,9 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		// and the rest of the connection over HTTP rather than failing the turn hard.
 		s.fallbackLease = lease
 		return ErrUpgradeRequired
+	}
+	if response != nil && response.Body != nil {
+		response.Body.Close()
 	}
 	conn.EnableWriteCompression(false)
 	// Only record the upstream request as written after a successful handshake; a

@@ -22,6 +22,8 @@ import (
 
 const maxResponsesWebSocketErrorBytes = 1 << 20
 
+const responsesWebSocketInternalPinKey = "responses_websocket_internal_pin"
+
 var responsesWebSocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -71,6 +73,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	engine.Use(func(turn *gin.Context) {
 		if pinnedChannelID > 0 {
 			common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(pinnedChannelID))
+			turn.Set(responsesWebSocketInternalPinKey, true)
 			service.DisableSubscriptionOAuthRetry(turn)
 		}
 		turn.Next()
@@ -86,9 +89,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		if turn.GetBool("relay_affinity_success") {
 			session.ConfirmHTTPFallbackSuccess()
 		}
-		if connectedChannelID := session.ChannelID(); connectedChannelID > 0 {
-			pinnedChannelID = connectedChannelID
-		}
+		pinnedChannelID = session.ChannelID()
 	})
 
 	for {

@@ -291,8 +291,6 @@ func getUpstreamModelUpdateMinCheckIntervalSeconds() int64 {
 
 func fetchCodexUpstreamModelCatalog(
 	ctx context.Context,
-	channelID int,
-	keyIndex int,
 	baseURL string,
 	key string,
 	proxyURL string,
@@ -300,18 +298,6 @@ func fetchCodexUpstreamModelCatalog(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	lease, err := acquireSubscriptionOAuthManagementCapacity(
-		ctx,
-		constant.ChannelTypeCodex,
-		channelID,
-		keyIndex,
-		key,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer lease.Release()
-
 	timeout := time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -339,7 +325,6 @@ func fetchCodexChannelUpstreamModelCatalog(ctx context.Context, channel *model.C
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		return channelUpstreamModelCatalog{}, errors.New("渠道没有可用密钥")
@@ -364,14 +349,12 @@ func fetchCodexChannelUpstreamModelCatalog(ctx context.Context, channel *model.C
 
 		upstreamCatalog, err := fetchCodexUpstreamModelCatalog(
 			ctx,
-			channel.Id,
-			keyIndex,
 			channel.GetBaseURL(),
 			key,
 			channel.GetSetting().Proxy,
 		)
 		if err != nil {
-			err = applySubscriptionOAuthModelFetchError(channel, key, err)
+			err = applySubscriptionOAuthModelFetchError(channel, err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -552,25 +535,11 @@ func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Chann
 		url = fmt.Sprintf("%s/v1/models", baseURL)
 	}
 
-	key, keyIndex, apiErr := channel.GetNextEnabledKey()
+	key, _, apiErr := channel.GetNextEnabledKey()
 	if apiErr != nil {
 		return channelUpstreamModelCatalog{}, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
 	}
 	key = strings.TrimSpace(key)
-	lease, err := acquireSubscriptionOAuthManagementCapacity(
-		ctx,
-		channel.Type,
-		channel.Id,
-		keyIndex,
-		key,
-	)
-	if err != nil {
-		return channelUpstreamModelCatalog{}, err
-	}
-	if lease != nil {
-		defer lease.Release()
-	}
-
 	headers, err := buildFetchModelsHeaders(channel, key)
 	if err != nil {
 		return channelUpstreamModelCatalog{}, err
@@ -579,7 +548,7 @@ func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Chann
 	timeout := time.Duration(common.ChannelManagementRequestTimeout) * time.Second
 	body, err := GetResponseBodyWithContext(ctx, http.MethodGet, url, channel, headers, timeout)
 	if err != nil {
-		return channelUpstreamModelCatalog{}, applySubscriptionOAuthModelFetchError(channel, key, err)
+		return channelUpstreamModelCatalog{}, applySubscriptionOAuthModelFetchError(channel, err)
 	}
 
 	var result OpenAIModelsResponse
@@ -603,7 +572,7 @@ func fetchNonCodexUpstreamModelCatalog(ctx context.Context, channel *model.Chann
 	return channelUpstreamModelCatalog{IDs: normalizeModelNames(ids), Metadata: metadata}, nil
 }
 
-func applySubscriptionOAuthModelFetchError(channel *model.Channel, key string, err error) error {
+func applySubscriptionOAuthModelFetchError(channel *model.Channel, err error) error {
 	if channel == nil || err == nil || !constant.IsSubscriptionOAuthChannel(channel.Type) {
 		return err
 	}
@@ -612,19 +581,6 @@ func applySubscriptionOAuthModelFetchError(channel *model.Channel, key string, e
 		return err
 	}
 	apiError = service.ApplyChannelErrorPolicy(channel.Type, apiError)
-	if service.IsSubscriptionOAuthAccountUnavailable(channel.Type, apiError) {
-		service.QuarantineSubscriptionOAuthCredential(
-			*types.NewChannelError(
-				channel.Id,
-				channel.Type,
-				channel.Name,
-				channel.ChannelInfo.IsMultiKey,
-				key,
-				channel.GetAutoBan(),
-			),
-			apiError,
-		)
-	}
 	return apiError
 }
 

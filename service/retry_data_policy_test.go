@@ -425,6 +425,26 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithoutCoolingAccount(t *testi
 	lease.Release()
 }
 
+func TestSubscriptionOAuthModelCapacitySwitchesWithoutCoolingAccount(t *testing.T) {
+	initial := retryPolicyChannel(23, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
+	initial.Key = `{"access_token":"token-a","account_id":"model-capacity-account"}`
+	backup := retryPolicyChannel(24, constant.ChannelTypeCodex, "https://chatgpt.com", nil)
+	backup.Key = `{"access_token":"token-b","account_id":"model-capacity-backup"}`
+
+	boundary := NewRetryBoundary(initial, "default")
+	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
+	replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	retryParam := &RetryParam{Boundary: boundary}
+	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.handleSubscriptionOAuthModelCapacity()
+
+	require.False(t, boundary.Allows(initial))
+	require.True(t, boundary.Allows(backup))
+	lease, err := AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
+	require.NoError(t, err)
+	lease.Release()
+}
+
 func TestRetryBoundaryRestartsOnlyCapacityExcludedGroupChannels(t *testing.T) {
 	policy := &dto.ChannelDataPolicy{}
 	initial := retryPolicyChannel(1, constant.ChannelTypeCodex, "https://chatgpt.com", policy)

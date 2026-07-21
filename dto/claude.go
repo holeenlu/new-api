@@ -538,6 +538,9 @@ func (c *ClaudeResponse) GetClaudeError() *types.ClaudeError {
 		if errMsg, ok := err["message"].(string); ok {
 			claudeErr.Message = errMsg
 		}
+		if errCode, exists := err["code"]; exists {
+			claudeErr.Code = errCode
+		}
 		return claudeErr
 	case string:
 		// 处理简单字符串错误

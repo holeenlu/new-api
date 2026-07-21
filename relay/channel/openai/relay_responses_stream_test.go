@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -82,11 +83,113 @@ func TestCodexResponsesStreamRetriesServerOverloadBeforeOutput(t *testing.T) {
 	require.Nil(t, usage)
 	require.NotNil(t, apiError)
 	require.Equal(t, types.ErrorCodeModelAtCapacity, apiError.GetErrorCode())
+	require.Equal(t, http.StatusServiceUnavailable, apiError.GetUpstreamStatusCode())
 	require.True(t, info.HasUpstreamFailureResponse())
 	require.Empty(t, recorder.Body.String())
 	failureEvent, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c)
 	require.True(t, exists)
 	require.Contains(t, failureEvent, `"type":"response.failed"`)
+}
+
+func TestCodexResponsesStreamPreservesExplicitAndUnknownFailureStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorJSON string
+		want      int
+	}{
+		{name: "explicit status", errorJSON: `{"type":"provider_error","message":"failed","status_code":418}`, want: http.StatusTeapot},
+		{name: "unknown failure", errorJSON: `{"type":"provider_error","message":"failed"}`, want: http.StatusBadGateway},
+		{name: "authentication failure", errorJSON: `{"type":"authentication_error","message":"expired"}`, want: http.StatusUnauthorized},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, _, resp, info := newCodexResponsesStreamTest(t,
+				`data: {"type":"response.failed","response":{"status":"failed","error":`+test.errorJSON+`}}`,
+			)
+
+			_, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+			require.NotNil(t, apiError)
+			require.Equal(t, test.want, apiError.GetUpstreamStatusCode())
+		})
+	}
+}
+
+func TestCodexResponsesStreamTreatsFailureWithoutErrorDetailsAsBadGateway(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.failed","response":{"status":"failed"}}`,
+	)
+
+	_, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadGateway, apiError.GetUpstreamStatusCode())
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestCodexResponsesStreamRetriesUsageLimitBeforeOutput(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"usage_limit_reached","code":"usage_limit_reached","message":"You've reached your usage limit","resets_in_seconds":18000}}}`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiError.GetErrorCode())
+	require.Equal(t, 5*time.Hour, apiError.RetryAfter)
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.False(t, recorder.Flushed)
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestCodexResponsesStreamRetriesPermanentCredentialFailuresBeforeOutput(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorJSON string
+		wantCode  types.ErrorCode
+	}{
+		{
+			name:      "unauthorized",
+			errorJSON: `{"type":"authentication_error","code":"oauth_unauthorized","message":"OAuth credential is invalid or expired"}`,
+			wantCode:  types.ErrorCodeOAuthUnauthorized,
+		},
+		{
+			name:      "forbidden",
+			errorJSON: `{"type":"permission_error","code":"oauth_forbidden","message":"OAuth account is not permitted to access this resource"}`,
+			wantCode:  types.ErrorCodeOAuthForbidden,
+		},
+		{
+			name:      "account disabled",
+			errorJSON: `{"type":"account_error","code":"account_disabled","message":"This organization has been disabled"}`,
+			wantCode:  types.ErrorCodeUpstreamAccountDisabled,
+		},
+		{
+			name:      "quota exhausted",
+			errorJSON: `{"type":"insufficient_quota","code":"insufficient_quota","message":"You exceeded your current quota"}`,
+			wantCode:  types.ErrorCodeUpstreamQuotaExhausted,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, recorder, resp, info := newCodexResponsesStreamTest(t,
+				`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+				`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":`+test.errorJSON+`}}`,
+			)
+
+			usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+			require.Nil(t, usage)
+			require.NotNil(t, apiError)
+			require.Equal(t, test.wantCode, apiError.GetErrorCode())
+			require.True(t, info.HasUpstreamFailureResponse())
+			require.False(t, recorder.Flushed)
+			require.Empty(t, recorder.Body.String())
+		})
+	}
 }
 
 func TestCodexResponsesStreamFlushesPreflightEventsInOrder(t *testing.T) {

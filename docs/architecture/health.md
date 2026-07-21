@@ -7,7 +7,7 @@ The customized branch adds or changes the following coherent domains:
 | Domain | Main ownership | Result |
 | --- | --- | --- |
 | Codex OAuth and Responses | `service/codex_oauth.go`, `relay/channel/codex/`, `controller/codex_*` | Browser authorization, refresh, model discovery, usage, Alpha search, and Responses WebSocket support |
-| Claude Code OAuth | `relay/channel/claude/`, `pkg/oauthcred/claude_code.go` | OAuth request authentication and shared subscription safeguards |
+| Claude Code OAuth | `relay/channel/claude/`, `pkg/oauthcred/claude_code.go` | OAuth request authentication and response-based error classification |
 | Credential reliability | `service/subscription_oauth_*.go`, `service/retry_data_policy.go`, `controller/relay.go` | Capacity slots, pacing, circuit recovery, classified errors, retry boundaries, and data-policy isolation |
 | Model administration | `controller/channel_*`, `model/channel_*metadata.go` | Per-channel catalogues, model capability metadata, upstream model checks, and multi-key management |
 | Privacy and disclosure | `common/upstream_location.go`, `relay/common/location_privacy.go` | Network-profile discovery, client location filtering, and controlled response disclosure |

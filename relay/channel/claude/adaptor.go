@@ -33,11 +33,13 @@ const (
 )
 
 var (
+	ClaudeCodeOAuthLocalLimitsEnabled = true
 	ClaudeCodeOAuthMaxConcurrency     = 10
 	ClaudeCodeOAuthMinRequestInterval = 750 * time.Millisecond
 )
 
 func InitOAuthRuntimeSettings() {
+	ClaudeCodeOAuthLocalLimitsEnabled = rootcommon.GetEnvOrDefaultBool("CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED", true)
 	ClaudeCodeOAuthMaxConcurrency, ClaudeCodeOAuthMinRequestInterval = service.ClampSubscriptionOAuthCapacity(
 		rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10),
 		time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750))*time.Millisecond,
@@ -45,6 +47,9 @@ func InitOAuthRuntimeSettings() {
 }
 
 func acquireClaudeCodeOAuthCapacity(c *gin.Context, info *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
+	if !ClaudeCodeOAuthLocalLimitsEnabled {
+		return nil, nil
+	}
 	return service.AcquireSubscriptionOAuthChannelCapacity(c, info, ClaudeCodeOAuthMaxConcurrency, ClaudeCodeOAuthMinRequestInterval)
 }
 

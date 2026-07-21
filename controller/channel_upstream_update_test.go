@@ -133,7 +133,7 @@ func TestOpenAIModelUpstreamMetadataReadsAnthropicCapabilities(t *testing.T) {
 	require.Equal(t, 1_000_000, profile.MaxContextWindow)
 }
 
-func TestSubscriptionOAuthModelFetchErrorQuarantinesCredential(t *testing.T) {
+func TestSubscriptionOAuthModelFetchErrorDoesNotMutateInferenceCredential(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
@@ -155,17 +155,18 @@ func TestSubscriptionOAuthModelFetchErrorQuarantinesCredential(t *testing.T) {
 	)
 	upstreamError.UpstreamStatusCode = http.StatusUnauthorized
 
-	got := applySubscriptionOAuthModelFetchError(channel, key, upstreamError)
+	got := applySubscriptionOAuthModelFetchError(channel, upstreamError)
 
 	var gotAPIError *types.NewAPIError
 	require.ErrorAs(t, got, &gotAPIError)
 	require.Equal(t, types.ErrorCodeOAuthUnauthorized, gotAPIError.GetErrorCode())
 	var stored model.Channel
 	require.NoError(t, db.First(&stored, channel.Id).Error)
-	require.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+	require.Equal(t, common.ChannelStatusEnabled, stored.Status)
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, 0, key)
-	_, capacityErr := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
-	require.True(t, service.IsSubscriptionOAuthCapacityError(capacityErr))
+	lease, capacityErr := service.AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
+	require.NoError(t, capacityErr)
+	lease.Release()
 }
 
 func TestCodexModelCatalogRejectsPartialCredentialScan(t *testing.T) {

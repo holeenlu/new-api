@@ -241,7 +241,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 	require.Equal(t, 2, selected[0].Id)
 }
 
-func TestSelectChannelsForAutomaticTestScheduledIncludesSubscriptionChannels(t *testing.T) {
+func TestSelectChannelsForAutomaticTestExcludesSubscriptionOAuth(t *testing.T) {
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
@@ -252,12 +252,10 @@ func TestSelectChannelsForAutomaticTestScheduledIncludesSubscriptionChannels(t *
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
 
-	require.Len(t, selected, 4)
-	require.Equal(t, []int{1, 2, 4, 5}, []int{
+	require.Len(t, selected, 2)
+	require.Equal(t, []int{1, 2}, []int{
 		selected[0].Id,
 		selected[1].Id,
-		selected[2].Id,
-		selected[3].Id,
 	})
 }
 

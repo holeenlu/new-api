@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -24,6 +26,36 @@ func TestRetryParamCapacityFailureDoesNotConsumeUpstreamRetry(t *testing.T) {
 	require.Equal(t, 0, retryParam.AttemptIndex())
 	retryParam.RecordAttempt()
 	require.Equal(t, 1, retryParam.AttemptIndex())
+}
+
+func TestSubscriptionOAuthRequestAttemptBudgetStopsAmplification(t *testing.T) {
+	retryParam := &RetryParam{}
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+	for range maximumSubscriptionOAuthRequestAttempts {
+		retryParam.RecordAttempt()
+	}
+
+	err := types.NewErrorWithStatusCode(
+		errors.New("temporary upstream failure"),
+		types.ErrorCodeDoRequestFailed,
+		http.StatusServiceUnavailable,
+	)
+	decision, _ := retryParam.DecideSubscriptionOAuthContinuation(SubscriptionOAuthRetryObservation{
+		ChannelType: constant.ChannelTypeCodex,
+		Error:       err,
+		Retryable:   true,
+	})
+
+	require.Equal(t, SubscriptionOAuthRetryStop, decision)
+	require.False(t, retryParam.SetSubscriptionOAuthAttempt(2, 0, "credential-b"))
+}
+
+func TestSubscriptionOAuthCredentialRefreshIsClaimedOncePerRequest(t *testing.T) {
+	retryParam := &RetryParam{}
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+
+	require.True(t, retryParam.ClaimSubscriptionOAuthCredentialRefresh())
+	require.False(t, retryParam.ClaimSubscriptionOAuthCredentialRefresh())
 }
 
 func TestNewRetryParamFreezesAutoEffectiveGroup(t *testing.T) {
@@ -170,6 +202,118 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 		SubscriptionOAuthSwitchCredential,
 		retryParam.decideSubscriptionOAuthRetry(false, true, true, false, http.StatusTooManyRequests, time.Second),
 	)
+}
+
+func TestSubscriptionOAuthUsageLimitAlwaysSwitchesToBackupCredential(t *testing.T) {
+	credential := `{"account_id":"usage-limited-account"}`
+	fingerprint := SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeClaudeCode,
+		7,
+		0,
+		credential,
+	)
+	state := replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	originalRetry429 := common.SubscriptionOAuthRetry429
+	common.SubscriptionOAuthRetry429 = false
+	t.Cleanup(func() { common.SubscriptionOAuthRetry429 = originalRetry429 })
+
+	initial := &model.Channel{
+		Id: 7, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled,
+		Key: credential, Group: "default",
+	}
+	backup := &model.Channel{
+		Id: 8, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled,
+		Key: `{"account_id":"usage-available-account"}`, Group: "default",
+	}
+	retryParam := &RetryParam{Boundary: NewRetryBoundary(initial, "default")}
+	retryParam.SetSubscriptionOAuthAttempt(7, 0, fingerprint)
+	err := types.NewErrorWithStatusCode(
+		errors.New("You've reached your usage limit"),
+		types.ErrorCodeUpstreamUsageLimit,
+		http.StatusTooManyRequests,
+	)
+	err.UpstreamStatusCode = http.StatusTooManyRequests
+	err.RetryAfter = 5 * time.Hour
+
+	decision, cooldown := retryParam.DecideSubscriptionOAuthContinuation(SubscriptionOAuthRetryObservation{
+		ChannelType: constant.ChannelTypeClaudeCode,
+		Error:       err,
+		Retryable:   true,
+	})
+
+	require.Equal(t, SubscriptionOAuthSwitchCredential, decision)
+	require.Equal(t, 5*time.Hour, cooldown)
+	require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
+	require.False(t, retryParam.Boundary.Allows(initial))
+	require.True(t, retryParam.Boundary.Allows(backup))
+	state.mu.Lock()
+	recoveryPending := state.recoveryPending
+	cooldownDuration := state.cooldownDuration
+	state.mu.Unlock()
+	require.True(t, recoveryPending)
+	require.Equal(t, 5*time.Hour, cooldownDuration)
+}
+
+func TestSubscriptionOAuthUsageLimitDoesNotReplayUnsafeRequests(t *testing.T) {
+	for _, observation := range []SubscriptionOAuthRetryObservation{
+		{DownstreamStarted: true},
+		{RetryDisabled: true},
+		{SpecificChannel: true},
+	} {
+		retryParam := &RetryParam{}
+		retryParam.SetSubscriptionOAuthAttempt(8, 0, "usage-limited-pinned")
+		err := types.NewErrorWithStatusCode(
+			errors.New("usage_limit_reached"),
+			types.ErrorCodeUpstreamUsageLimit,
+			http.StatusTooManyRequests,
+		)
+		err.UpstreamStatusCode = http.StatusTooManyRequests
+		observation.ChannelType = constant.ChannelTypeCodex
+		observation.Error = err
+		observation.Retryable = true
+
+		decision, _ := retryParam.DecideSubscriptionOAuthContinuation(observation)
+
+		require.Equal(t, SubscriptionOAuthRetryStop, decision)
+		require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
+	}
+}
+
+func TestSubscriptionOAuthRateLimitCooldownSwitchesCredential(t *testing.T) {
+	initial := &model.Channel{
+		Id: 12, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled,
+		Key: "rate-limited-key", Group: "default",
+	}
+	backup := &model.Channel{
+		Id: 13, Type: constant.ChannelTypeClaudeCode, Status: common.ChannelStatusEnabled,
+		Key: "backup-key", Group: "default",
+	}
+	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
+	retryParam := &RetryParam{Boundary: NewRetryBoundary(initial, "default")}
+	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	apiError := types.NewErrorWithStatusCode(
+		&subscriptionOAuthCapacityError{
+			cause:          errSubscriptionOAuthCredentialCool,
+			retryAfter:     15 * time.Minute,
+			cooldownReason: subscriptionOAuthCooldownRateLimit,
+		},
+		types.ErrorCodeUpstreamRateLimited,
+		http.StatusTooManyRequests,
+	)
+	apiError.RetryAfter = 15 * time.Minute
+
+	decision, retryAfter := retryParam.DecideSubscriptionOAuthContinuation(SubscriptionOAuthRetryObservation{
+		ChannelType: initial.Type,
+		Error:       apiError,
+		Retryable:   true,
+	})
+
+	require.Equal(t, SubscriptionOAuthSwitchCredential, decision)
+	require.Equal(t, 15*time.Minute, retryAfter)
+	require.Nil(t, retryParam.SubscriptionOAuthAttemptTarget())
+	require.False(t, retryParam.Boundary.Allows(initial))
+	require.True(t, retryParam.Boundary.Allows(backup))
+	require.False(t, retryParam.Boundary.HasCapacityExclusions())
 }
 
 func TestSubscriptionOAuthCapacityReplayPreservesCredentialOrder(t *testing.T) {

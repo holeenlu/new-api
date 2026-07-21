@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -84,7 +85,7 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return types.WithClaudeError(*claudeError, claudeStreamErrorStatus(claudeError))
 	}
 	if claudeResponse.StopReason != "" {
 		maybeMarkClaudeRefusal(c, claudeResponse.StopReason)
@@ -194,7 +195,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return types.WithClaudeError(*claudeError, claudeStreamErrorStatus(claudeError))
 	}
 	maybeMarkClaudeRefusal(c, claudeResponse.StopReason)
 	if claudeInfo.Usage == nil {
@@ -230,6 +231,31 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 
 	service.IOCopyBytesGracefully(c, httpResp, responseData)
 	return nil
+}
+
+func claudeStreamErrorStatus(claudeError *types.ClaudeError) int {
+	if claudeError == nil {
+		return http.StatusBadGateway
+	}
+	marker := strings.ToLower(strings.TrimSpace(claudeError.Type + " " + fmt.Sprint(claudeError.Code)))
+	switch {
+	case strings.Contains(marker, "invalid_request_error"):
+		return http.StatusBadRequest
+	case strings.Contains(marker, "authentication_error"):
+		return http.StatusUnauthorized
+	case strings.Contains(marker, "permission_error"):
+		return http.StatusForbidden
+	case strings.Contains(marker, "not_found_error"):
+		return http.StatusNotFound
+	case strings.Contains(marker, "request_too_large"):
+		return http.StatusRequestEntityTooLarge
+	case strings.Contains(marker, "rate_limit_error"), strings.Contains(marker, "usage_limit"):
+		return http.StatusTooManyRequests
+	case strings.Contains(marker, "overloaded_error"):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {

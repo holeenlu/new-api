@@ -129,7 +129,16 @@ func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncat
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *types.NewAPIError) {
-	retryAfter := ParseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+	// Header-only fallback for the rare body-read-failure path below, capped at the
+	// ordinary transient bound. The success path overwrites this with
+	// ParseUpstreamRetryDelay, which alone may reach the longer usage-limit bound
+	// from structured reset metadata; a bare Retry-After header must not widen the
+	// cooldown to days on a read error.
+	retryAfter := parseRetryAfterValue(
+		resp.Header.Get("Retry-After"),
+		time.Now(),
+		maximumSubscriptionOAuthRetryAfter,
+	)
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.RetryAfter = retryAfter
@@ -148,6 +157,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 	if truncated {
 		responseBody = responseBody[:maxUpstreamErrorResponseBytes]
 	}
+	retryAfter = ParseUpstreamRetryDelay(resp.Header, responseBody, time.Now())
 
 	var errResponse dto.GeneralErrorResponse
 	err = common.Unmarshal(responseBody, &errResponse)
@@ -174,6 +184,101 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 }
 
 func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
+	return parseRetryAfterValue(value, now, maximumSubscriptionOAuthRetryAfter)
+}
+
+// ParseUpstreamRetryDelay preserves long subscription usage-window resets from
+// structured upstream errors while keeping malformed values bounded. Ordinary
+// burst-rate cooldowns are still capped later by SubscriptionOAuthRetryCooldown.
+func ParseUpstreamRetryDelay(headers http.Header, responseBody []byte, now time.Time) time.Duration {
+	var payload map[string]any
+	if len(responseBody) > 0 && common.UnmarshalWithNumber(responseBody, &payload) == nil {
+		if delay := findUpstreamResetDelay(payload, now, true, 0); delay > 0 {
+			return delay
+		}
+		if delay := findUpstreamResetDelay(payload, now, false, 0); delay > 0 {
+			return delay
+		}
+	}
+	return parseRetryAfterValue(headers.Get("Retry-After"), now, maximumSubscriptionOAuthUsageLimitCooldown)
+}
+
+func findUpstreamResetDelay(value any, now time.Time, absolute bool, depth int) time.Duration {
+	if depth > 4 {
+		return 0
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return 0
+	}
+	keys := []string{"resets_in_seconds", "reset_after_seconds", "retry_after"}
+	if absolute {
+		keys = []string{"resets_at"}
+	}
+	for _, key := range keys {
+		if delay := parseUpstreamResetValue(object[key], now, absolute); delay > 0 {
+			return delay
+		}
+	}
+	for _, wrapper := range []string{"error", "body", "response", "detail"} {
+		if delay := findUpstreamResetDelay(object[wrapper], now, absolute, depth+1); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func parseUpstreamResetValue(value any, now time.Time, absolute bool) time.Duration {
+	var raw string
+	switch typed := value.(type) {
+	case json.Number:
+		raw = typed.String()
+	case string:
+		raw = strings.TrimSpace(typed)
+	case float64:
+		raw = strconv.FormatFloat(typed, 'g', -1, 64)
+	default:
+		return 0
+	}
+	if raw == "" {
+		return 0
+	}
+	if absolute {
+		if when, err := time.Parse(time.RFC3339, raw); err == nil {
+			return boundedUpstreamResetDuration(when.Sub(now))
+		}
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return 0
+	}
+	if absolute {
+		if seconds > float64(math.MaxInt64) {
+			return 0
+		}
+		seconds = float64(time.Unix(int64(seconds), 0).Sub(now)) / float64(time.Second)
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	maximumSeconds := float64(maximumSubscriptionOAuthUsageLimitCooldown / time.Second)
+	if seconds >= maximumSeconds {
+		return maximumSubscriptionOAuthUsageLimitCooldown
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func boundedUpstreamResetDuration(duration time.Duration) time.Duration {
+	if duration <= 0 {
+		return 0
+	}
+	if duration > maximumSubscriptionOAuthUsageLimitCooldown {
+		return maximumSubscriptionOAuthUsageLimitCooldown
+	}
+	return duration
+}
+
+func parseRetryAfterValue(value string, now time.Time, maximum time.Duration) time.Duration {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0
@@ -182,8 +287,8 @@ func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
 		if seconds <= 0 {
 			return 0
 		}
-		if seconds >= int64(maximumSubscriptionOAuthRetryAfter/time.Second) {
-			return maximumSubscriptionOAuthRetryAfter
+		if seconds >= int64(maximum/time.Second) {
+			return maximum
 		}
 		return time.Duration(seconds) * time.Second
 	}
@@ -192,8 +297,8 @@ func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
 		return 0
 	}
 	duration := when.Sub(now)
-	if duration > maximumSubscriptionOAuthRetryAfter {
-		return maximumSubscriptionOAuthRetryAfter
+	if duration > maximum {
+		return maximum
 	}
 	return duration
 }

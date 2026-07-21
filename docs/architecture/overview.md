@@ -33,12 +33,29 @@ Codex and Claude Code share the subscription OAuth policy surface:
 
 - `service/subscription_oauth_capacity.go` owns process-local credential slots,
   pacing, cooldowns, and recovery probes.
+- `service/subscription_oauth_error_policy.go` owns provider-neutral OAuth error
+  classification, including the distinction between permanent account failures,
+  temporary burst limits, and resettable subscription usage windows.
+- `service/codex_wham_usage.go` owns Codex Wham usage requests and the same
+  short-lived evidence role for ambiguous inference 429 responses.
+- `service/subscription_oauth_usage_cache.go` owns bounded Codex Wham evidence
+  caching; it never controls credential routing or cooldown state.
 - `service/subscription_oauth_retry.go` owns request-local retry decisions and
-  credential attempt budgets.
+  per-credential and whole-request attempt budgets. It distinguishes active
+  concurrency replay from known cooldown exclusion and request-local model
+  capacity.
 - `service/retry_data_policy.go` owns which channels and credentials may be
   selected for a retry.
+- `relay/responsesws/session.go` owns the upstream WebSocket connection and its
+  temporary channel binding; the controller may release that binding only
+  after the shared retry state machine declares the turn safe to replay.
 - `relay/channel/codex/` and `relay/channel/claude/` own upstream protocol
-  construction, credentials, and response-body lease release.
+  construction, credentials, and response-body lease release. The Claude
+  adaptor also owns the deployment-scoped switch that can bypass its local
+  capacity gate without bypassing the shared retry/error policy.
+- `service/codex_credential_refresh.go` owns serialized, CAS-protected Codex
+  credential rotation. The relay may request one refresh-first transition; it
+  does not write credentials itself.
 
 The request-local attempt record must have one owner. Gin context may expose a
 lease to an adaptor, but must not become a second independent retry ledger.

@@ -164,15 +164,6 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
-	lease, err := acquireSubscriptionOAuthManagementCapacity(requestCtx, req.Type, 0, 0, key)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
-		return
-	}
-	if lease != nil {
-		defer lease.Release()
-	}
-
 	switch req.Type {
 	case constant.ChannelTypeAnthropic:
 		request.Header = GetClaudeAuthHeader(key)

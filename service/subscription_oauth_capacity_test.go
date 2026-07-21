@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +13,8 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -122,29 +127,6 @@ func TestSubscriptionOAuthCooldownAllowsOnlyOneProbePerWindow(t *testing.T) {
 	next.Release()
 }
 
-func TestSubscriptionOAuthManagementCallDoesNotConsumeRecoveryProbe(t *testing.T) {
-	fingerprint := SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 1, 0, `{"account_id":"management-recovery-account"}`)
-	state := replaceSubscriptionOAuthStateForTest(t, fingerprint)
-	require.True(t, CooldownSubscriptionOAuthCredential(fingerprint, 1, time.Hour))
-	state.mu.Lock()
-	state.cooldownUntil = time.Now().Add(-time.Second)
-	state.mu.Unlock()
-
-	_, err := AcquireSubscriptionOAuthManagementCapacity(context.Background(), fingerprint, 10, 0)
-	require.ErrorIs(t, err, errSubscriptionOAuthCredentialCool)
-
-	state.mu.Lock()
-	require.Zero(t, state.active)
-	require.True(t, state.recoveryPending)
-	require.False(t, state.recoveryInFlight)
-	state.mu.Unlock()
-
-	probe, err := AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
-	require.NoError(t, err)
-	require.True(t, probe.IsRecoveryProbe())
-	probe.Release()
-}
-
 func TestSubscriptionOAuthCooldownReportsRemainingRetryAfter(t *testing.T) {
 	fingerprint := SubscriptionOAuthCredentialFingerprint(constant.ChannelTypeCodex, 1, 0, `{"account_id":"retry-after-account"}`)
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
@@ -158,6 +140,131 @@ func TestSubscriptionOAuthCooldownReportsRemainingRetryAfter(t *testing.T) {
 	retryAfterSeconds := SubscriptionOAuthCapacityRetryAfterSeconds(err)
 	require.GreaterOrEqual(t, retryAfterSeconds, 11)
 	require.LessOrEqual(t, retryAfterSeconds, 12)
+}
+
+func TestSubscriptionOAuthUsageLimitCooldownPreservesReasonAndResetTime(t *testing.T) {
+	fingerprint := SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeCodex,
+		1,
+		0,
+		`{"account_id":"usage-limit-reason-account"}`,
+	)
+	replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	require.True(t, cooldownSubscriptionOAuthCredential(
+		fingerprint,
+		1,
+		6*24*time.Hour,
+		subscriptionOAuthCooldownUsageLimit,
+	))
+
+	_, err := AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 10, 0)
+	require.ErrorIs(t, err, errSubscriptionOAuthCredentialCool)
+	require.True(t, IsSubscriptionOAuthUsageLimitCapacityError(err))
+	now := time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
+	expectedResetAt := now.Add(SubscriptionOAuthCapacityRetryAfter(err)).UTC().Format(time.RFC3339)
+	message := SubscriptionOAuthCapacityErrorMessage(err, now)
+	require.Contains(t, message, "subscription OAuth usage window is exhausted")
+	require.Contains(t, message, "resets at "+expectedResetAt)
+	require.Contains(t, message, "retry after 518400 seconds")
+	require.False(t, strings.Contains(message, "credential is busy"))
+}
+
+func TestSubscriptionOAuthChannelCapacityReturnsUsageLimitClassification(t *testing.T) {
+	key := `{"account_id":"usage-limit-channel-account"}`
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: constant.ChannelTypeCodex,
+		ChannelId:   9,
+		ApiKey:      key,
+	}}
+	fingerprint := SubscriptionOAuthCredentialFingerprint(info.ChannelType, info.ChannelId, 0, key)
+	replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	require.True(t, cooldownSubscriptionOAuthCredential(
+		fingerprint,
+		1,
+		5*time.Hour,
+		subscriptionOAuthCooldownUsageLimit,
+	))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	_, err := AcquireSubscriptionOAuthChannelCapacity(c, info, 10, 0)
+
+	require.Error(t, err)
+	var apiError *types.NewAPIError
+	require.True(t, errors.As(err, &apiError))
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiError.GetErrorCode())
+	require.Equal(t, http.StatusTooManyRequests, apiError.StatusCode)
+	require.Contains(t, apiError.Error(), "subscription OAuth usage window is exhausted")
+	require.Greater(t, apiError.RetryAfter, 4*time.Hour+59*time.Minute)
+	require.True(t, IsSubscriptionOAuthCapacityFailure(constant.ChannelTypeCodex, apiError))
+	require.False(t, IsSubscriptionOAuthConcurrencyLimit(constant.ChannelTypeCodex, apiError))
+}
+
+func TestSubscriptionOAuthChannelCapacityPreservesUpstreamRateLimit(t *testing.T) {
+	key := `{"account_id":"rate-limit-channel-account"}`
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: constant.ChannelTypeCodex,
+		ChannelId:   11,
+		ApiKey:      key,
+	}}
+	fingerprint := SubscriptionOAuthCredentialFingerprint(info.ChannelType, info.ChannelId, 0, key)
+	replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	require.True(t, cooldownSubscriptionOAuthCredential(
+		fingerprint,
+		1,
+		15*time.Minute,
+		subscriptionOAuthCooldownRateLimit,
+	))
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	_, err := AcquireSubscriptionOAuthChannelCapacity(c, info, 10, 0)
+
+	require.Error(t, err)
+	var apiError *types.NewAPIError
+	require.ErrorAs(t, err, &apiError)
+	require.Equal(t, types.ErrorCodeUpstreamRateLimited, apiError.GetErrorCode())
+	require.Equal(t, http.StatusTooManyRequests, apiError.StatusCode)
+	require.Contains(t, apiError.Error(), "upstream rate limit is active")
+	require.Greater(t, apiError.RetryAfter, 14*time.Minute+59*time.Second)
+	require.Equal(t, "900", recorder.Header().Get("Retry-After"))
+	require.True(t, IsSubscriptionOAuthCapacityFailure(constant.ChannelTypeCodex, apiError))
+	require.False(t, IsSubscriptionOAuthConcurrencyLimit(constant.ChannelTypeCodex, apiError))
+}
+
+func TestSubscriptionOAuthManualChannelTestBypassesInferenceCapacity(t *testing.T) {
+	key := `{"account_id":"manual-test-account"}`
+	info := &relaycommon.RelayInfo{
+		IsChannelTest: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeCodex,
+			ChannelId:   10,
+			ApiKey:      key,
+		},
+	}
+	fingerprint := SubscriptionOAuthCredentialFingerprint(info.ChannelType, info.ChannelId, 0, key)
+	state := replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	state.mu.Lock()
+	state.active = 10
+	state.recoveryPending = true
+	state.cooldownUntil = time.Now().Add(time.Hour)
+	state.cooldownReason = subscriptionOAuthCooldownUsageLimit
+	state.mu.Unlock()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	lease, err := AcquireSubscriptionOAuthChannelCapacity(c, info, 1, time.Hour)
+
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	lease.Release()
+	state.mu.Lock()
+	require.Equal(t, 10, state.active)
+	require.True(t, state.recoveryPending)
+	require.Equal(t, subscriptionOAuthCooldownUsageLimit, state.cooldownReason)
+	state.active = 0
+	state.mu.Unlock()
 }
 
 func TestSubscriptionOAuthCancelledPacingAbandonsRecoveryProbe(t *testing.T) {

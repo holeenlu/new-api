@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/service"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const codexOAuthUsageCorrelationTimeout = 5 * time.Second
 
 func GetCodexChannelUsage(c *gin.Context) {
 	fetchCodexChannelWhamData(
@@ -100,19 +103,6 @@ func fetchCodexChannelWhamData(
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "codex channel: account_id is required"})
 		return
 	}
-	lease, err := acquireSubscriptionOAuthManagementCapacity(
-		c.Request.Context(),
-		ch.Type,
-		ch.Id,
-		0,
-		ch.Key,
-	)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
-		return
-	}
-	defer lease.Release()
-
 	responseHeaderTimeout := time.Duration(common.SubscriptionOAuthResponseHeaderTimeout) * time.Second
 	if responseHeaderTimeout <= 0 {
 		responseHeaderTimeout = 30 * time.Second
@@ -188,12 +178,59 @@ func fetchCodexChannelWhamData(
 		upstreamErr = service.ApplyChannelErrorPolicy(ch.Type, upstreamErr)
 		resp["error_code"] = upstreamErr.GetErrorCode()
 		resp["message"] = upstreamErr.Error()
-		if service.IsSubscriptionOAuthAccountUnavailable(ch.Type, upstreamErr) {
-			service.QuarantineSubscriptionOAuthCredential(
-				*types.NewChannelError(ch.Id, ch.Type, ch.Name, ch.ChannelInfo.IsMultiKey, ch.Key, ch.GetAutoBan()),
-				upstreamErr,
-			)
-		}
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func correlateCodexOAuthUsageLimit(
+	c *gin.Context,
+	channel *model.Channel,
+	apiError *types.NewAPIError,
+) *types.NewAPIError {
+	if c == nil || channel == nil || apiError == nil ||
+		channel.Type != constant.ChannelTypeCodex ||
+		apiError.GetUpstreamStatusCode() != http.StatusTooManyRequests {
+		return apiError
+	}
+
+	oauthKey, err := codex.ParseOAuthKey(
+		common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+	)
+	if err != nil || strings.TrimSpace(oauthKey.AccessToken) == "" || strings.TrimSpace(oauthKey.AccountID) == "" {
+		return apiError
+	}
+	client, err := service.GetHttpClientWithResponseHeaderTimeout(
+		channel.GetSetting().Proxy,
+		codexOAuthUsageCorrelationTimeout,
+	)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("Codex OAuth usage correlation skipped: %s", err.Error()))
+		return apiError
+	}
+	keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		channel.Type,
+		channel.Id,
+		keyIndex,
+		common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+	)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), codexOAuthUsageCorrelationTimeout)
+	defer cancel()
+	statusCode, snapshot, err := service.FetchCodexWhamUsageSnapshot(
+		ctx,
+		client,
+		channel.GetBaseURL(),
+		oauthKey.AccessToken,
+		oauthKey.AccountID,
+		fingerprint,
+	)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("Codex OAuth usage correlation failed: %s", err.Error()))
+		return apiError
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices || snapshot == nil {
+		logger.LogWarn(c, fmt.Sprintf("Codex OAuth usage correlation returned status %d", statusCode))
+		return apiError
+	}
+	return service.CorrelateCodexOAuthUsageLimit(apiError, snapshot, time.Now())
 }
