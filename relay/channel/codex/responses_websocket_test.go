@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -76,9 +78,9 @@ func TestResponsesWebSocketSessionUsesCodexUpstreamProtocol(t *testing.T) {
 			ChannelSetting:    dto.ChannelSettings{},
 		},
 	}
-	session := &ResponsesWebSocketSession{}
+	session := &responsesws.Session{}
 	defer session.Close()
-	resp, err := session.doRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
@@ -121,9 +123,9 @@ func TestResponsesWebSocketSessionStopsAfterTerminalFailureEvent(t *testing.T) {
 			ChannelSetting:    dto.ChannelSettings{},
 		},
 	}
-	session := &ResponsesWebSocketSession{}
+	session := &responsesws.Session{}
 	defer session.Close()
-	resp, err := session.doRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-luna","stream":true}`))
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-luna","stream":true}`))
 	require.NoError(t, err)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
@@ -174,16 +176,16 @@ func TestResponsesWebSocketSessionFallsBackToHTTPOnUpgradeRequired(t *testing.T)
 			ChannelSetting:    dto.ChannelSettings{},
 		},
 	}
-	session := &ResponsesWebSocketSession{}
+	session := &responsesws.Session{}
 	defer session.Close()
-	resp, err := session.doRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
 	require.NoError(t, err)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Contains(t, string(body), "response.completed")
 
-	resp, err = session.doRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	resp, err = session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
 	require.NoError(t, err)
 	_, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
@@ -215,7 +217,7 @@ func TestResponsesWebSocketHTTPFallbackPinsOnlySuccessfulChannel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	session := &ResponsesWebSocketSession{}
+	session := &responsesws.Session{}
 	defer session.Close()
 	newAttempt := func(channelID int, accountID string) (*gin.Context, *relaycommon.RelayInfo) {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -234,7 +236,7 @@ func TestResponsesWebSocketHTTPFallbackPinsOnlySuccessfulChannel(t *testing.T) {
 	}
 
 	firstContext, firstInfo := newAttempt(980010, "fallback-failed-account")
-	resp, err := session.doRequest(firstContext, &Adaptor{}, firstInfo, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	resp, err := session.DoRequest(firstContext, &Adaptor{}, firstInfo, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
@@ -243,7 +245,7 @@ func TestResponsesWebSocketHTTPFallbackPinsOnlySuccessfulChannel(t *testing.T) {
 	require.False(t, pinned)
 
 	secondContext, secondInfo := newAttempt(980011, "fallback-success-account")
-	resp, err = session.doRequest(secondContext, &Adaptor{}, secondInfo, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	resp, err = session.DoRequest(secondContext, &Adaptor{}, secondInfo, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
@@ -268,8 +270,8 @@ func TestResponsesWebSocketHandshakePreservesUpstream429(t *testing.T) {
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	session := &ResponsesWebSocketSession{}
-	_, err := session.doRequest(c, &Adaptor{}, &relaycommon.RelayInfo{
+	session := &responsesws.Session{}
+	_, err := session.DoRequest(c, &Adaptor{}, &relaycommon.RelayInfo{
 		IsStream:  true,
 		RelayMode: relayconstant.RelayModeResponses,
 		ChannelMeta: &relaycommon.ChannelMeta{
@@ -289,6 +291,68 @@ func TestResponsesWebSocketHandshakePreservesUpstream429(t *testing.T) {
 	require.Zero(t, session.ChannelID())
 }
 
+func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	originalFirstEvent := responsesws.FirstEventTimeout
+	responsesws.FirstEventTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { responsesws.FirstEventTimeout = originalFirstEvent })
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			// Accept the upgrade but never send a Responses event, simulating an
+			// upstream that does not actually speak the WebSocket protocol.
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, _, _ = conn.ReadMessage()
+			time.Sleep(500 * time.Millisecond)
+			return
+		}
+		// HTTP fallback transport.
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"total_tokens\":5}}}\n\n"))
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         980020,
+			ChannelType:       constant.ChannelTypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"access-token","account_id":"silent-account"}`,
+			UpstreamModelName: "gpt-5.6-sol",
+			ChannelSetting:    dto.ChannelSettings{},
+		},
+	}
+	session := &responsesws.Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Contains(t, string(body), "event: response.completed")
+	// The silent WebSocket produced no event, so the response must have come from
+	// the HTTP fallback transport.
+	require.Equal(t, int32(1), httpRequests.Load())
+}
+
 func TestResponsesWebSocketSessionUsesConfiguredRequestBodyLimit(t *testing.T) {
 	originalLimit := constant.MaxRequestBodyMB
 	constant.MaxRequestBodyMB = 1
@@ -296,7 +360,7 @@ func TestResponsesWebSocketSessionUsesConfiguredRequestBodyLimit(t *testing.T) {
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err := (&ResponsesWebSocketSession{}).doRequest(
+	_, err := (&responsesws.Session{}).DoRequest(
 		c,
 		&Adaptor{},
 		&relaycommon.RelayInfo{},
@@ -324,7 +388,7 @@ func TestResponsesWebSocketSessionReturnsTypedLocalConcurrencyLimit(t *testing.T
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err = (&ResponsesWebSocketSession{}).doRequest(
+	_, err = (&responsesws.Session{}).DoRequest(
 		c,
 		&Adaptor{},
 		&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{

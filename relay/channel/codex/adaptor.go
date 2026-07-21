@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -318,8 +319,8 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
-	if session := responsesWebSocketSessionFromContext(c); session != nil {
-		return session.doRequest(c, a, info, requestBody)
+	if session := responsesws.SessionFromContext(c); session != nil {
+		return session.DoRequest(c, a, info, requestBody)
 	}
 	return doCodexHTTPResponseRequest(c, a, info, requestBody)
 }

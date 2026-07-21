@@ -11,7 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
-	"github.com/QuantumNous/new-api/relay/channel/codex"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -52,7 +52,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		c.Request.Header.Set("Thread-Id", sessionID)
 		c.Request.Header.Set("X-Codex-Window-Id", sessionID+":0")
 	}
-	session := &codex.ResponsesWebSocketSession{}
+	session := &responsesws.Session{}
 	defer session.Close()
 	pinnedChannelID := 0
 	var previousRequest map[string]any
@@ -78,11 +78,10 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	engine.Use(middleware.ModelRequestRateLimit())
 	engine.Use(middleware.Distribute())
 	engine.POST("/v1/responses", func(turn *gin.Context) {
-		if common.GetContextKeyInt(turn, constant.ContextKeyChannelType) != constant.ChannelTypeCodex {
-			turn.JSON(http.StatusBadRequest, gin.H{"error": types.NewError(errors.New("Responses WebSocket requires a ChatGPT Subscription (Codex) channel"), types.ErrorCodeInvalidRequest).ToOpenAIError()})
-			return
-		}
-		codex.SetResponsesWebSocketSession(turn, session)
+		// Bind the session for every turn; each adaptor decides whether to use the
+		// upstream WebSocket (Codex always, other channels when
+		// ResponsesWebSocketEnabled is set) or serve the turn over HTTP.
+		responsesws.SetSession(turn, session)
 		Relay(turn, types.RelayFormatOpenAIResponses)
 		if turn.GetBool("relay_affinity_success") {
 			session.ConfirmHTTPFallbackSuccess()
