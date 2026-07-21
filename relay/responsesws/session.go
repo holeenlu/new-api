@@ -325,14 +325,13 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	}
 	if err != nil {
 		logger.LogError(c, "responses websocket handshake failed: "+err.Error())
-		if response != nil && response.StatusCode == http.StatusUpgradeRequired {
-			s.fallbackLease = lease
-			return ErrUpgradeRequired
-		}
-		if lease != nil {
-			lease.Release()
-		}
-		if response != nil && response.StatusCode > 0 {
+		if response != nil && response.StatusCode > 0 && response.StatusCode != http.StatusUpgradeRequired {
+			// A genuine upstream HTTP status reached us (e.g. 429 or 5xx). Surface it
+			// so the relay applies its normal retry/failover and Retry-After handling
+			// instead of masking a rate limit or outage behind an HTTP fallback.
+			if lease != nil {
+				lease.Release()
+			}
 			info.MarkUpstreamResponseStarted()
 			info.MarkUpstreamFailureResponse()
 			apiError := types.NewErrorWithStatusCode(
@@ -344,11 +343,13 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 			apiError.RetryAfter = service.ParseRetryAfterHeader(response.Header.Get("Retry-After"), time.Now())
 			return apiError
 		}
-		return types.NewErrorWithStatusCode(
-			errors.New("responses websocket connection failed"),
-			types.ErrorCodeDoRequestFailed,
-			http.StatusBadGateway,
-		)
+		// Either the upstream explicitly asked to upgrade elsewhere (426) or the dial
+		// produced no usable HTTP response at all — a malformed/HTTP-2 framed reply,
+		// a TLS error, or a connection-level failure. In every one of these cases the
+		// endpoint does not speak the Responses WebSocket protocol, so serve this turn
+		// and the rest of the connection over HTTP rather than failing the turn hard.
+		s.fallbackLease = lease
+		return ErrUpgradeRequired
 	}
 	conn.EnableWriteCompression(false)
 	// Only record the upstream request as written after a successful handshake; a

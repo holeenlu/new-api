@@ -254,6 +254,78 @@ func TestResponsesWebSocketHTTPFallbackPinsOnlySuccessfulChannel(t *testing.T) {
 	require.Equal(t, 980011, session.ChannelID())
 }
 
+func TestResponsesWebSocketSessionFallsBackToHTTPOnMalformedHandshake(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	service.InitHttpClient()
+
+	var websocketAttempts int
+	var httpAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Reproduce an upstream served over HTTP/2 (or otherwise not a WebSocket
+			// endpoint): answer the upgrade with non-HTTP/1.1 bytes so the dialer
+			// reports "malformed HTTP response" and returns a nil *http.Response.
+			websocketAttempts++
+			hijacker, ok := w.(http.Hijacker)
+			require.True(t, ok)
+			conn, _, err := hijacker.Hijack()
+			require.NoError(t, err)
+			_, _ = conn.Write([]byte("\x00\x00\x12\x04\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00d"))
+			_ = conn.Close()
+		case http.MethodPost:
+			httpAttempts++
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.NotContains(t, string(body), `"type":"response.create"`)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"total_tokens\":2}}}\n\n"))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	setCodexResponsesLiteEnabled(c, true)
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         980004,
+			ChannelType:       constant.ChannelTypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"access-token","account_id":"malformed-handshake-account"}`,
+			UpstreamModelName: "gpt-5.6-sol",
+			ChannelSetting:    dto.ChannelSettings{},
+		},
+	}
+	session := &responsesws.Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Contains(t, string(body), "response.completed")
+
+	// The failed WebSocket handshake must degrade to HTTP for the rest of the
+	// session instead of surfacing a hard 502; the follow-up turn reuses HTTP.
+	resp, err = session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, 1, websocketAttempts)
+	require.Equal(t, 2, httpAttempts)
+}
+
 func TestResponsesWebSocketHandshakePreservesUpstream429(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalInterval := CodexOAuthMinRequestInterval
