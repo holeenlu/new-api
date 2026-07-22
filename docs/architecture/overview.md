@@ -47,8 +47,11 @@ Codex and Claude Code share the subscription OAuth policy surface:
 - `service/retry_data_policy.go` owns which channels and credentials may be
   selected for a retry.
 - `relay/responsesws/session.go` owns the upstream WebSocket connection and its
-  temporary channel binding; the controller may release that binding only
-  after the shared retry state machine declares the turn safe to replay.
+  channel/model/credential binding. The controller restores that exact binding
+  for later turns and may release it only after the shared retry state machine
+  declares the turn safe to replay. Capacity leases remain per-turn, and an
+  early response-body close invalidates the connection before another reader
+  can start.
 - `relay/channel/codex/` and `relay/channel/claude/` own upstream protocol
   construction, credentials, and response-body lease release. The Claude
   adaptor also owns the deployment-scoped switch that can bypass its local

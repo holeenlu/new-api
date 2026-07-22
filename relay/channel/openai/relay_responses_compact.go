@@ -6,13 +6,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
 
-func OaiResponsesCompactionHandler(c *gin.Context, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
 	responseBody, err := io.ReadAll(resp.Body)
@@ -25,13 +26,7 @@ func OaiResponsesCompactionHandler(c *gin.Context, resp *http.Response) (*dto.Us
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := compactResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		status := resp.StatusCode
-		if status >= 200 && status < 300 {
-			// Upstream wrapped an error in a success status; derive a routable status
-			// from the error content instead of forwarding a non-retryable 2xx.
-			status = responsesStreamErrorStatus(string(responseBody), oaiError)
-		}
-		return nil, types.WithOpenAIError(*oaiError, status)
+		return nil, responsesWrappedError(info, resp, responseBody, oaiError)
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)

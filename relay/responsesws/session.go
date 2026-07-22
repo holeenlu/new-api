@@ -27,20 +27,27 @@ const (
 
 	// idleTimeout bounds the gap between two upstream events once streaming has
 	// started, acting as an idle rather than a total-duration timeout.
-	idleTimeout = 5 * time.Minute
+	idleTimeout  = 5 * time.Minute
+	writeTimeout = 30 * time.Second
+
+	// Keep one upstream event bounded before gorilla/websocket allocates it in
+	// full. The downstream SSE bridge applies the same limit to an unframed event.
+	maxUpstreamMessageBytes = 16 << 20
 )
 
 // FirstEventTimeout bounds how long a freshly established upstream WebSocket may
-// stay silent before it is treated as not supporting the Responses WebSocket
-// protocol. An upstream that accepts the handshake but never speaks the protocol
-// would otherwise stall the client until the idle timeout; instead the session
-// falls back to HTTP. It is a var so tests can shorten it.
+// stay silent after response.create is written. An upstream that accepts the
+// handshake but never speaks the protocol would otherwise stall the client until
+// the idle timeout. Because the application request may already be executing, a
+// timeout fails without replaying it over HTTP. It is a var so tests can shorten
+// it.
 var FirstEventTimeout = 30 * time.Second
 
 // MaxConnectionLifetime bounds how long one upstream connection is reused before
 // it is proactively recycled. OpenAI caps a Responses WebSocket connection at 60
-// minutes; recycling a little earlier avoids failing a turn when the upstream
-// closes mid-stream. It is a var so tests can shorten it.
+// minutes. A self-contained turn can reconnect, but a connection-local
+// previous_response_id must fail and let the client resend full input context.
+// It is a var so tests can shorten it.
 var MaxConnectionLifetime = 55 * time.Minute
 
 // ErrUpgradeRequired signals that the upstream declined the WebSocket upgrade and
@@ -76,15 +83,64 @@ type Driver interface {
 // Capacity leases are per-turn, not per-connection: an idle but still-open
 // connection holds no OAuth concurrency slot.
 type Session struct {
-	mu              sync.Mutex
-	conn            *websocket.Conn
-	connectedAt     time.Time
-	channelID       int
-	model           string
-	httpFallback    bool
-	handshakeHeader http.Header
-	pendingID       int
-	pendingModel    string
+	mu                    sync.Mutex
+	conn                  *websocket.Conn
+	connectedAt           time.Time
+	channelID             int
+	keyIndex              int
+	credentialFingerprint string
+	model                 string
+	httpFallback          bool
+	pendingID             int
+	pendingKeyIndex       int
+	pendingFingerprint    string
+	pendingModel          string
+}
+
+// CredentialBinding identifies the credential that authenticated the upstream
+// connection. A persistent Responses connection is credential-local, so the
+// controller must restore this exact binding before building every later turn.
+type CredentialBinding struct {
+	ChannelID   int
+	KeyIndex    int
+	Fingerprint string
+}
+
+// responseBody ties the HTTP/SSE facade to one upstream WebSocket reader. If a
+// relay handler stops consuming before the terminal event, closing the body must
+// also close that upstream connection; otherwise a stale reader can race the
+// next turn on the same socket.
+type responseBody struct {
+	io.ReadCloser
+	session *Session
+	conn    *websocket.Conn
+	done    <-chan struct{}
+	once    sync.Once
+	err     error
+}
+
+func (b *responseBody) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.once.Do(func() {
+		if b.session != nil {
+			if b.done == nil {
+				b.session.invalidate(b.conn)
+			} else {
+				select {
+				case <-b.done:
+					// A terminal event already ended the reader; keep the connection reusable.
+				default:
+					b.session.invalidate(b.conn)
+				}
+			}
+		}
+		if b.ReadCloser != nil {
+			b.err = b.ReadCloser.Close()
+		}
+	})
+	return b.err
 }
 
 // SetSession stores the session on the request context for the adaptor to pick up.
@@ -132,6 +188,23 @@ func (s *Session) ChannelID() int {
 	return s.channelID
 }
 
+// Binding returns the credential currently pinned to the session.
+func (s *Session) Binding() (CredentialBinding, bool) {
+	if s == nil {
+		return CredentialBinding{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelID == 0 || s.credentialFingerprint == "" {
+		return CredentialBinding{}, false
+	}
+	return CredentialBinding{
+		ChannelID:   s.channelID,
+		KeyIndex:    s.keyIndex,
+		Fingerprint: s.credentialFingerprint,
+	}, true
+}
+
 // ResetChannelForRetry releases the current upstream connection and its
 // channel binding before the relay selects another compatible credential. It
 // is used only while the current turn is still replay-safe; the relay owns that
@@ -143,9 +216,13 @@ func (s *Session) ResetChannelForRetry() {
 	s.mu.Lock()
 	s.invalidateLocked(s.conn)
 	s.channelID = 0
+	s.keyIndex = 0
+	s.credentialFingerprint = ""
 	s.model = ""
 	s.httpFallback = false
 	s.pendingID = 0
+	s.pendingKeyIndex = 0
+	s.pendingFingerprint = ""
 	s.pendingModel = ""
 	s.mu.Unlock()
 }
@@ -160,8 +237,12 @@ func (s *Session) ConfirmHTTPFallbackSuccess() {
 		return
 	}
 	s.channelID = s.pendingID
+	s.keyIndex = s.pendingKeyIndex
+	s.credentialFingerprint = s.pendingFingerprint
 	s.model = s.pendingModel
 	s.pendingID = 0
+	s.pendingKeyIndex = 0
+	s.pendingFingerprint = ""
 	s.pendingModel = ""
 }
 
@@ -191,6 +272,12 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		return nil, err
 	}
 	payload["type"] = "response.create"
+	// Streaming is implicit and background execution is unsupported on the
+	// Responses WebSocket transport. Keep these fields in httpBody for a possible
+	// HTTP fallback, but never send them in an upstream WebSocket event.
+	delete(payload, "stream")
+	delete(payload, "stream_options")
+	delete(payload, "background")
 	body, err = common.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -200,6 +287,20 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	defer s.mu.Unlock()
 	if s.channelID != 0 && s.channelID != info.ChannelId {
 		return nil, errors.New("responses websocket cannot switch channels within one session")
+	}
+	credentialFingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		info.ChannelType,
+		info.ChannelId,
+		info.ChannelMultiKeyIndex,
+		info.ApiKey,
+	)
+	if s.credentialFingerprint != "" && s.credentialFingerprint != credentialFingerprint {
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("responses websocket cannot switch credentials within one session"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusConflict,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	model := strings.TrimSpace(info.UpstreamModelName)
 	if s.model != "" && !strings.EqualFold(s.model, model) {
@@ -211,20 +312,29 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
 	}
 
+	if s.conn != nil && !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
+		// Proactively recycle the connection before the upstream's 60-minute cap
+		// for a self-contained turn. A previous_response_id is connection-local and
+		// cannot be transparently replayed on a replacement connection.
+		logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
+		s.invalidateLocked(s.conn)
+		previousResponseID, _ := payload["previous_response_id"].(string)
+		if strings.TrimSpace(previousResponseID) != "" {
+			return nil, types.NewErrorWithStatusCode(
+				errors.New("responses websocket connection lifetime reached; reconnect and retry with full input context"),
+				types.ErrorCodeWebSocketConnectionLimitReached,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+	}
+
 	// Reserve capacity for THIS turn only. The lease is released when the turn's
 	// response body closes (success) or on the failure paths below, so an idle but
 	// still-open upstream connection never pins an OAuth concurrency slot.
 	lease, err := driver.AcquireCapacity(c, info)
 	if err != nil {
 		return nil, err
-	}
-
-	if s.conn != nil && !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
-		// Proactively recycle the connection before the upstream's 60-minute cap
-		// so a long-lived session does not fail a turn when the upstream closes
-		// mid-stream. The block below re-establishes it.
-		logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
-		s.invalidateLocked(s.conn)
 	}
 	justConnected := false
 	if s.conn == nil {
@@ -241,45 +351,21 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		}
 		justConnected = true
 	}
+	// A WebSocket write error is ambiguous: the peer may have received the full
+	// application frame even when the local write reports failure. Mark the
+	// attempt before writing and never reconnect or fall back after this point.
+	info.MarkUpstreamRequestWritten()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := s.conn.WriteMessage(websocket.TextMessage, body); err != nil {
 		s.invalidateLocked(s.conn)
-		if justConnected {
-			// A brand-new connection that cannot accept the first write is not a
-			// usable WebSocket transport; degrade to HTTP for this session and reuse
-			// this turn's lease for the fallback.
-			s.httpFallback = true
-			logger.LogWarn(c, "responses websocket write failed on a new connection; falling back to HTTP: "+err.Error())
-			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
-		}
-		// A reused connection was silently dropped by the upstream (idle sockets can
-		// be closed well before the lifetime cap). Reconnect once and replay the
-		// buffered turn before failing, so a pinned WebSocket channel is as resilient
-		// to a dead connection as the HTTP path's failover.
-		logger.LogWarn(c, "responses websocket reused connection write failed; reconnecting: "+err.Error())
-		if err := s.connect(c, driver, info); err != nil {
-			if errors.Is(err, ErrUpgradeRequired) {
-				s.httpFallback = true
-				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
-			}
-			written, responseStarted := info.UpstreamAttemptState()
-			lease.FinishFailedAttempt(written || responseStarted)
-			return nil, err
-		}
-		justConnected = true
-		if err := s.conn.WriteMessage(websocket.TextMessage, body); err != nil {
-			s.invalidateLocked(s.conn)
-			s.httpFallback = true
-			logger.LogWarn(c, "responses websocket write failed after reconnect; falling back to HTTP: "+err.Error())
-			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
-		}
+		lease.FinishFailedAttempt(true)
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("responses websocket write failed after the request may have reached upstream: %w", err),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
-
-	// The response.create frame is now on the wire — whether over a freshly
-	// established, a reconnected, or a reused connection. connect() only marks a
-	// brand-new dial, so mark it here too, otherwise a reused-connection turn that
-	// already hit the upstream would look replay-safe to the retry idempotency
-	// guard. The flag is an idempotent atomic store.
-	info.MarkUpstreamRequestWritten()
 
 	conn := s.conn
 	var firstPayload []byte
@@ -308,24 +394,14 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 			// The request frame was written, so this is a real failed attempt against
 			// the credential.
 			lease.FinishFailedAttempt(true)
-			// A silent stream is often a usage-exhausted account. If the handshake
-			// response headers prove the rate-limit window is exhausted, return a
-			// usage-limit classification (cooling this credential, giving the client a
-			// reset time, and letting routing fail over to another account) — a
-			// rate-limit rejection means the request was not actually executed, so
-			// this is safe. Mirrors the Claude silent-stream path.
-			if usageErr := service.SubscriptionOAuthUsageLimitFromResponseHeaders(s.handshakeHeader, time.Now()); usageErr != nil {
-				logger.LogWarn(c, "responses websocket silent after handshake; upstream headers indicate a usage limit: "+probeErr.Error())
-				return nil, usageErr
-			}
 			// Otherwise the response.create frame was already written to this
 			// connection, so the upstream may have received and begun executing it — a
 			// silent probe cannot prove otherwise. Do NOT replay the turn over HTTP,
 			// and do not let the relay resend it on another credential: a duplicate
 			// would re-execute non-idempotent work (tool calls, code edits) and
 			// double-consume the upstream account. Fail this turn instead (SkipRetry).
-			// HTTP fallback stays reserved for pre-write failures (upgrade declined,
-			// write error), where non-receipt is certain.
+			// HTTP fallback stays reserved for failures before the application frame is
+			// written (for example, an unsupported upgrade).
 			logger.LogWarn(c, "responses websocket produced no initial event after the request was sent; failing the turn without replay: "+probeErr.Error())
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("responses websocket upstream produced no output within %s after the request was sent: %w", FirstEventTimeout, probeErr),
@@ -338,14 +414,20 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 
 	reader, writer := io.Pipe()
-	go s.streamAsSSE(c.Request.Context(), conn, writer, firstPayload)
-	var responseBody io.ReadCloser = reader
+	streamDone := make(chan struct{})
+	go s.streamAsSSE(c.Request.Context(), conn, writer, firstPayload, streamDone)
+	var responseBody io.ReadCloser = &responseBody{
+		ReadCloser: reader,
+		session:    s,
+		conn:       conn,
+		done:       streamDone,
+	}
 	if lease != nil {
 		// Finalize the per-turn lease exactly like the HTTP path: the relay closes
 		// this body when the stream ends (releasing the slot) and marks the turn's
 		// success/failure (resolving the credential's health / recovery probe).
 		service.BindSubscriptionOAuthResponseLease(c, lease)
-		responseBody = service.NewSubscriptionOAuthResponseBody(reader, lease)
+		responseBody = service.NewSubscriptionOAuthResponseBody(responseBody, lease)
 	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -367,10 +449,19 @@ func (s *Session) doHTTPFallbackLocked(
 	response, err := driver.DoHTTPFallback(c, info, body, reuseLease)
 	if err != nil || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 		s.pendingID = 0
+		s.pendingKeyIndex = 0
+		s.pendingFingerprint = ""
 		s.pendingModel = ""
 		return response, err
 	}
 	s.pendingID = info.ChannelId
+	s.pendingKeyIndex = info.ChannelMultiKeyIndex
+	s.pendingFingerprint = service.SubscriptionOAuthCredentialFingerprint(
+		info.ChannelType,
+		info.ChannelId,
+		info.ChannelMultiKeyIndex,
+		info.ApiKey,
+	)
 	s.pendingModel = model
 	return response, nil
 }
@@ -383,6 +474,7 @@ func (s *Session) invalidateLocked(conn *websocket.Conn) {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
+	s.connectedAt = time.Time{}
 }
 
 func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.RelayInfo) error {
@@ -451,21 +543,18 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		response.Body.Close()
 	}
 	conn.EnableWriteCompression(false)
-	// Only record the upstream request as written after a successful handshake; a
-	// dial that never reached upstream must stay retryable so the failover policy
-	// is not suppressed.
-	info.MarkUpstreamRequestWritten()
+	conn.SetReadLimit(maxUpstreamMessageBytes)
 	s.conn = conn
 	s.connectedAt = time.Now()
 	s.channelID = info.ChannelId
+	s.keyIndex = info.ChannelMultiKeyIndex
+	s.credentialFingerprint = service.SubscriptionOAuthCredentialFingerprint(
+		info.ChannelType,
+		info.ChannelId,
+		info.ChannelMultiKeyIndex,
+		info.ApiKey,
+	)
 	s.model = strings.TrimSpace(info.UpstreamModelName)
-	// Retain the handshake response headers so a subsequent silent-stream probe can
-	// classify an exhausted usage window from the upstream's rate-limit headers.
-	if response != nil {
-		s.handshakeHeader = response.Header
-	} else {
-		s.handshakeHeader = nil
-	}
 	driver.OnUpstreamConnected(c, info)
 	return nil
 }
@@ -480,9 +569,9 @@ func (s *Session) invalidate(conn *websocket.Conn) {
 }
 
 // readInitialEvent reads the first non-empty text event from a freshly
-// established upstream connection within FirstEventTimeout. A timeout or read
-// error signals that the upstream did not deliver a Responses event, so the
-// caller can fall back to the HTTP transport.
+// established upstream connection within FirstEventTimeout. At this point the
+// request frame has already been written, so a timeout or read error must fail
+// without replaying the request on another transport.
 func readInitialEvent(conn *websocket.Conn) ([]byte, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(FirstEventTimeout))
 	for {
@@ -564,15 +653,14 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 // streamAsSSE relays upstream WebSocket events to the SSE pipe. firstPayload, if
 // non-nil, is a text event already read during the fresh-connection probe and is
 // emitted before the read loop continues.
-func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter, firstPayload []byte) {
+func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter, firstPayload []byte, done chan struct{}) {
 	defer writer.Close()
+	defer close(done)
 
 	// Unblock a stalled ReadMessage when the request is cancelled by closing the
 	// connection from a watcher goroutine; otherwise the reader (and its capacity
 	// lease) would stay blocked until the idle deadline fires, and a follow-up
 	// request could start a second concurrent reader on the same conn.
-	done := make(chan struct{})
-	defer close(done)
 	if ctx != nil {
 		go func() {
 			select {

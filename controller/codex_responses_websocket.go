@@ -2,15 +2,19 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -27,6 +31,11 @@ const maxResponsesWebSocketErrorBytes = 1 << 20
 // by the relay) never approaches this; the cap stops a misbehaving one from
 // growing the buffer without limit.
 const maxResponsesWebSocketPendingBytes = 16 << 20
+
+const (
+	maxResponsesWebSocketQueuedFrames = 8
+	responsesWebSocketWriteTimeout    = 30 * time.Second
+)
 
 const responsesWebSocketInternalPinKey = "responses_websocket_internal_pin"
 
@@ -62,6 +71,10 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	}
 	session := &responsesws.Session{}
 	defer session.Close()
+	connectionContext, cancelConnection := context.WithCancel(c.Request.Context())
+	defer cancelConnection()
+	clientFrames := make(chan responsesWebSocketClientFrame, maxResponsesWebSocketQueuedFrames)
+	go readResponsesWebSocketClientFrames(connectionContext, cancelConnection, conn, clientFrames)
 	pinnedChannelID := 0
 	// turnReferencesPriorResponse marks a turn that chains onto a prior response's
 	// server-side state (previous_response_id). Such a turn must stay on the account
@@ -98,7 +111,17 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	})
 	engine.Use(middleware.ModelRequestRateLimit())
 	engine.Use(middleware.Distribute())
+	bindingFailure := false
 	engine.POST("/v1/responses", func(turn *gin.Context) {
+		if apiError := restoreResponsesWebSocketCredentialBinding(turn, session); apiError != nil {
+			bindingFailure = true
+			status := apiError.StatusCode
+			if status < http.StatusBadRequest {
+				status = http.StatusInternalServerError
+			}
+			turn.AbortWithStatusJSON(status, gin.H{"error": apiError.ToOpenAIError()})
+			return
+		}
 		// Bind the session for every turn; each adaptor decides whether to use the
 		// upstream WebSocket (Codex always, other channels when
 		// ResponsesWebSocketEnabled is set) or serve the turn over HTTP.
@@ -111,16 +134,19 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	})
 
 	for {
-		messageType, payload, err := conn.ReadMessage()
-		if err != nil {
+		var clientFrame responsesWebSocketClientFrame
+		select {
+		case <-connectionContext.Done():
 			return
-		}
-		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
-			continue
+		case frame, ok := <-clientFrames:
+			if !ok || connectionContext.Err() != nil {
+				return
+			}
+			clientFrame = frame
 		}
 
 		var frame map[string]any
-		if err := common.Unmarshal(payload, &frame); err != nil {
+		if err := common.Unmarshal(clientFrame.payload, &frame); err != nil {
 			writeResponsesWebSocketError(conn, http.StatusBadRequest, "invalid response.create JSON", "")
 			continue
 		}
@@ -136,7 +162,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			continue
 		}
 
-		request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		request, err := http.NewRequestWithContext(connectionContext, http.MethodPost, "/v1/responses", bytes.NewReader(body))
 		if err != nil {
 			writeResponsesWebSocketError(conn, http.StatusInternalServerError, err.Error(), "")
 			return
@@ -147,8 +173,12 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		request.RemoteAddr = c.Request.RemoteAddr
 
 		writer := newResponsesWebSocketSSEWriter(conn)
+		bindingFailure = false
 		engine.ServeHTTP(writer, request)
 		if err := writer.Finish(); err != nil {
+			return
+		}
+		if bindingFailure {
 			return
 		}
 		if writer.SucceededTurn() {
@@ -159,6 +189,81 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			previousRequest = reusableResponsesWebSocketFields(frame)
 		}
 	}
+}
+
+type responsesWebSocketClientFrame struct {
+	payload []byte
+}
+
+// readResponsesWebSocketClientFrames is the sole downstream reader. Keeping it
+// alive while a turn is running lets a disconnect cancel the turn's upstream
+// request immediately. A small queue permits normal pipelining without allowing
+// an unbounded number of response.create bodies to accumulate in memory.
+func readResponsesWebSocketClientFrames(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *websocket.Conn,
+	frames chan<- responsesWebSocketClientFrame,
+) {
+	defer close(frames)
+	defer cancel()
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+			continue
+		}
+		select {
+		case frames <- responsesWebSocketClientFrame{payload: payload}:
+		case <-ctx.Done():
+			return
+		default:
+			// The protocol processes turns serially. More than the bounded queue is a
+			// protocol abuse condition; cancel the active turn instead of stopping the
+			// read pump and losing disconnect detection.
+			return
+		}
+	}
+}
+
+// restoreResponsesWebSocketCredentialBinding replaces the key chosen by
+// Distribute with the exact credential that authenticated the reusable upstream
+// connection. Pinning only the channel is insufficient for multi-key channels.
+func restoreResponsesWebSocketCredentialBinding(turn *gin.Context, session *responsesws.Session) *types.NewAPIError {
+	binding, ok := session.Binding()
+	if !ok {
+		return nil
+	}
+	channel, err := model.CacheGetChannel(binding.ChannelID)
+	if err != nil {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("get responses websocket channel %d: %w", binding.ChannelID, err),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	matched, apiError := middleware.SetupContextForSelectedChannelAtCredential(
+		turn,
+		channel,
+		turn.GetString("original_model"),
+		binding.KeyIndex,
+		binding.Fingerprint,
+	)
+	if apiError != nil {
+		return apiError
+	}
+	if matched {
+		return nil
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("responses websocket credential binding changed; reconnect to establish a new session"),
+		types.ErrorCodeChannelInvalidKey,
+		http.StatusConflict,
+		types.ErrOptionWithSkipRetry(),
+	)
 }
 
 func reusableResponsesWebSocketFields(frame map[string]any) map[string]any {
@@ -277,18 +382,29 @@ func (w *responsesWebSocketSSEWriter) Write(payload []byte) (int, error) {
 		remaining := maxResponsesWebSocketErrorBytes - len(w.raw)
 		w.raw = append(w.raw, payload[:min(len(payload), remaining)]...)
 	}
+	if len(payload) > maxResponsesWebSocketPendingBytes-len(w.pending) {
+		// Check before append so an oversized, boundary-free upstream event cannot
+		// force the allocation that this limit is intended to prevent.
+		w.err = errors.New("responses websocket upstream event exceeded the buffer limit without a frame boundary")
+		return 0, w.err
+	}
 	w.pending = append(w.pending, payload...)
 	w.drainSSEFrames(false)
 	if w.err != nil {
 		return 0, w.err
 	}
-	if len(w.pending) > maxResponsesWebSocketPendingBytes {
-		// The upstream is streaming an event with no SSE boundary; refuse to buffer
-		// it without bound so a misbehaving upstream cannot exhaust memory.
-		w.err = errors.New("responses websocket upstream event exceeded the buffer limit without a frame boundary")
-		return 0, w.err
-	}
 	return len(payload), nil
+}
+
+// SetWriteDeadline lets http.ResponseController propagate the relay's streaming
+// write deadline through Gin to the underlying WebSocket connection.
+func (w *responsesWebSocketSSEWriter) SetWriteDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.conn == nil {
+		return errors.New("responses websocket connection is nil")
+	}
+	return w.conn.SetWriteDeadline(deadline)
 }
 
 func (w *responsesWebSocketSSEWriter) Flush() {
@@ -318,8 +434,20 @@ func (w *responsesWebSocketSSEWriter) Finish() error {
 		w.status = http.StatusInternalServerError
 	}
 	message := strings.TrimSpace(string(w.raw))
+	if w.status >= http.StatusOK && w.status < http.StatusMultipleChoices {
+		// A successful HTTP status without even one Responses event is not a
+		// successful WebSocket turn. Surface it as a gateway failure rather than an
+		// impossible code=200/204 error frame.
+		w.status = http.StatusBadGateway
+		if message == "" {
+			message = "upstream returned an empty response stream"
+		}
+	}
 	if message == "" {
 		message = http.StatusText(w.status)
+	}
+	if upstreamError, ok := responsesWebSocketHTTPError(w.raw); ok {
+		return writeResponsesWebSocketErrorObject(w.conn, w.status, upstreamError, w.header.Get("Retry-After"))
 	}
 	// Carry the retry timing the relay resolved (Retry-After was written to this
 	// writer's header map) so the client learns when the credential recovers.
@@ -360,13 +488,14 @@ func (w *responsesWebSocketSSEWriter) writeSSEBlock(block []byte) {
 	if payload == "" || payload == "[DONE]" {
 		return
 	}
-	if responsesWebSocketPayloadIsTerminal(payload) {
+	eventType := responsesWebSocketPayloadType(payload)
+	if responsesWebSocketEventIsTerminal(eventType) {
 		w.sawTerminal = true
 	}
-	if responsesWebSocketPayloadIsCleanTerminal(payload) {
+	if responsesWebSocketEventIsCleanTerminal(eventType) {
 		w.sawCleanTerminal = true
 	}
-	w.err = w.conn.WriteMessage(websocket.TextMessage, []byte(payload))
+	w.err = writeResponsesWebSocketMessage(w.conn, []byte(payload))
 	if w.err == nil {
 		w.sent++
 	}
@@ -382,26 +511,45 @@ func (w *responsesWebSocketSSEWriter) SucceededTurn() bool {
 	return w.sawCleanTerminal
 }
 
-// responsesWebSocketPayloadIsTerminal reports whether a forwarded event payload
-// is a stream-ending Responses event. It matches the quoted event-type value, so
-// a real terminal frame is never missed (its type is always present verbatim);
-// an unrelated payload that merely mentions one of these strings only risks a
-// false positive, which just suppresses the synthetic terminal — never a spurious
-// error after a clean stream.
+// responsesWebSocketPayloadType parses only the top-level event type. Looking
+// for quoted substrings is unsafe because a normal delta can contain text such
+// as `"response.completed"` without ending the stream.
+func responsesWebSocketPayloadType(payload string) string {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := common.Unmarshal([]byte(payload), &event); err != nil {
+		return ""
+	}
+	return event.Type
+}
+
+// responsesWebSocketEventIsTerminal reports whether a forwarded event is a
+// stream-ending Responses event.
+func responsesWebSocketEventIsTerminal(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.failed", "response.incomplete", "response.error", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+// responsesWebSocketPayloadIsTerminal is retained as the payload-level helper
+// used by focused tests and callers in this package.
 func responsesWebSocketPayloadIsTerminal(payload string) bool {
-	return strings.Contains(payload, `"response.completed"`) ||
-		strings.Contains(payload, `"response.failed"`) ||
-		strings.Contains(payload, `"response.incomplete"`) ||
-		strings.Contains(payload, `"response.error"`) ||
-		strings.Contains(payload, `"type":"error"`)
+	return responsesWebSocketEventIsTerminal(responsesWebSocketPayloadType(payload))
 }
 
 // responsesWebSocketPayloadIsCleanTerminal reports whether a forwarded payload is
 // a non-error stream-ending event. It is the success subset of
 // responsesWebSocketPayloadIsTerminal and drives response.append inheritance.
+func responsesWebSocketEventIsCleanTerminal(eventType string) bool {
+	return eventType == "response.completed" || eventType == "response.incomplete"
+}
+
 func responsesWebSocketPayloadIsCleanTerminal(payload string) bool {
-	return strings.Contains(payload, `"response.completed"`) ||
-		strings.Contains(payload, `"response.incomplete"`)
+	return responsesWebSocketEventIsCleanTerminal(responsesWebSocketPayloadType(payload))
 }
 
 // responsesWebSocketErrorType maps an HTTP status to a Responses error type so a
@@ -423,17 +571,53 @@ func responsesWebSocketErrorType(status int) string {
 	}
 }
 
-// writeResponsesWebSocketError sends a structured error frame. status drives the
-// error type; retryAfter, when a positive delta-seconds value, is preserved as a
-// numeric retry_after so a strict client can wait rather than hammer.
-func writeResponsesWebSocketError(conn *websocket.Conn, status int, message string, retryAfter string) error {
+func responsesWebSocketHTTPError(raw []byte) (gin.H, bool) {
+	var envelope struct {
+		Error types.OpenAIError `json:"error"`
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || common.Unmarshal(raw, &envelope) != nil || envelope.Error.Message == "" {
+		return nil, false
+	}
+	errorObject := gin.H{
+		"message": envelope.Error.Message,
+	}
+	if envelope.Error.Type != "" {
+		errorObject["type"] = envelope.Error.Type
+	}
+	if envelope.Error.Code != nil && fmt.Sprint(envelope.Error.Code) != "" {
+		errorObject["code"] = envelope.Error.Code
+	}
+	if envelope.Error.Param != "" {
+		errorObject["param"] = envelope.Error.Param
+	}
+	if len(envelope.Error.Metadata) > 0 {
+		errorObject["metadata"] = envelope.Error.Metadata
+	}
+	return errorObject, true
+}
+
+func writeResponsesWebSocketMessage(conn *websocket.Conn, payload []byte) error {
 	if conn == nil {
 		return errors.New("responses websocket connection is nil")
 	}
-	errorObject := gin.H{
-		"message": message,
-		"type":    responsesWebSocketErrorType(status),
-		"code":    status,
+	if err := conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func writeResponsesWebSocketErrorObject(conn *websocket.Conn, status int, errorObject gin.H, retryAfter string) error {
+	if conn == nil {
+		return errors.New("responses websocket connection is nil")
+	}
+	if errorObject == nil {
+		errorObject = gin.H{}
+	}
+	if strings.TrimSpace(fmt.Sprint(errorObject["type"])) == "" {
+		errorObject["type"] = responsesWebSocketErrorType(status)
+	}
+	if errorObject["code"] == nil || strings.TrimSpace(fmt.Sprint(errorObject["code"])) == "" {
+		errorObject["code"] = status
 	}
 	if seconds, convErr := strconv.Atoi(strings.TrimSpace(retryAfter)); convErr == nil && seconds > 0 {
 		errorObject["retry_after"] = seconds
@@ -445,5 +629,17 @@ func writeResponsesWebSocketError(conn *websocket.Conn, status int, message stri
 	if err != nil {
 		return err
 	}
-	return conn.WriteMessage(websocket.TextMessage, payload)
+	return writeResponsesWebSocketMessage(conn, payload)
+}
+
+// writeResponsesWebSocketError sends a structured error frame. status drives the
+// error type; retryAfter, when a positive delta-seconds value, is preserved as a
+// numeric retry_after so a strict client can wait rather than hammer.
+func writeResponsesWebSocketError(conn *websocket.Conn, status int, message string, retryAfter string) error {
+	errorObject := gin.H{
+		"message": message,
+		"type":    responsesWebSocketErrorType(status),
+		"code":    status,
+	}
+	return writeResponsesWebSocketErrorObject(conn, status, errorObject, retryAfter)
 }

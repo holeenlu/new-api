@@ -1,183 +1,272 @@
 # ADR 0006: Claude Code (Subscription) OAuth channel
 
-Status: Proposed — not implemented. This record captures the design and the
-compliance risk so the project owner can decide whether to build it. No code has
-been written. If accepted, implementation follows the "Decision" section; if
-declined, this record stays as the rationale for not adding the channel.
+Status: Proposed — not implemented. Acceptance requires an explicit project-owner
+decision on the compliance risk below. This record defines an implementable
+boundary; it does not authorize the feature by itself.
 
 ## Context
 
 The gateway already has a **Claude Code (OAuth)** channel
-(`ChannelTypeClaudeCode = 59`) that accepts only a *static*
-`CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...`. That token is long-lived (~1 year) but
-still expires, and it carries no refresh token: when it lapses an operator must
-re-run `claude setup-token` and paste the new value by hand. There is no
-automatic renewal.
+(`ChannelTypeClaudeCode = 59`) that accepts a static
+`CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...`. It has no refresh token, so renewal is an
+operator action. Its credential format and behavior are compatibility contracts
+and must not change.
 
-By contrast the **Codex (ChatGPT subscription)** channel
-(`ChannelTypeCodex = 57`) implements a full subscription OAuth login flow —
-browser authorization → exchange for `access_token + refresh_token` → persist a
-JSON credential in `channel.Key` → refresh both on a background timer and on a
-401 during relay. It reuses a provider-agnostic subscription-OAuth framework
-(`service/subscription_oauth_*.go`: capacity leasing, retry, error policy,
-usage-limit cooldown, usage cache) that is gated on
-`constant.IsSubscriptionOAuthChannel`.
+The **Codex (ChatGPT subscription)** channel (`ChannelTypeCodex = 57`) has an
+interactive OAuth flow and stores a refreshable JSON credential in `channel.Key`.
+Shared `service/subscription_oauth_*.go` code owns inference capacity, retry,
+cooldown, recovery probes, and request-local attempt budgets. Codex-specific
+services own its endpoints and credential rotation.
 
-Operators want the same "log in once, auto-refresh forever" experience for
-Anthropic subscription accounts that Codex already gives for ChatGPT accounts.
+The requested user outcome is a separate Anthropic subscription channel with the
+same login-once and automatic-renewal experience, while reusing the existing
+Claude relay and the shared subscription policy. The request does not justify
+changing the static type, adding a second Claude transport, or making all
+subscription channels share one credential parser.
 
 Non-negotiable constraints:
 
-- The existing static **Claude Code (OAuth)** channel must not change behavior.
-- Relay must reuse the existing `claude.Adaptor` (`APITypeAnthropic`); no second
-  Anthropic transport path.
-- No second source of truth for subscription-OAuth capacity/retry/refresh state;
-  reuse the shared framework and the shared `model/auth_flow.go` store.
-- All JSON via `common.Marshal/Unmarshal`; credential persists in the existing
-  `channel.Key` TEXT column (works on SQLite/MySQL/PostgreSQL unchanged).
+- Static type 59 retains its raw-token parser, model handling, refresh behavior
+  (none), and admin UI.
+- Relay reuses `relay/channel/claude.Adaptor` and `APITypeAnthropic`.
+- `channel.Key` remains the only credential source of truth. Shared subscription
+  services remain the only capacity/retry/cooldown ledger.
+- Transient login flows remain in `model/auth_flow.go`; refresh coordination is
+  part of the credential state, not a second token store.
+- All JSON encoding/decoding uses `common.*`; persistence and coordination work
+  on SQLite, MySQL, and PostgreSQL.
+- Secrets, authorization codes, callback URLs, request bodies, and token-endpoint
+  responses are never logged.
 
-## Decision
+## External protocol status
 
-Add a new channel type **Claude Code (Subscription)**
-(`ChannelTypeClaudeCodeSubscription = 60`) that layers Codex-style OAuth login +
-auto-refresh onto the existing Claude transport. The channel type owns its
-credential JSON in `channel.Key`; the shared subscription-OAuth framework owns
-capacity/retry/cooldown state; `model/auth_flow.go` owns the transient login
-flow (`Provider: "claude"`).
+The following values have been observed in community implementations and packet
+captures, not in a stable Anthropic public integration contract. They must be
+revalidated before implementation and monitored after release:
 
-Verified Anthropic subscription OAuth protocol (source-level: querymt/
-anthropic-auth, ben-vargas gist, opencode community + packet captures):
-
-| Item | Value |
-|---|---|
+| Item | Observed value |
+| --- | --- |
 | Authorize endpoint | `https://claude.ai/oauth/authorize` |
-| Token endpoint (exchange + refresh) | `https://console.anthropic.com/v1/oauth/token` |
-| client_id | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
-| redirect_uri (paste mode) | `https://console.anthropic.com/oauth/code/callback` |
-| scope | `org:create_api_key user:profile user:inference` |
-| PKCE | S256; authorize also sends `code=true` (server echoes `code#state`) |
-| Code exchange | JSON body: `{code, state, grant_type:"authorization_code", client_id, redirect_uri, code_verifier}` |
-| Refresh | JSON body: `{grant_type:"refresh_token", refresh_token, client_id}` |
-| Response | `access_token` (`sk-ant-oat01-`), `refresh_token`, `expires_in` (~3600s interactive) |
+| Token endpoint | `https://console.anthropic.com/v1/oauth/token` |
+| client ID | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| Paste-mode redirect URI | `https://console.anthropic.com/oauth/code/callback` |
+| Scope | `org:create_api_key user:profile user:inference` |
+| PKCE | S256; authorize also sends `code=true` |
+| Exchange body | JSON containing `code`, verified `state`, `grant_type`, `client_id`, `redirect_uri`, `code_verifier` |
+| Refresh body | JSON containing `grant_type`, `refresh_token`, `client_id` |
+| Token response | `access_token`, `refresh_token`, `expires_in` |
 
-Inference headers and the mandatory Claude Code identity system block are already
-produced by the existing `claude.Adaptor` (`BuildClaudeCodeOAuthHeaders`,
-`ensureClaudeCodeIdentitySystem`) and are reused unchanged.
+The existing Claude adaptor already owns the mandatory Claude Code identity
+system block and OAuth inference headers. Client-supplied header or body
+passthrough must never override those fields.
 
-Implementation shape (mirrors Codex except where noted):
+## Decision if accepted
 
-- **Type registration** — `constant/channel.go`: add
-  `ChannelTypeClaudeCodeSubscription = 60` before `ChannelTypeDummy` (Dummy has
-  no expression, so it copies `= 60`; the `for i:=1;i<=Dummy` loop at
-  `controller/model.go:102` then covers it). Add to
-  `IsSubscriptionOAuthChannel`, append `ChannelBaseURLs` index 60 =
-  `https://api.anthropic.com`, and add the name mapping. `common/api_type.go`
-  `ChannelType2APIType` → `APITypeAnthropic`. No change to
-  `relay/relay_adaptor.go` or `constant/api_type.go`.
-- **Adaptor reuse** — `relay/channel/claude/adaptor.go`: widen the four
-  `== ChannelTypeClaudeCode` gates (identity injection, header setup, capacity
-  lease) to `IsSubscriptionOAuthChannel(info.ChannelType)`. Split credential
-  parsing: static type keeps `ParseClaudeCodeOAuthToken`; subscription type
-  extracts `access_token` from the JSON credential (new
-  `extractSubscriptionAccessToken`), with the same `sk-ant-oat` prefix check.
-- **Credential** — new `dto/claude_oauth.go` (`ClaudeOAuthCredential`, mirroring
-  `CodexOAuthCredential`) + `relay/channel/claude/oauth_key.go`. `account_id`
-  and `email` are optional (a Claude OAuth token is not guaranteed to be a
-  decodable JWT), unlike Codex which requires `account_id`.
-- **OAuth service** — new `service/claude_oauth.go` mirroring
-  `service/codex_oauth.go`: `CreateClaudeOAuthAuthorizationFlow`,
-  `ExchangeClaudeAuthorizationCode`, `RefreshClaudeOAuthToken[WithProxy]`,
-  `ClaudeOAuthUpstreamError`. Requests use JSON bodies against the endpoints
-  above; env overrides (`CLAUDE_SUBSCRIPTION_OAUTH_CLIENT_ID`, etc.) parallel
-  the Codex ones.
-- **Auto-refresh** — new `service/claude_credential_refresh.go` +
-  `_task.go`: per-channel mutex, optimistic CAS update
-  (`WHERE key = previousKey`), master-node `sync.Once` background scan of
-  soon-to-expire subscription channels; registered near `main.go:121`. Runtime
-  capacity/timeout init reuses the existing `claude.InitOAuthRuntimeSettings`.
-- **401-refresh gating** — generalize `ShouldRefreshCodexOAuthCredential` /
-  `IsPermanentCodexOAuthRefreshFailure`
-  (`service/subscription_oauth_error_policy.go`) to be provider-agnostic via
-  `IsSubscriptionOAuthChannel`, and have
-  `controller/relay.go:refreshCodexCredentialForRetry` dispatch by channel type
-  to the matching `Refresh*ChannelCredential`, preserving the single-refresh
-  claim (`ClaimSubscriptionOAuthCredentialRefresh`) semantics.
-- **Login controller + routes** — new `controller/claude_oauth.go`
-  (`StartClaudeOAuth` / `CompleteClaudeOAuth`, `model.CreateAuthFlow` with
-  `Provider: "claude"`); `router/channel-router.go` adds
-  `/claude/oauth/start`, `/claude/oauth/complete`, `/:id/claude/refresh`.
-- **Validation / model-fetch** — `controller/channel.go` adds a JSON-credential
-  validation branch (generic subscription guardrails already apply via
-  `IsSubscriptionOAuthChannel`); `controller/channel_models.go` generalizes the
-  "preserve full OAuth JSON" and OAuth-header model-fetch branches from
-  `== ChannelTypeCodex` to the subscription predicate.
-- **Frontend** (`web/src/features/channels/`) — register type `60` in
-  `constants.ts` (types, order, options, fetchable, key prompt, warning);
-  new `claude-oauth-dialog.tsx` cloned from `codex-oauth-dialog.tsx`; wire the
-  login/refresh UI block and base-URL grouping in `channel-mutate-drawer.tsx`;
-  add `startClaudeOAuth`/`completeClaudeOAuth`/`refreshClaudeCredential` to
-  `api.ts` and `use-channel-credential-actions.ts`; icon in `channel-utils.ts`;
-  i18n keys in `web/src/i18n/locales/*.json`.
+Add **Claude Code (Subscription)** as a separate channel type
+`ChannelTypeClaudeCodeSubscription = 60`. The feature is disabled by default and
+requires an explicit deployment opt-in because its upstream availability and
+terms compliance are uncertain. The backend is the authority for that opt-in;
+the frontend only reflects the backend capability and displays a persistent
+warning before authorization.
+
+### Capability boundaries
+
+Do not generalize behavior through one overly broad predicate. Introduce and use
+separate capabilities:
+
+- `IsSubscriptionOAuthChannel`: types 57, 59, and 60. This means shared inference
+  capacity/retry/cooldown and protected-request policy only.
+- `IsRefreshableSubscriptionOAuthChannel`: types 57 and 60. Only these types may
+  enter authorization-code, background-refresh, or 401-refresh code.
+- `IsClaudeCodeOAuthChannel`: types 59 and 60. Only these types receive Claude
+  Code identity/header behavior.
+- `UsesJSONSubscriptionCredential`: types 57 and 60. Type 59 is always a static
+  token and must never be decoded as the new JSON format.
+
+Call sites must select the narrowest predicate. In particular, a 401 on type 59
+must never invoke refresh, and Codex must never enter Claude-specific adaptor
+logic.
+
+### Credential identity and storage
+
+Type 60 stores a versioned JSON object in `channel.Key`:
+
+```json
+{
+  "version": 1,
+  "credential_id": "generated-once-stable-uuid",
+  "access_token": "...",
+  "refresh_token": "...",
+  "expires_at": 0,
+  "account_id": "optional",
+  "email": "optional"
+}
+```
+
+`credential_id` is required, generated by the backend at successful exchange,
+and preserved byte-for-value across every refresh. It is the identity input for
+capacity, cooldown, retry exclusion, recovery probes, and quarantine. Rotating
+access/refresh tokens must not change the credential fingerprint. `account_id`
+and `email` are display metadata only and cannot be used as a fallback identity.
+
+The first implementation is **single-key only**. Backend create/update/import
+validation rejects type 60 multi-key payloads; frontend controls are convenience,
+not enforcement. Refresh CAS therefore targets one channel ID and the exact
+previous `channel.Key`. Multi-key support requires a later ADR that defines
+per-index CAS, refresh claims, quarantine, and credential replacement.
+
+### OAuth completion and replay protection
+
+`StartClaudeOAuth` creates a one-time, expiring auth-flow row with provider
+`claude`, PKCE verifier, and random state, and returns the authorization URL.
+`CompleteClaudeOAuth` accepts either the pasted callback URL or the documented
+`code#state` form, parses it without logging it, and requires the returned state
+to match the stored flow. Successful exchange consumes the flow exactly once;
+expired, mismatched, or replayed flows fail without calling the token endpoint.
+
+OAuth endpoint errors are parsed structurally. Only an explicit credential
+failure such as `invalid_grant` / an invalid refresh token makes reauthorization
+necessary. A bare 400, 401, or 403, `invalid_client`, endpoint drift, timeout, or
+5xx is an operational/provider failure and must not quarantine a user credential.
+
+### Refresh ownership and cross-node coordination
+
+New `service/claude_credential_refresh*.go` code owns type 60 rotation. A local
+singleflight/mutex is only an optimization and is not claimed as a distributed
+lock. Cross-node exclusion uses a short-lived refresh claim embedded in the same
+versioned `channel.Key` JSON and acquired with an optimistic CAS from the exact
+previous key. The claim contains only a random owner ID and expiry, never a
+secret. The winner calls the token endpoint; other nodes wait/reload within a
+bounded request deadline. An expired claim may be taken over by CAS after a
+crashed owner.
+
+Success atomically replaces the claimed key with a refreshed credential while
+preserving `credential_id`. Failure atomically clears the claim or, for a
+structured permanent credential error, disables the channel through the shared
+credential-isolation path. Every write invalidates channel cache. This provides
+one provider refresh in flight and one persisted rotation across nodes without a
+second credential store.
+
+Both proactive and reactive refresh use this operation:
+
+- 401 refresh is available only to `IsRefreshableSubscriptionOAuthChannel` and
+  remains bounded to one refresh transition per client request.
+- The background scanner runs only on the elected master, derives its context
+  from application shutdown, has a per-scan deadline, row limit, worker limit,
+  and per-request timeout, and applies jitter.
+- The refresh window is provider-specific and based on the observed one-hour
+  token lifetime (for example, refresh 10–15 minutes before expiry), not Codex's
+  longer-lived threshold.
+- The capacity janitor and refresh scanner include type 60 intentionally; static
+  type 59 remains outside refresh scans.
+
+### Relay, management, and UI integration
+
+Register type 60 before `ChannelTypeDummy`, add a matching `ChannelBaseURLs`
+entry and name/API mappings, and harden all base-URL indexing against unknown
+persistent types. The new type reuses `APITypeAnthropic` and the Claude adaptor.
+The adaptor uses `IsClaudeCodeOAuthChannel` for identity/header behavior, and
+`UsesJSONSubscriptionCredential` only for access-token extraction.
+
+Implementation must audit every channel-type gate, including:
+
+- protected OAuth headers/body passthrough in `relay/channel/api_request.go`;
+- subscription capacity initialization and janitor queries;
+- stream-support declarations in `relay/common/relay_info.go`;
+- channel create/update/import validation and channel test restrictions;
+- model catalogue fetches, JSON token extraction, and Claude headers in
+  `controller/channel_model_catalog.go` / `channel_models.go`;
+- data-policy, retry, ratio-sync, batch-test, and upstream-update eligibility;
+- frontend type registration, single-key enforcement, login/refresh actions,
+  warnings, and all supported locale files.
+
+The UI completion dialog is shared or extracted where practical; cloning the
+Codex dialog is not a requirement. User-facing text follows the frontend i18n
+workflow.
 
 ## Alternatives considered
 
-- **Extend the existing static Claude Code (OAuth) channel to also accept a
-  refreshable JSON credential** (no new type). Rejected: it overloads one
-  channel type with two credential formats and two lifecycles, complicates
-  validation and the admin UI, and risks changing behavior for existing static
-  deployments — violating the "must not change" constraint.
-- **A new dedicated Anthropic transport / `APIType`.** Rejected: the existing
-  `claude.Adaptor` already handles Anthropic relay, identity injection, and
-  OAuth headers; a second path would duplicate that and drift.
-- **A generic "subscription OAuth provider" plugin abstraction** covering Codex
-  and Claude behind one interface. Rejected for now: only two providers exist,
-  the shared `service/subscription_oauth_*.go` framework already carries the
-  common state, and the per-provider auth endpoints/quirks are small. Revisit if
-  a third subscription provider appears.
-- **Do nothing / keep only the static token.** This remains the fallback if the
-  compliance risk below is judged unacceptable.
+- **Overload static type 59 with JSON credentials.** Rejected because it changes
+  an existing credential contract and makes refresh eligibility ambiguous.
+- **Use `IsSubscriptionOAuthChannel` for every gate.** Rejected because it would
+  send static type 59 into JSON parsing and refresh paths and could send Codex
+  into Claude-specific behavior.
+- **Process-local mutex plus post-refresh CAS.** Rejected as the complete
+  concurrency policy because two nodes could submit the same single-use refresh
+  token. A losing post-refresh CAS may persist an already-invalidated successor.
+- **Support multi-key in the first version.** Rejected until refresh identity,
+  CAS, claims, and quarantine are specified per key index.
+- **Add a second Anthropic transport/API type.** Rejected; it would duplicate the
+  existing adaptor and drift.
+- **Keep only the static token channel.** This remains the selected outcome if
+  the project owner does not accept the compliance risk.
 
-## Consequences
+## Consequences and state ownership
 
-- **Compliance / availability risk (primary).** Around 2026-02 Anthropic began
-  blocking third-party applications that use a subscription OAuth token
-  (`sk-ant-oat01-`) against `api.anthropic.com/v1/messages` (issues
-  anthropics/claude-code#28091, #18340; NousResearch/hermes-agent#15080), and
-  the TOS restricts subscription tokens to the official Claude Code client. Even
-  with every protocol parameter correct, this channel **may stop working at any
-  time and may violate the TOS / risk account suspension.** This is why the
-  channel is proposed, not built. If implemented, it should carry a prominent
-  admin-facing disclaimer (`CHANNEL_TYPE_WARNINGS`) and its failures should be
-  treated as expected, not as gateway bugs.
-- **What stays compatible.** The static Claude Code (OAuth) channel is untouched
-  (separate type, separate credential parser). Rollback = remove type `60` and
-  its files; no data migration, since the credential lives in the existing
-  `channel.Key` TEXT column and no schema changes are made.
-- **What must be monitored.** The Anthropic OAuth endpoints, client_id, scope,
-  and required beta/identity headers are reverse-engineered, not officially
-  documented; they can change without notice. The refresh path must never
-  produce two concurrent refreshes for one channel (single-claim invariant) and
-  must fail closed (a permanent 400/401/403 from the token endpoint disables the
-  channel and requires re-auth).
-- **State ownership.** Credential JSON → `channel.Key`; capacity/retry/cooldown →
-  shared `service/subscription_oauth_*.go`; transient login flow →
-  `model/auth_flow.go` (`Provider: "claude"`). No new source of truth.
+- **Compliance and availability risk.** Community reports indicate that
+  Anthropic may block third-party applications using subscription OAuth tokens
+  for inference, and applicable terms may restrict them to official Claude Code.
+  The channel may stop working without notice and may risk account suspension.
+  It therefore remains opt-in and prominently warned; protocol correctness does
+  not remove this risk.
+- Credential and refresh claim: `channel.Key`, owned by the Claude credential
+  refresh service.
+- Inference capacity/retry/cooldown/quarantine: existing shared subscription
+  services.
+- Login flow: existing `model/auth_flow.go` store with provider `claude`.
+- Feature exposure: one backend startup capability, disabled by default. Turning
+  it off fails closed for new login, refresh, and inference but preserves stored
+  credentials for a later safe export or re-enable.
+- No compatibility path changes static type 59. No duplicate token table or
+  independent retry ledger is introduced.
 
-## Verification
+## Rollback
 
-- **Unit (table-driven, testify)** mirroring the Codex tests: authorize-URL
-  assembly (PKCE + `code=true`); JSON-body code exchange and refresh field/
-  endpoint correctness; `extractSubscriptionAccessToken` over both JSON and
-  static keys incl. `sk-ant-oat` prefix rejection; provider-agnostic
-  `ShouldRefreshSubscriptionOAuthCredential` returning true for type `60`; CAS
-  refresh optimistic lock (`WHERE key = previousKey`) rejecting a stale key.
-- **Build/format.** `go build ./...`, `gofmt`; frontend type-check/build.
-- **End-to-end** (real subscription account, mindful of the block risk): create
-  channel → front-end authorize → JSON credential persisted → one `/v1/messages`
-  request confirms identity block + OAuth headers injected → force `expired`
-  near now to trigger background/401 refresh and confirm the key is CAS-updated
-  and the retried request succeeds.
-- **Rollback test.** Disabling/removing type `60` leaves existing static Claude
-  Code (OAuth) channels and Codex channels functioning unchanged.
-- **Cross-DB.** No schema change; credential in `channel.Key` TEXT — identical on
-  SQLite, MySQL, PostgreSQL.
+Code-only rollback is unsafe once type 60 rows exist: an older binary can index
+its shorter `ChannelBaseURLs` slice with the persisted type and panic. Before
+deploying an older version, operators must stop writes, export type 60
+credentials securely, disable and remove or migrate every type 60 channel,
+verify the database contains none, and only then deploy the old binary. The
+forward implementation also bounds-checks channel-type array access so unknown
+persisted types fail as validation errors rather than panicking.
+
+Disabling the feature flag is the preferred immediate rollback because it keeps
+the newer binary and stored rows while blocking login, refresh, and inference.
+The operational runbook and rollback test are release requirements.
+
+## Verification required before acceptance
+
+- Table tests with `testify` for capability predicates prove static type 59 never
+  enters JSON parsing or refresh, while types 57/60 use only their provider's
+  refresh implementation.
+- Credential tests prove `credential_id` is required, generated once, preserved
+  across refresh and refresh claims, and yields a stable fingerprint while
+  access and refresh tokens rotate.
+- OAuth tests cover PKCE/URL fields, callback URL and `code#state` parsing, state
+  mismatch, expiry, one-time completion, replay, structured endpoint errors,
+  and log redaction.
+- Concurrent two-node tests prove only the refresh-claim winner calls the token
+  endpoint, waiters reload the winning key, expired claims can be recovered, CAS
+  loss cannot overwrite a newer credential, and cancellation bounds all waits.
+- Validator/API tests reject type 60 multi-key configuration through direct API
+  and import paths, not only through the UI.
+- Relay tests prove protected Claude identity headers cannot be overridden,
+  access-token extraction does not leak the JSON credential, stream/model
+  catalogue behavior is registered, and 401 refresh is attempted once at most.
+- Background-task tests use deterministic clocks and prove scan row/worker/time
+  bounds, shutdown cancellation, jitter/window selection, and no type 59 scan.
+- SQLite, MySQL, and PostgreSQL tests cover claim CAS, success replacement,
+  failure cleanup, cache invalidation, and credential isolation.
+- Frontend typecheck/build and i18n sync pass; the disabled capability hides or
+  disables setup and displays the compliance warning when enabled.
+- End-to-end testing with a specifically authorized real account validates the
+  currently observed protocol without treating that result as a durable API
+  guarantee.
+- Rollback rehearsal proves feature disablement is immediate and that the
+  documented data cleanup allows the previous binary to start without type 60
+  rows.
+
+Implementation does not begin while this ADR is Proposed. On acceptance, update
+`docs/architecture/overview.md`, `docs/architecture/health.md`, and the functional
+change catalogue together with the code; mark this ADR Implemented only after the
+verification above actually passes.

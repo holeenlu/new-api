@@ -38,14 +38,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		status := resp.StatusCode
-		if status >= 200 && status < 300 {
-			// The upstream wrapped an error in a success status; derive a routable
-			// status from the error content so the relay retries/fails over instead of
-			// treating it as success (shouldRetry returns false for 2xx).
-			status = responsesStreamErrorStatus(string(responseBody), oaiError)
-		}
-		return nil, types.WithOpenAIError(*oaiError, status)
+		return nil, responsesWrappedError(info, resp, responseBody, oaiError)
 	}
 
 	if responsesResponse.HasImageGenerationCall() {
@@ -105,6 +98,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		downstreamCommitted.Store(true)
 	}
 	var preflightError *types.NewAPIError
+	hasAuthoritativeUsage := false
 
 	flushPendingEvents := func() {
 		for _, event := range pendingEvents {
@@ -126,7 +120,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			data = info.ResponsesStreamEventTransform(data)
 		}
 
-		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
@@ -134,18 +127,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			return
 		}
 		switch streamResponse.Type {
-		case "response.completed":
+		case "response.completed", "response.incomplete", "response.done":
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
-					if streamResponse.Response.Usage.InputTokens != 0 {
-						usage.PromptTokens = streamResponse.Response.Usage.InputTokens
-					}
-					if streamResponse.Response.Usage.OutputTokens != 0 {
-						usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
-					}
-					if streamResponse.Response.Usage.TotalTokens != 0 {
-						usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
-					}
+					hasAuthoritativeUsage = true
+					usage.PromptTokens = streamResponse.Response.Usage.InputTokens
+					usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
+					usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
 					if streamResponse.Response.Usage.InputTokensDetails != nil {
 						usage.PromptTokensDetails.CachedTokens = streamResponse.Response.Usage.InputTokensDetails.CachedTokens
 						usage.PromptTokensDetails.CacheWriteTokens = streamResponse.Response.Usage.InputTokensDetails.CacheWriteTokens
@@ -178,12 +166,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// error logs stay observable even when the downstream is already committed
 			// and the turn cannot be safely retried.
 			info.MarkUpstreamFailureResponse()
+			upstreamStatus := responsesStreamErrorStatus(data, streamError)
+			candidate := types.WithOpenAIError(*streamError, upstreamStatus)
+			candidate.UpstreamStatusCode = upstreamStatus
+			candidate.RetryAfter = service.ParseUpstreamRetryDelay(http.Header{}, []byte(data), time.Now())
+			candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
 			if isSubscriptionOAuth {
-				upstreamStatus := responsesStreamErrorStatus(data, streamError)
-				candidate := types.WithOpenAIError(*streamError, upstreamStatus)
-				candidate.UpstreamStatusCode = upstreamStatus
-				candidate.RetryAfter = service.ParseUpstreamRetryDelay(http.Header{}, []byte(data), time.Now())
-				candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
 				if !downstreamCommitted.Load() {
 					// Preflight stage: nothing committed downstream yet, so record any
 					// terminal failure (response.failed / response.error / error) — not
@@ -200,6 +188,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				// first event, so the turn cannot be safely retried; log for visibility
 				// and forward the failure event to the client below.
 				logger.LogError(c, fmt.Sprintf("responses stream terminal failure on non-subscription channel: type=%s message=%s", streamResponse.Type, streamError.Message))
+				sr.Error(candidate)
 			}
 		}
 		if isSubscriptionOAuth && !downstreamCommitted.Load() {
@@ -263,7 +252,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		commitPreflight()
 	}
 
-	if usage.CompletionTokens == 0 {
+	if !hasAuthoritativeUsage && usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量
 		tempStr := responseTextBuilder.String()
 		if len(tempStr) > 0 {
@@ -273,13 +262,30 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	}
 
-	if usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
+	if !hasAuthoritativeUsage && usage.PromptTokens == 0 && usage.CompletionTokens != 0 {
 		usage.PromptTokens = info.GetEstimatePromptTokens()
 	}
 
-	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	if !hasAuthoritativeUsage {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
 
 	return usage, nil
+}
+
+func responsesWrappedError(info *relaycommon.RelayInfo, resp *http.Response, responseBody []byte, upstreamError *types.OpenAIError) *types.NewAPIError {
+	status := resp.StatusCode
+	if status >= 200 && status < 300 {
+		status = responsesStreamErrorStatus(string(responseBody), upstreamError)
+	}
+
+	apiError := types.WithOpenAIError(*upstreamError, status)
+	apiError.UpstreamStatusCode = status
+	apiError.RetryAfter = service.ParseUpstreamRetryDelay(resp.Header, responseBody, time.Now())
+	if info != nil {
+		info.MarkUpstreamFailureResponse()
+	}
+	return apiError
 }
 
 func responsesStreamErrorStatus(data string, streamError *types.OpenAIError) int {

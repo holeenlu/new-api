@@ -35,16 +35,14 @@ func init() {
 
 // StartSystemMonitor 启动系统监控
 func StartSystemMonitor() {
-	go func() {
-		for {
-			config := GetPerformanceMonitorConfig()
-			if !config.Enabled {
-				time.Sleep(30 * time.Second)
-				continue
-			}
+	// 在实例首次上报前生成快照，避免启动阶段显示空指标。
+	updateSystemStatus()
 
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
 			updateSystemStatus()
-			time.Sleep(5 * time.Second)
 		}
 	}()
 }

@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
@@ -174,6 +176,114 @@ func TestResponsesWebSocketSSEWriterMarksSuccessOnlyOnCleanTerminal(t *testing.T
 	}
 }
 
+func TestResponsesWebSocketTerminalDetectionUsesTopLevelType(t *testing.T) {
+	require.True(t, responsesWebSocketPayloadIsTerminal(`{"type":"response.completed"}`))
+	require.True(t, responsesWebSocketPayloadIsCleanTerminal(`{"type": "response.incomplete"}`))
+	require.False(t, responsesWebSocketPayloadIsTerminal(
+		`{"type":"response.output_text.delta","delta":"quoted event: \\"response.completed\\""}`,
+	))
+	require.False(t, responsesWebSocketPayloadIsTerminal(
+		`{"type":"response.output_item.done","response":{"type":"response.failed"}}`,
+	))
+	require.False(t, responsesWebSocketPayloadIsTerminal(`not-json "response.completed"`))
+}
+
+func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNoContent} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			serverErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				defer conn.Close()
+				writer := newResponsesWebSocketSSEWriter(conn)
+				writer.WriteHeader(status)
+				serverErr <- writer.Finish()
+			}))
+
+			url := "ws" + strings.TrimPrefix(server.URL, "http")
+			conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+			require.NoError(t, err)
+			_, frame, err := conn.ReadMessage()
+			require.NoError(t, err)
+			require.JSONEq(t,
+				`{"type":"error","error":{"message":"upstream returned an empty response stream","type":"server_error","code":502}}`,
+				string(frame),
+			)
+			require.NoError(t, <-serverErr)
+			require.NoError(t, conn.Close())
+			server.Close()
+		})
+	}
+}
+
+func TestResponsesWebSocketSSEWriterPreservesStructuredHTTPError(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		writer := newResponsesWebSocketSSEWriter(conn)
+		writer.WriteHeader(http.StatusConflict)
+		_, err = writer.Write([]byte(
+			`{"error":{"message":"credential binding changed","type":"new_api_error","code":"channel:invalid_key"}}`,
+		))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- writer.Finish()
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, frame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"error","error":{"message":"credential binding changed","type":"new_api_error","code":"channel:invalid_key"}}`,
+		string(frame),
+	)
+	require.NoError(t, <-serverErr)
+}
+
+func TestResponsesWebSocketReadPumpCancelsOnDisconnect(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		ctx, cancel := context.WithCancel(r.Context())
+		frames := make(chan responsesWebSocketClientFrame, 1)
+		go readResponsesWebSocketClientFrames(ctx, cancel, conn, frames)
+		select {
+		case <-ctx.Done():
+			serverErr <- nil
+		case <-time.After(2 * time.Second):
+			serverErr <- context.DeadlineExceeded
+		}
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.NoError(t, <-serverErr)
+}
+
 // A turn that chains onto a prior response's server-side state must be detected
 // as stateful so the credential switch is disabled; a self-contained turn must
 // not be, so it stays free to fail over.
@@ -200,11 +310,10 @@ func TestResponsesWebSocketFrameReferencesPriorResponse(t *testing.T) {
 // pending buffer without bound: past the cap Write returns an error and stops.
 func TestResponsesWebSocketSSEWriterBoundsPendingBuffer(t *testing.T) {
 	w := newResponsesWebSocketSSEWriter(nil)
-	chunk := []byte(strings.Repeat("a", 1<<20)) // 1 MiB, no "\n\n"
-	var writeErr error
-	for i := 0; i < 32 && writeErr == nil; i++ {
-		_, writeErr = w.Write(chunk)
-	}
+	w.pending = []byte(strings.Repeat("a", maxResponsesWebSocketPendingBytes))
+	pendingBefore := len(w.pending)
+	_, writeErr := w.Write([]byte("b"))
 	require.Error(t, writeErr)
 	require.Contains(t, writeErr.Error(), "buffer limit")
+	require.Len(t, w.pending, pendingBefore)
 }
