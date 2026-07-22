@@ -6,6 +6,11 @@ fi
 readonly NEW_API_DEPLOY_COMMON_LOADED=1
 readonly DEPLOY_DEFAULT_GOPROXY=https://goproxy.cn,direct
 readonly DEPLOY_DEFAULT_GOPROXY_FALLBACK=https://proxy.golang.org,direct
+# Pinned deployment policy, applied to every target's .env on every deploy.
+# TZ is forced (operators asked for one unified display timezone); the default
+# language is only ensured when absent so a per-target override survives.
+readonly DEPLOY_PINNED_TZ=Asia/Taipei
+readonly DEPLOY_PINNED_DEFAULT_LANGUAGE=zh-CN
 
 deploy_log() {
   printf '[deploy] %s\n' "$*"
@@ -324,20 +329,20 @@ deploy_prepare_env_file() {
   # timestamps are parsed as absolute values (Unix epoch / RFC3339), so this
   # only affects how local times are rendered in client messages and logs.
   timezone_env_file=$(mktemp "${env_file}.XXXXXX")
-  awk '
+  awk -v tz="$DEPLOY_PINNED_TZ" '
     BEGIN { found = 0 }
     /^[[:space:]]*TZ=/ {
-      if (!found) print "TZ=Asia/Taipei"
+      if (!found) print "TZ=" tz
       found = 1
       next
     }
     { print }
-    END { if (!found) print "TZ=Asia/Taipei" }
+    END { if (!found) print "TZ=" tz }
   ' "$env_file" >"$timezone_env_file"
   chmod 600 "$timezone_env_file"
   mv "$timezone_env_file" "$env_file"
 
-  deploy_env_ensure "$env_file" DEFAULT_LANGUAGE zh-CN
+  deploy_env_ensure "$env_file" DEFAULT_LANGUAGE "$DEPLOY_PINNED_DEFAULT_LANGUAGE"
 
   deploy_env_migrate_default "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5 10
   deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 750
@@ -454,6 +459,34 @@ deploy_server_main() {
     scp_remote "$initial_env_file" "$DEPLOY_TARGET:$REMOTE_DIR/.env"
     ssh_remote "$DEPLOY_TARGET" "chmod 600 '$REMOTE_DIR/.env'"
   fi
+  # deploy_prepare_env_file only runs when the remote .env is first created, so
+  # an already-provisioned target would otherwise keep whatever TZ it was
+  # initialized with (e.g. a stale TZ=UTC that silently overrides the compose
+  # ${TZ:-...} default and renders reset times in UTC). Reconcile the pinned
+  # policy on every deploy: force TZ, ensure DEFAULT_LANGUAGE only when absent.
+  # The rewrite is atomic (temp + mv) so a failure never truncates the live .env.
+  ssh_remote "$DEPLOY_TARGET" \
+    "POLICY_TZ='$DEPLOY_PINNED_TZ' POLICY_LANG='$DEPLOY_PINNED_DEFAULT_LANGUAGE' REMOTE_DIR='$REMOTE_DIR' bash -s" \
+    <<'REMOTE_ENV_POLICY_EOF' || deploy_die "Failed to reconcile TZ/DEFAULT_LANGUAGE in $REMOTE_DIR/.env"
+set -Eeuo pipefail
+cd "$REMOTE_DIR"
+[ -f .env ] || exit 0
+reconciled=$(mktemp .env.policy.XXXXXX)
+trap 'rm -f "$reconciled"' EXIT
+awk -v tz="$POLICY_TZ" -v lang="$POLICY_LANG" '
+  BEGIN { have_lang = 0 }
+  /^[[:space:]]*TZ=/ { next }
+  /^[[:space:]]*DEFAULT_LANGUAGE=/ { have_lang = 1 }
+  { print }
+  END {
+    print "TZ=" tz
+    if (!have_lang) print "DEFAULT_LANGUAGE=" lang
+  }
+' .env >"$reconciled"
+chmod 600 "$reconciled"
+mv "$reconciled" .env
+trap - EXIT
+REMOTE_ENV_POLICY_EOF
   ssh_remote "$DEPLOY_TARGET" "mkdir '$remote_lock' 2>/dev/null || { find '$remote_lock' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$remote_lock' && mkdir '$remote_lock'; }" \
     || deploy_die "Another $DEPLOY_NAME deployment is active"
 
