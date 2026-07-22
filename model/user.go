@@ -1233,17 +1233,16 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if err := increaseUserQuota(id, quota); err != nil {
+		return err
+	}
 	gopool.Go(func() {
 		err := cacheIncrUserQuota(id, int64(quota))
 		if err != nil {
 			common.SysLog("failed to increase user quota: " + err.Error())
 		}
 	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
-		return nil
-	}
-	return increaseUserQuota(id, quota)
+	return nil
 }
 
 func increaseUserQuota(id int, quota int) (err error) {
@@ -1258,17 +1257,46 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if err := decreaseUserQuota(id, quota); err != nil {
+		return err
+	}
 	gopool.Go(func() {
 		err := cacheDecrUserQuota(id, int64(quota))
 		if err != nil {
 			common.SysLog("failed to decrease user quota: " + err.Error())
 		}
 	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
+	return nil
+}
+
+// DecreaseUserQuotaIfEnough atomically reserves wallet quota only when the
+// persisted balance can cover the full amount. Wallet quota is an immediate
+// database ledger even when unrelated usage counters are batched, so this row
+// is authoritative across processes.
+func DecreaseUserQuotaIfEnough(id int, quota int) error {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
 		return nil
 	}
-	return decreaseUserQuota(id, quota)
+	result := DB.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("%w: user %d needs %d", ErrInsufficientUserQuota, id, quota)
+	}
+
+	// A strict debit cannot safely apply a delta to a potentially stale cache
+	// snapshot. Remove it so the next request reloads the committed database
+	// balance. Cache failure cannot turn a real charge into an API failure.
+	if err := invalidateUserCache(id); err != nil {
+		common.SysLog("failed to invalidate user quota cache after strict reservation: " + err.Error())
+	}
+	return nil
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
@@ -1313,6 +1341,14 @@ func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
 		return
 	}
 	updateUserUsedQuotaAndRequestCount(id, quota, 1)
+}
+
+func UpdateUserUsedQuota(id int, quota int) {
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
+		return
+	}
+	updateUserUsedQuota(id, quota)
 }
 
 func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {

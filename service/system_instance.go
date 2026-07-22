@@ -88,7 +88,8 @@ func ReportCurrentSystemInstance() error {
 		identity.ManuallyConfigured = false
 		identity.ShouldConfigureManually = true
 	}
-	systemStatus := common.GetSystemStatus()
+	// 实例资源展示独立于性能阈值保护开关，心跳始终采集当前状态。
+	systemStatus := common.CollectSystemStatus()
 	diskInfo := common.GetDiskSpaceInfo()
 	info := SystemInstanceInfo{
 		SchemaVersion: 1,

@@ -16,10 +16,16 @@ var (
 	ErrEmailAmbiguous       = errors.New("email matches multiple users")
 )
 
+// User quota errors
+var (
+	ErrInsufficientUserQuota = errors.New("insufficient user quota")
+)
+
 // Token auth errors
 var (
-	ErrTokenNotProvided = errors.New("token not provided")
-	ErrTokenInvalid     = errors.New("token invalid")
+	ErrTokenNotProvided       = errors.New("token not provided")
+	ErrTokenInvalid           = errors.New("token invalid")
+	ErrInsufficientTokenQuota = errors.New("insufficient token quota")
 )
 
 // Redemption errors

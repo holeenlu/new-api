@@ -49,6 +49,45 @@ func TestNewPrivacyFilteredPassThroughJSONBodyFiltersNormalizedSensitiveKeys(t *
 	require.JSONEq(t, `{"metadata":{"keep":"value"}}`, string(output))
 }
 
+func TestPreparedOutboundJSONSharesPrivacyFilteredBytesWithTransport(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeStrip))
+
+	prepared, err := PrepareOutboundJSON([]byte(
+		`{"model":"gpt-5","metadata":{"city":"Shanghai","keep":"value"}}`,
+	))
+	require.NoError(t, err)
+	require.JSONEq(t, `{"model":"gpt-5","metadata":{"keep":"value"}}`, string(prepared.Bytes()))
+
+	body, size, closer, err := prepared.NewBody()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, closer.Close()) })
+	transportBytes, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(prepared.Bytes())), size)
+	require.Equal(t, prepared.Bytes(), transportBytes)
+}
+
+func TestPreparedOutboundJSONCannotBeMutatedThroughInputOrInspectionBytes(t *testing.T) {
+	restoreLocationSettings(t)
+	require.NoError(t, rootcommon.SetUpstreamLocationMode(rootcommon.UpstreamLocationModeClient))
+
+	input := []byte(`{"model":"gpt-5","input":"hello"}`)
+	prepared, err := PrepareOutboundJSON(input)
+	require.NoError(t, err)
+
+	input[2] = 'X'
+	inspection := prepared.Bytes()
+	inspection[2] = 'Y'
+
+	body, _, closer, err := prepared.NewBody()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, closer.Close()) })
+	transportBytes, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"model":"gpt-5","input":"hello"}`, string(transportBytes))
+}
+
 func TestNewPrivacyFilteredPassThroughJSONBodySkipsMaterializingLargeSafeRequest(t *testing.T) {
 	restoreLocationSettings(t)
 	storage := newTrackingBodyStorage([]byte(`{"model":"gpt-5","metadata":{"request_kind":"turn"},"input":"` + strings.Repeat("x", 2*1024*1024) + `"}`))

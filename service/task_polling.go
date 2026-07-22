@@ -44,7 +44,8 @@ const (
 
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
-// 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
+// 使用带 submit-time lease generation 的 per-task CAS，防止覆盖被正常
+// 轮询推进或刚由提交重试续租的任务。
 func sweepTimedOutTasks(ctx context.Context) {
 	if constant.TaskTimeoutMinutes <= 0 {
 		return
@@ -64,6 +65,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
+		expectedSubmitTime := task.SubmitTime
 		task.Status = model.TaskStatusFailure
 		task.Progress = "100%"
 		task.FinishTime = now
@@ -75,7 +77,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.FailReason = reason
 		}
 
-		won, err := task.UpdateWithStatus(oldStatus)
+		won, err := task.UpdateTimedOutWithStatus(oldStatus, expectedSubmitTime)
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
 			continue
@@ -106,28 +108,8 @@ func sweepUnrefundedFailedTasks(ctx context.Context) {
 			return
 		}
 
-		quota := task.Quota
-		claimed, err := model.ClaimQuotaForRefund(task.ID, quota)
-		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("sweepUnrefundedFailedTasks claim error for task %s: %v", task.TaskID, err))
-			continue
-		}
-		if !claimed {
-			logger.LogDebug(ctx, "sweepUnrefundedFailedTasks: task %s claim lost, skip refund", task.TaskID)
-			continue
-		}
-
-		// 对账先清 marker 再退款，确保并发 sweep 只有一个实际退款者。若进程在
-		// claim 后、退款前崩溃，会偏向漏退而不是双退，需由人工账务对账兜底。
-		if RefundTaskQuota(ctx, task, task.FailReason) {
-			continue
-		}
-
-		restored, restoreErr := model.RestoreQuotaAfterFailedRefund(task.ID, quota)
-		if restoreErr != nil {
-			logger.LogError(ctx, fmt.Sprintf("sweepUnrefundedFailedTasks restore quota error for task %s: %v", task.TaskID, restoreErr))
-		} else if !restored {
-			logger.LogError(ctx, fmt.Sprintf("sweepUnrefundedFailedTasks could not restore quota marker for task %s", task.TaskID))
+		if !RefundTaskQuota(ctx, task, task.FailReason) {
+			logger.LogWarn(ctx, fmt.Sprintf("sweepUnrefundedFailedTasks refund remains pending for task %s", task.TaskID))
 		}
 	}
 }

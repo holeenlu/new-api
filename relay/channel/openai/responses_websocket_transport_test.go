@@ -163,6 +163,160 @@ func TestResponsesWebSocketStreamHandlerPreservesConnectionAfterCleanTerminal(t 
 	require.Equal(t, int32(2), requestCount.Load())
 }
 
+func TestResponsesWebSocketOpenAIAdaptorKeepsLiveOwnerWhenFlagIsDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var connectionCount atomic.Int32
+	var websocketRequestCount atomic.Int32
+	var httpRequestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			httpRequestCount.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_http","object":"response"}`))
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		connectionCount.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn := websocketRequestCount.Add(1)
+			payload := `{"type":"response.completed","response":{"id":"resp_` +
+				fmt.Sprint(turn) + `","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	session := &responsesws.Session{}
+	defer session.Close()
+	for index, enabled := range []bool{true, false} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		responsesws.SetSession(c, session)
+		info := &relaycommon.RelayInfo{
+			IsStream:       true,
+			RelayMode:      relayconstant.RelayModeResponses,
+			RequestURLPath: "/v1/responses",
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:            990006,
+				ChannelType:          constant.ChannelTypeOpenAI,
+				ChannelBaseUrl:       server.URL,
+				ApiKey:               "test-key",
+				UpstreamModelName:    "gpt-5",
+				ChannelSetting:       dto.ChannelSettings{},
+				ChannelOtherSettings: dto.ChannelOtherSettings{ResponsesWebSocketEnabled: enabled},
+			},
+		}
+
+		respAny, err := (&Adaptor{}).DoRequest(
+			c,
+			info,
+			strings.NewReader(fmt.Sprintf(`{"model":"gpt-5","input":"turn-%d","stream":true}`, index+1)),
+		)
+		require.NoError(t, err)
+		resp, ok := respAny.(*http.Response)
+		require.True(t, ok)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Contains(t, string(body), "response.completed")
+		require.True(t, session.HasLiveConnection())
+	}
+
+	require.Equal(t, int32(1), connectionCount.Load())
+	require.Equal(t, int32(2), websocketRequestCount.Load())
+	require.Zero(t, httpRequestCount.Load())
+}
+
+func TestResponsesWebSocketOpenAIAdaptorKeepsBoundSessionOnHTTPAfterSocketLoss(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var connectionCount atomic.Int32
+	var websocketRequestCount atomic.Int32
+	var httpRequestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			httpRequestCount.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_http","object":"response"}`))
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connectionCount.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			websocketRequestCount.Add(1)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(
+				`{"type":"response.completed","response":{"id":"resp_ws"}}`,
+			)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	session := &responsesws.Session{}
+	defer session.Close()
+	doTurn := func(enabled bool, input string) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		responsesws.SetSession(c, session)
+		info := &relaycommon.RelayInfo{
+			RelayMode:      relayconstant.RelayModeResponses,
+			RequestURLPath: "/v1/responses",
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:            990007,
+				ChannelType:          constant.ChannelTypeOpenAI,
+				ChannelBaseUrl:       server.URL,
+				ApiKey:               "test-key",
+				UpstreamModelName:    "gpt-5",
+				ChannelOtherSettings: dto.ChannelOtherSettings{ResponsesWebSocketEnabled: enabled},
+			},
+		}
+		responseAny, err := (&Adaptor{}).DoRequest(
+			c,
+			info,
+			strings.NewReader(`{"model":"gpt-5","input":"`+input+`"}`),
+		)
+		require.NoError(t, err)
+		response, ok := responseAny.(*http.Response)
+		require.True(t, ok)
+		_, err = io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+
+	doTurn(true, "websocket")
+	require.NoError(t, session.Close())
+	doTurn(false, "http-after-loss")
+	doTurn(true, "still-http")
+
+	require.Equal(t, int32(1), connectionCount.Load())
+	require.Equal(t, int32(1), websocketRequestCount.Load())
+	require.Equal(t, int32(2), httpRequestCount.Load())
+}
+
 // A response.incomplete event (e.g. max output tokens or a content filter) is a
 // clean terminal state. The session must stop the read loop and close the SSE
 // stream even though the persistent upstream keeps the connection open afterward;
@@ -235,9 +389,15 @@ func TestResponsesWebSocketOpenAIAdaptorSkipsWebSocketWithoutFlag(t *testing.T) 
 	gin.SetMode(gin.TestMode)
 	service.InitHttpClient()
 
-	var upgradeAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upgradeAttempts++
+	var upgradeAttempts atomic.Int32
+	var httpCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			upgradeAttempts.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		httpCalls.Add(1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response"}`))
 	}))
@@ -271,6 +431,8 @@ func TestResponsesWebSocketOpenAIAdaptorSkipsWebSocketWithoutFlag(t *testing.T) 
 	require.True(t, ok)
 	require.NoError(t, resp.Body.Close())
 	// Zero WebSocket upgrades: the plain HTTP handler served the request.
+	require.Zero(t, upgradeAttempts.Load())
+	require.Equal(t, int32(1), httpCalls.Load())
 	require.Zero(t, session.ChannelID())
 }
 

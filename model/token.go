@@ -244,7 +244,12 @@ func ValidateUserToken(key string) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
-	token, err = GetTokenByKey(key, false)
+	// Authentication must not be authorized by a disposable token snapshot.
+	// In particular, an older cache write can race a quota debit or status
+	// change and temporarily republish an enabled/non-exhausted token. Billing
+	// reservations are database-backed as well, so read the same authoritative
+	// row before admitting the request.
+	token, err = GetTokenByKeyForAuthorization(key)
 	if err == nil {
 		if token.Status == common.TokenStatusExhausted ||
 			token.Status == common.TokenStatusExpired ||
@@ -280,6 +285,16 @@ func ValidateUserToken(key string) (token *Token, err error) {
 	return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
 }
 
+// GetTokenByKeyForAuthorization reads the persisted token without publishing a
+// cache snapshot. Security-sensitive admission uses this boundary so a stale
+// cache cannot authorize a request and every request does not perform a Redis
+// write merely to confirm the database result.
+func GetTokenByKeyForAuthorization(key string) (*Token, error) {
+	var token Token
+	err := DB.Where(map[string]interface{}{"key": key}).First(&token).Error
+	return &token, err
+}
+
 func GetTokenByIds(id int, userId int) (*Token, error) {
 	if id == 0 || userId == 0 {
 		return nil, errors.New("id 或 userId 为空！")
@@ -298,36 +313,34 @@ func GetTokenById(id int) (*Token, error) {
 	var err error = nil
 	err = DB.First(&token, "id = ?", id).Error
 	if shouldUpdateRedis(true, err) {
-		gopool.Go(func() {
-			if err := cacheSetToken(token); err != nil {
-				common.SysLog("failed to update user status cache: " + err.Error())
-			}
-		})
+		if err := cacheSetToken(token); err != nil {
+			common.SysLog("failed to update token cache: " + err.Error())
+		}
 	}
 	return &token, err
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	defer func() {
-		// Update Redis cache asynchronously on successful DB read
+		// Publish a successful DB read before returning. The cache is a best-effort
+		// identity snapshot; billing debit authorization remains database-backed.
 		if shouldUpdateRedis(fromDB, err) && token != nil {
-			gopool.Go(func() {
-				if err := cacheSetToken(*token); err != nil {
-					common.SysLog("failed to update user status cache: " + err.Error())
-				}
-			})
+			if cacheErr := cacheSetToken(*token); cacheErr != nil {
+				common.SysLog("failed to update token cache: " + cacheErr.Error())
+			}
 		}
 	}()
 	if !fromDB && common.RedisEnabled {
 		// Try Redis first
-		token, err := cacheGetTokenByKey(key)
+		token, err = cacheGetTokenByKey(key)
 		if err == nil {
 			return token, nil
 		}
-		// Don't return error - fall through to DB
+		// Redis is only an identity lookup cache. Token billing is authorized by a
+		// database debit, so a miss can safely fall back to the persisted record.
 	}
 	fromDB = true
-	err = DB.Where(commonKeyCol+" = ?", key).First(&token).Error
+	err = DB.Where(map[string]interface{}{"key": key}).First(&token).Error
 	return token, err
 }
 
@@ -341,12 +354,9 @@ func (token *Token) Insert() error {
 func (token *Token) Update() (err error) {
 	defer func() {
 		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
-				}
-			})
+			if cacheErr := cacheSetToken(*token); cacheErr != nil {
+				common.SysLog("failed to update token cache: " + cacheErr.Error())
+			}
 		}
 	}()
 	err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
@@ -357,12 +367,9 @@ func (token *Token) Update() (err error) {
 func (token *Token) SelectUpdate() (err error) {
 	defer func() {
 		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
-				}
-			})
+			if cacheErr := cacheSetToken(*token); cacheErr != nil {
+				common.SysLog("failed to update token cache: " + cacheErr.Error())
+			}
 		}
 	}()
 	// This can update zero values
@@ -372,12 +379,9 @@ func (token *Token) SelectUpdate() (err error) {
 func (token *Token) Delete() (err error) {
 	defer func() {
 		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheDeleteToken(token.Key)
-				if err != nil {
-					common.SysLog("failed to delete token cache: " + err.Error())
-				}
-			})
+			if cacheErr := cacheDeleteToken(token.Key); cacheErr != nil {
+				common.SysLog("failed to delete token cache: " + cacheErr.Error())
+			}
 		}
 	}()
 	err = DB.Delete(token).Error
@@ -427,64 +431,103 @@ func DeleteTokenById(id int, userId int) (err error) {
 	return token.Delete()
 }
 
-func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
+// RestoreTokenQuota reverses a token debit and synchronously
+// invalidates its cache. Token quota never participates in the batch updater,
+// so rollback always uses the same authoritative row.
+func RestoreTokenQuota(tokenId int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheIncrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to increase token quota: " + err.Error())
-			}
-		})
-	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
+	if quota == 0 {
 		return nil
 	}
-	return increaseTokenQuota(tokenId, quota)
-}
-
-func increaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
+	result := DB.Model(&Token{}).Where("id = ?", tokenId).Updates(
 		map[string]interface{}{
 			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota - ?", quota),
 			"accessed_time": common.GetTimestamp(),
 		},
-	).Error
-	return err
+	)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("token %d quota restore updated %d rows", tokenId, result.RowsAffected)
+	}
+	if common.RedisEnabled {
+		if err := cacheDeleteToken(key); err != nil {
+			common.SysLog("failed to invalidate token cache after token quota restore: " + err.Error())
+		}
+	}
+	return nil
 }
 
-func DecreaseTokenQuota(id int, key string, quota int) (err error) {
+// ReserveTokenQuota atomically reserves a token debit before upstream usage. A
+// limited token is updated only when its persisted balance covers the full
+// amount; an unlimited token is not availability-constrained. Billing debit
+// authorization never depends on the token identity cache.
+func ReserveTokenQuota(id int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheDecrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to decrease token quota: " + err.Error())
-			}
-		})
-	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
+	if quota == 0 {
 		return nil
 	}
-	return decreaseTokenQuota(id, quota)
+	result := DB.Model(&Token{}).
+		Where("id = ? AND (unlimited_quota = ? OR remain_quota >= ?)", id, true, quota).
+		Updates(map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
+			"used_quota":    gorm.Expr("used_quota + ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("%w: token %d needs %d", ErrInsufficientTokenQuota, id, quota)
+	}
+
+	// Synchronous invalidation keeps authentication and display state close to
+	// the authoritative row. Billing debit authorization never depends on this
+	// cache.
+	if common.RedisEnabled {
+		if err := cacheDeleteToken(key); err != nil {
+			common.SysLog("failed to invalidate token cache after conditional debit: " + err.Error())
+		}
+	}
+	return nil
 }
 
-func decreaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
+// ConsumeTokenQuota records usage that has already happened. Unlike a
+// reservation, committed reconciliation must not disappear merely because a
+// limited token no longer covers the positive delta: retaining the debt is the
+// only accurate ledger state after the upstream has served the request.
+func ConsumeTokenQuota(id int, key string, quota int) error {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+	result := DB.Model(&Token{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"accessed_time": common.GetTimestamp(),
 		},
-	).Error
-	return err
+	)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("token %d committed debit updated %d rows", id, result.RowsAffected)
+	}
+	if common.RedisEnabled {
+		if err := cacheDeleteToken(key); err != nil {
+			common.SysLog("failed to invalidate token cache after committed debit: " + err.Error())
+		}
+	}
+	return nil
 }
 
 // CountUserTokens returns total number of tokens for the given user, used for pagination

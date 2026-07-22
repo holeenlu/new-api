@@ -12,6 +12,7 @@ The customized branch adds or changes the following coherent domains:
 | Model administration | `controller/channel_*`, `model/channel_*metadata.go` | Per-channel catalogues, model capability metadata, upstream model checks, and multi-key management |
 | Privacy and disclosure | `common/upstream_location.go`, `relay/common/location_privacy.go` | Network-profile discovery, client location filtering, and controlled response disclosure |
 | Pricing and options | `controller/option.go`, `controller/ratio_sync.go`, `controller/official_api_price_catalog.go`, `model/option.go`, model-pricing UI | Validated transactional model-price saves, configurable completion ratios, and reviewed official API pricing sources |
+| Billing lifecycle | `service/billing_session.go`, `relay/responses_handler.go`, `relay/channel/openai/relay_realtime.go`, `model/task.go` | Final-payload reservation, progressive Realtime reservation with one settlement, and atomic idempotent task settlement/refund |
 | Deployment | `bin/deploy-*.sh`, Compose/Caddy files, Dockerfiles | Per-target artifacts, checksummed transfer, backup, rollback, and endpoint verification |
 | Default frontend | `web/default/src/features/channels`, `features/system-settings`, `lib` | OAuth configuration, channel governance, operational privacy, routing reliability, and localized errors |
 
@@ -37,6 +38,22 @@ feature description.
 - The Gin request state and retry tracker share one attempt object, so lease
   generation, recovery-probe, and response-scope metadata are no longer copied
   between independent records.
+- Responses compact now reserves from its provider-ready payload; an earlier
+  trusted-wallet bypass cannot leave that final target unfunded. Supplemental
+  wallet quota is conditionally reserved against the synchronous,
+  database-authoritative ledger even while used-quota, request-count, and
+  channel-used-quota statistics are batched.
+- Legacy OpenAI Realtime uses progressive cumulative reservations but delegates
+  the connection's actual consumption and log to one final settlement.
+- Asynchronous tasks persist a non-pollable `PENDING_SUBMIT` marker before the
+  upstream write. Accepted settlement, successful completion recalculation, and
+  failed-task refund share its exact funding/token snapshot as the single task
+  ledger owner. Settlement returns its locked-reservation delta and a `changed`
+  flag; secondary accounting uses that delta, and only a changed caller may
+  write the task billing log and user/request/channel statistics. Same-target
+  stale, duplicate, and concurrent pollers therefore cannot repeat those
+  effects. Each ledger transition uses one main-database transaction, and marker
+  insertion failure cannot leave an accepted untracked task.
 
 ## Current release decision
 
@@ -62,6 +79,14 @@ feature description.
    streaming state, and billing state.
 4. Replace duplicated routing-reliability defaults, form types, and normalized
    payload types with a schema-derived normalized payload.
+5. Replace the process-local `BillingSession.Refund` guard with a durable refund
+   intent and idempotency contract owned by the persistence layer. Today the
+   session marks itself refunded before asynchronously restoring funding and
+   token quota in sequence; a process exit can lose the work, and a partial
+   failure is only logged with no safe cross-process retry key. Any durable
+   design must define atomic state transitions for both ledger legs, tolerate
+   worker retries, and preserve the current no-refund-after-settlement rule in an
+   ADR before claiming crash-safe or exactly-once refunds.
 
 ## Change review protocol
 

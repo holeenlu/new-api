@@ -1,12 +1,17 @@
 package model
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -21,6 +26,12 @@ type Option struct {
 	Value string `json:"value"`
 }
 
+// optionSyncMutex keeps the database Option snapshot and its in-memory
+// publication in the same order. Without one boundary, a periodic sync can
+// read an old snapshot, wait for an administrator update to commit and publish,
+// then overwrite the runtime state with the stale snapshot.
+var optionSyncMutex sync.Mutex
+
 func AllOption() ([]*Option, error) {
 	var options []*Option
 	var err error
@@ -29,6 +40,9 @@ func AllOption() ([]*Option, error) {
 }
 
 func InitOptionMap() {
+	optionSyncMutex.Lock()
+	defer optionSyncMutex.Unlock()
+
 	common.OptionMapRWMutex.Lock()
 	common.OptionMap = make(map[string]string)
 
@@ -184,17 +198,32 @@ func InitOptionMap() {
 	common.OptionMap["UpstreamLocationMode"] = common.GetUpstreamLocationMode()
 
 	// 自动添加所有注册的模型配置
-	modelConfigs := config.GlobalConfig.ExportAllConfigs()
-	for k, v := range modelConfigs {
-		common.OptionMap[k] = v
+	modelConfigs, err := config.GlobalConfig.ExportAllConfigsChecked()
+	if err != nil {
+		common.SysError("failed to initialize registered configs: " + err.Error())
+	} else {
+		for k, v := range modelConfigs {
+			common.OptionMap[k] = v
+		}
 	}
 
 	common.OptionMapRWMutex.Unlock()
-	loadOptionsFromDatabase()
+	loadOptionsFromDatabaseLocked()
 }
 
 func loadOptionsFromDatabase() {
-	options, _ := AllOption()
+	optionSyncMutex.Lock()
+	defer optionSyncMutex.Unlock()
+	loadOptionsFromDatabaseLocked()
+}
+
+func loadOptionsFromDatabaseLocked() {
+	options, err := AllOption()
+	if err != nil {
+		common.SysLog("failed to load options from database: " + err.Error())
+		return
+	}
+	values := make(map[string]string, len(options))
 	for _, option := range options {
 		if option.Key == "AutomaticRetryStatusCodes" {
 			normalized, err := operation_setting.NormalizeAutomaticRetryStatusCodes(option.Value)
@@ -211,10 +240,10 @@ func loadOptionsFromDatabase() {
 				option.Value = normalized
 			}
 		}
-		err := updateOptionMap(option.Key, option.Value)
-		if err != nil {
-			common.SysLog("failed to update option map: " + err.Error())
-		}
+		values[option.Key] = option.Value
+	}
+	if err := updateOptionMapsFromDatabase(values); err != nil {
+		common.SysLog("failed to update option map: " + err.Error())
 	}
 }
 
@@ -231,14 +260,17 @@ func UpdateOption(key string, value string) error {
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
-// transaction, then dispatches them through updateOptionMap in one pass. If
-// any DB write fails the whole transaction rolls back and no in-memory state
-// is touched — safe for callers that must commit a set of related options
-// atomically (e.g. payment gateway binding).
+// transaction, then publishes each registered configuration module in one
+// update. If any DB write fails the whole transaction rolls back and no
+// in-memory state is touched — safe for callers that must commit a set of
+// related options atomically (e.g. payment gateway binding).
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	optionSyncMutex.Lock()
+	defer optionSyncMutex.Unlock()
+
 	normalizedValues := make(map[string]string, len(values))
 	for key, value := range values {
 		if key == "AutomaticRetryStatusCodes" {
@@ -248,12 +280,14 @@ func UpdateOptionsBulk(values map[string]string) error {
 			}
 			value = normalized
 		}
-		if err := validateOptionValue(key, value); err != nil {
-			return err
-		}
 		normalizedValues[key] = value
 	}
 	values = normalizedValues
+
+	if err := validateOptionMaps(values); err != nil {
+		return err
+	}
+
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
 			option := Option{Key: k}
@@ -270,30 +304,188 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range values {
-		if err := updateOptionMap(k, v); err != nil {
-			return err
+	return updateOptionMaps(values)
+}
+
+type registeredConfigUpdate struct {
+	target  interface{}
+	fields  map[string]string
+	options map[string]string
+}
+
+func groupRegisteredConfigUpdates(values map[string]string) (map[string]*registeredConfigUpdate, map[string]struct{}) {
+	updates := make(map[string]*registeredConfigUpdate)
+	groupedKeys := make(map[string]struct{})
+	for key, value := range values {
+		parts := strings.SplitN(key, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		cfg := config.GlobalConfig.Get(parts[0])
+		if cfg == nil {
+			continue
+		}
+		update := updates[parts[0]]
+		if update == nil {
+			update = &registeredConfigUpdate{
+				target:  cfg,
+				fields:  make(map[string]string),
+				options: make(map[string]string),
+			}
+			updates[parts[0]] = update
+		}
+		update.fields[parts[1]] = value
+		update.options[key] = value
+		groupedKeys[key] = struct{}{}
+	}
+	return updates, groupedKeys
+}
+
+// updateOptionMaps applies a database option snapshot to runtime state. Fields
+// belonging to one registered module are validated and published together so
+// AtomicConfig readers cannot observe a mixed multi-field snapshot.
+func updateOptionMaps(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if err := validateOptionMaps(values); err != nil {
+		return err
+	}
+
+	registeredUpdates, groupedKeys := groupRegisteredConfigUpdates(values)
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+
+	// Apply standalone compatibility options first. A registered successor key
+	// in the same database snapshot is the canonical source and publishes below,
+	// so a retired bridge such as DisplayInCurrencyEnabled cannot overwrite it.
+	standaloneKeys := make([]string, 0, len(values)-len(groupedKeys))
+	for key := range values {
+		if _, grouped := groupedKeys[key]; grouped {
+			continue
+		}
+		standaloneKeys = append(standaloneKeys, key)
+	}
+	sort.Strings(standaloneKeys)
+	for _, key := range standaloneKeys {
+		value := values[key]
+		if err := updateOptionMapLocked(key, value); err != nil {
+			return fmt.Errorf("update option %s after successful validation: %w", key, err)
 		}
 	}
+	registeredNames := make([]string, 0, len(registeredUpdates))
+	for name := range registeredUpdates {
+		registeredNames = append(registeredNames, name)
+	}
+	sort.Strings(registeredNames)
+	for _, name := range registeredNames {
+		update := registeredUpdates[name]
+		err := config.UpdateConfigFromMap(update.target, update.fields)
+		if err == nil {
+			for key, value := range update.options {
+				common.OptionMap[key] = value
+			}
+			postProcessConfigUpdate(name)
+		}
+		if err != nil {
+			return fmt.Errorf("update %s configuration after successful validation: %w", name, err)
+		}
+	}
+
 	return nil
+}
+
+// updateOptionMapsFromDatabase restores the historical fault isolation of the
+// periodic database sync. A malformed option must not prevent unrelated valid
+// options from loading, while all fields belonging to one registered module
+// are still validated and published as a unit.
+func updateOptionMapsFromDatabase(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+
+	registeredUpdates, groupedKeys := groupRegisteredConfigUpdates(values)
+	standaloneKeys := make([]string, 0, len(values)-len(groupedKeys))
+	for key := range values {
+		if _, grouped := groupedKeys[key]; !grouped {
+			standaloneKeys = append(standaloneKeys, key)
+		}
+	}
+	sort.Strings(standaloneKeys)
+
+	registeredNames := make([]string, 0, len(registeredUpdates))
+	for name := range registeredUpdates {
+		registeredNames = append(registeredNames, name)
+	}
+	sort.Strings(registeredNames)
+
+	var updateErrors []error
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+
+	// Compatibility options run first so a valid registered successor remains
+	// canonical when both forms exist in the same database snapshot.
+	for _, key := range standaloneKeys {
+		value := values[key]
+		if err := validateOptionValue(key, value); err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("validate option %s: %w", key, err))
+			continue
+		}
+		if err := updateOptionMapLocked(key, value); err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("update option %s: %w", key, err))
+		}
+	}
+
+	for _, name := range registeredNames {
+		update := registeredUpdates[name]
+		if err := config.ValidateConfigUpdate(update.target, update.fields); err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("validate %s configuration: %w", name, err))
+			continue
+		}
+		if err := config.UpdateConfigFromMap(update.target, update.fields); err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("update %s configuration: %w", name, err))
+			continue
+		}
+		for key, value := range update.options {
+			common.OptionMap[key] = value
+		}
+		postProcessConfigUpdate(name)
+	}
+
+	return errors.Join(updateErrors...)
 }
 
 func updateOptionMap(key string, value string) (err error) {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
-	if key == retiredThemeOptionKey {
-		common.OptionMapRWMutex.Lock()
-		delete(common.OptionMap, key)
-		common.OptionMapRWMutex.Unlock()
-		return nil
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) == 2 {
+		if cfg := config.GlobalConfig.Get(parts[0]); cfg != nil {
+			if err := config.ValidateConfigUpdate(cfg, map[string]string{parts[1]: value}); err != nil {
+				return fmt.Errorf("validate %s configuration: %w", parts[0], err)
+			}
+		}
 	}
+
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
-	common.OptionMap[key] = value
+	return updateOptionMapLocked(key, value)
+}
+
+func updateOptionMapLocked(key string, value string) (err error) {
+	if key == retiredThemeOptionKey {
+		delete(common.OptionMap, key)
+		return nil
+	}
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
-	if handleConfigUpdate(key, value) {
+	handled, err := handleConfigUpdate(key, value)
+	if err != nil {
+		return err
+	}
+	common.OptionMap[key] = value
+	if handled {
 		return nil // 已由配置系统处理
 	}
 
@@ -350,8 +542,11 @@ func updateOptionMap(key string, value string) (err error) {
 				newVal = "TOKENS"
 			}
 			if cfg := config.GlobalConfig.Get("general_setting"); cfg != nil {
-				_ = config.UpdateConfigFromMap(cfg, map[string]string{"quota_display_type": newVal})
+				if err = config.UpdateConfigFromMap(cfg, map[string]string{"quota_display_type": newVal}); err != nil {
+					return err
+				}
 			}
+			common.OptionMap["general_setting.quota_display_type"] = newVal
 		case "DisplayTokenStatEnabled":
 			common.DisplayTokenStatEnabled = boolValue
 		case "DrawingEnabled":
@@ -620,8 +815,102 @@ func updateOptionMap(key string, value string) (err error) {
 	return err
 }
 
+func validateOptionMaps(values map[string]string) error {
+	var validationErrors []error
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := values[key]
+		if err := validateOptionValue(key, value); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("validate option %s: %w", key, err))
+		}
+	}
+
+	registeredUpdates, _ := groupRegisteredConfigUpdates(values)
+	registeredNames := make([]string, 0, len(registeredUpdates))
+	for name := range registeredUpdates {
+		registeredNames = append(registeredNames, name)
+	}
+	sort.Strings(registeredNames)
+	for _, name := range registeredNames {
+		update := registeredUpdates[name]
+		if err := config.ValidateConfigUpdate(update.target, update.fields); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("validate %s configuration: %w", name, err))
+		}
+	}
+	return errors.Join(validationErrors...)
+}
+
 func validateOptionValue(key string, value string) error {
+	if strings.HasSuffix(key, "Permission") {
+		if _, err := strconv.Atoi(value); err != nil {
+			return fmt.Errorf("%s must be an integer: %w", key, err)
+		}
+	}
+	if strings.HasSuffix(key, "Enabled") || key == "DefaultCollapseSidebar" ||
+		key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" ||
+		key == "SMTPInsecureSkipVerify" || key == "CreemTestMode" || key == "WaffoSandbox" {
+		if value != "true" && value != "false" {
+			return fmt.Errorf("%s must be true or false", key)
+		}
+	}
+
 	switch key {
+	case "Chats", "PayMethods":
+		var parsed []map[string]string
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "AutoGroups":
+		var parsed []string
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "TopupGroupRatio", "ModelRatio", "CompletionRatio", "ModelPrice", "CacheRatio",
+		"CreateCacheRatio", "ImageRatio", "AudioRatio", "AudioCompletionRatio":
+		var parsed map[string]float64
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "GroupRatio":
+		return ratio_setting.CheckGroupRatio(value)
+	case "GroupGroupRatio":
+		var parsed map[string]map[string]float64
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "UserUsableGroups":
+		var parsed map[string]string
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "ModelRequestRateLimitGroup":
+		return setting.CheckModelRequestRateLimitGroup(value)
+	case "AutomaticDisableStatusCodes", "AutomaticRetryStatusCodes":
+		_, err := operation_setting.ParseHTTPStatusCodeRanges(value)
+		return err
+	case "WaffoPayMethods":
+		var parsed []constant.WaffoPayMethod
+		if err := common.Unmarshal([]byte(value), &parsed); err != nil {
+			return err
+		}
+	case "SMTPPort", "MinTopUp", "StripeMinTopUp", "WaffoMinTopUp", "WaffoPancakeMinTopUp",
+		"LinuxDOMinimumTrustLevel", "QuotaForNewUser", "QuotaForInviter", "QuotaForInvitee",
+		"QuotaRemindThreshold", "PreConsumedQuota", "ModelRequestRateLimitCount",
+		"ModelRequestRateLimitDurationMinutes", "ModelRequestRateLimitSuccessCount", "RetryTimes",
+		"DataExportInterval", "StreamCacheQueueLength":
+		if _, err := strconv.Atoi(value); err != nil {
+			return fmt.Errorf("%s must be an integer: %w", key, err)
+		}
+	case "Price", "USDExchangeRate", "StripeUnitPrice", "WaffoUnitPrice", "WaffoPancakeUnitPrice",
+		"ChannelDisableThreshold", "QuotaPerUnit":
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return fmt.Errorf("%s must be a finite number", key)
+		}
 	case "UpstreamLocationMode":
 		return common.ValidateUpstreamLocationMode(value)
 	case "SubscriptionOAuthUpstreamRetryTimes", "SubscriptionOAuthCapacityCycleTimes":
@@ -643,10 +932,10 @@ func validateOptionValue(key string, value string) error {
 }
 
 // handleConfigUpdate 处理分层配置更新，返回是否已处理
-func handleConfigUpdate(key, value string) bool {
+func handleConfigUpdate(key, value string) (bool, error) {
 	parts := strings.SplitN(key, ".", 2)
 	if len(parts) != 2 {
-		return false // 不是分层配置
+		return false, nil // 不是分层配置
 	}
 
 	configName := parts[0]
@@ -655,16 +944,22 @@ func handleConfigUpdate(key, value string) bool {
 	// 获取配置对象
 	cfg := config.GlobalConfig.Get(configName)
 	if cfg == nil {
-		return false // 未注册的配置
+		return false, nil // 未注册的配置
 	}
 
 	// 更新配置
 	configMap := map[string]string{
 		configKey: value,
 	}
-	config.UpdateConfigFromMap(cfg, configMap)
+	if err := config.UpdateConfigFromMap(cfg, configMap); err != nil {
+		return true, fmt.Errorf("update %s configuration: %w", configName, err)
+	}
 
-	// 特定配置的后处理
+	postProcessConfigUpdate(configName)
+	return true, nil // 已处理
+}
+
+func postProcessConfigUpdate(configName string) {
 	if configName == "performance_setting" {
 		performance_setting.UpdateAndSync()
 	} else if configName == "tool_price_setting" {
@@ -673,6 +968,4 @@ func handleConfigUpdate(key, value string) bool {
 		InvalidatePricingCache()
 		ratio_setting.InvalidateExposedDataCache()
 	}
-
-	return true // 已处理
 }

@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -1406,7 +1407,7 @@ func RefundSubscriptionPreConsume(requestId string) error {
 			record.Status = "refunded"
 			return tx.Save(&record).Error
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
+		if err := postConsumeUserSubscriptionDeltaTx(tx, record.UserSubscriptionId, -record.PreConsumed); err != nil {
 			return err
 		}
 		record.Status = "refunded"
@@ -1496,29 +1497,90 @@ func GetSubscriptionPlanInfoByUserSubscriptionId(userSubscriptionId int) (*Subsc
 	return info, nil
 }
 
-// Update subscription used amount by delta (positive consume more, negative refund).
-func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error {
+func checkedSubscriptionAmountUsedDelta(amountUsed int64, delta int64) (int64, error) {
+	if delta > 0 && amountUsed > math.MaxInt64-delta {
+		return 0, fmt.Errorf("subscription usage overflow, used=%d delta=%d", amountUsed, delta)
+	}
+	if delta < 0 && amountUsed < math.MinInt64-delta {
+		return 0, fmt.Errorf("subscription usage underflow, used=%d delta=%d", amountUsed, delta)
+	}
+	return amountUsed + delta, nil
+}
+
+func postConsumeUserSubscriptionDeltaTx(tx *gorm.DB, userSubscriptionId int, delta int64) error {
+	if tx == nil {
+		return errors.New("invalid transaction")
+	}
 	if userSubscriptionId <= 0 {
 		return errors.New("invalid userSubscriptionId")
 	}
 	if delta == 0 {
 		return nil
 	}
+	var sub UserSubscription
+	if err := lockForUpdate(tx).
+		Where("id = ?", userSubscriptionId).
+		First(&sub).Error; err != nil {
+		return err
+	}
+	newUsed, err := checkedSubscriptionAmountUsedDelta(sub.AmountUsed, delta)
+	if err != nil {
+		return err
+	}
+	if newUsed < 0 {
+		newUsed = 0
+	}
+	if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
+		return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
+	}
+	sub.AmountUsed = newUsed
+	return tx.Save(&sub).Error
+}
+
+// Update subscription used amount by delta (positive consume more, negative refund).
+func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).
-			First(&sub).Error; err != nil {
-			return err
-		}
-		newUsed := sub.AmountUsed + delta
-		if newUsed < 0 {
-			newUsed = 0
-		}
-		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
-			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
-		}
-		sub.AmountUsed = newUsed
-		return tx.Save(&sub).Error
+		return postConsumeUserSubscriptionDeltaTx(tx, userSubscriptionId, delta)
+	})
+}
+
+// commitUserSubscriptionUsageDeltaTx records a delta after upstream usage has
+// already been accepted. Positive committed usage is retained as subscription
+// debt even when it crosses AmountTotal; future pre-use reservations continue
+// to use postConsumeUserSubscriptionDeltaTx and fail at the configured cap.
+// Negative deltas must reverse an exact prior debit and therefore fail instead
+// of silently clamping below zero.
+func commitUserSubscriptionUsageDeltaTx(tx *gorm.DB, userSubscriptionId int, delta int64) error {
+	if tx == nil {
+		return errors.New("invalid transaction")
+	}
+	if userSubscriptionId <= 0 {
+		return errors.New("invalid userSubscriptionId")
+	}
+	if delta == 0 {
+		return nil
+	}
+
+	var sub UserSubscription
+	if err := lockForUpdate(tx).
+		Where("id = ?", userSubscriptionId).
+		First(&sub).Error; err != nil {
+		return err
+	}
+	newUsed, err := checkedSubscriptionAmountUsedDelta(sub.AmountUsed, delta)
+	if err != nil {
+		return err
+	}
+	if newUsed < 0 {
+		return fmt.Errorf("subscription committed refund exceeds usage, used=%d delta=%d", sub.AmountUsed, delta)
+	}
+
+	sub.AmountUsed = newUsed
+	return tx.Save(&sub).Error
+}
+
+func CommitUserSubscriptionUsageDelta(userSubscriptionId int, delta int64) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return commitUserSubscriptionUsageDeltaTx(tx, userSubscriptionId, delta)
 	})
 }

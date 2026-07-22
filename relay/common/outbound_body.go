@@ -8,6 +8,56 @@ import (
 	"github.com/QuantumNous/new-api/common"
 )
 
+// PreparedOutboundJSON is the provider-ready JSON payload after outbound
+// privacy policy has been applied. Callers that need to inspect the exact
+// payload (for example, for request-dependent billing) must use Bytes and then
+// create the request reader with NewBody so inspection and transport share one
+// canonical representation.
+//
+// Bytes returns an independent copy of the provider-ready payload. Mutating the
+// returned slice cannot affect the bytes later used by NewBody.
+type PreparedOutboundJSON struct {
+	data []byte
+}
+
+// PrepareOutboundJSON applies the outbound privacy policy once and freezes the
+// bytes that will be sent to the provider.
+func PrepareOutboundJSON(data []byte, channelProxy ...string) (PreparedOutboundJSON, error) {
+	preparedData, err := applyOutboundPrivacyPolicy(data, channelProxy...)
+	if err != nil {
+		return PreparedOutboundJSON{}, err
+	}
+	return PreparedOutboundJSON{data: append([]byte(nil), preparedData...)}, nil
+}
+
+// applyOutboundPrivacyPolicy returns the provider-ready representation. The
+// returned slice may alias data when no rewrite is necessary; callers that need
+// ownership must copy it.
+func applyOutboundPrivacyPolicy(data []byte, channelProxy ...string) ([]byte, error) {
+	mayContainLocationData, err := readerMayContainLocationPrivacyData(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if !mayContainLocationData {
+		return data, nil
+	}
+	filtered, _, err := FilterUpstreamLocationData(data, channelProxy...)
+	if err != nil {
+		return nil, err
+	}
+	return filtered, nil
+}
+
+// Bytes returns the exact JSON bytes used by NewBody.
+func (b PreparedOutboundJSON) Bytes() []byte {
+	return append([]byte(nil), b.data...)
+}
+
+// NewBody creates storage and a request reader for the prepared payload.
+func (b PreparedOutboundJSON) NewBody() (body io.Reader, size int64, closer io.Closer, err error) {
+	return newOutboundJSONBody(b.data)
+}
+
 // NewOutboundJSONBody wraps the already-marshaled upstream request body into a
 // BodyStorage. When disk cache is enabled and the payload exceeds the configured
 // threshold, the data is written to a temp file and the original []byte can be
@@ -25,18 +75,14 @@ import (
 // size is meant to be propagated to http.Request.ContentLength because the
 // type-erased io.Reader prevents net/http from auto-detecting it.
 func NewOutboundJSONBody(data []byte, channelProxy ...string) (body io.Reader, size int64, closer io.Closer, err error) {
-	mayContainLocationData, err := readerMayContainLocationPrivacyData(bytes.NewReader(data))
+	preparedData, err := applyOutboundPrivacyPolicy(data, channelProxy...)
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	if !mayContainLocationData {
-		return newOutboundJSONBody(data)
-	}
-	data, _, err = FilterUpstreamLocationData(data, channelProxy...)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	return newOutboundJSONBody(data)
+	// This API does not expose the provider-ready bytes for inspection, so retain
+	// its original low-copy ownership contract. PreparedOutboundJSON is the
+	// defensive-copy variant for callers that need both inspection and transport.
+	return newOutboundJSONBody(preparedData)
 }
 
 func newOutboundJSONBody(data []byte) (body io.Reader, size int64, closer io.Closer, err error) {

@@ -106,7 +106,6 @@ type RelayInfo struct {
 	UserId            int
 	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
 	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	isFirstResponse   bool
@@ -344,7 +343,7 @@ func (info *RelayInfo) ToString() string {
 	// User & token info (mask secrets)
 	fmt.Fprintf(b, "User{ Id: %d, Email: %q, Group: %q, UsingGroup: %q, Quota: %d }, ",
 		info.UserId, common.MaskEmail(info.UserEmail), info.UserGroup, info.UsingGroup, info.UserQuota)
-	fmt.Fprintf(b, "Token{ Id: %d, Unlimited: %t, Key: ***masked*** }, ", info.TokenId, info.TokenUnlimited)
+	fmt.Fprintf(b, "Token{ Id: %d, Key: ***masked*** }, ", info.TokenId)
 
 	// Time info
 	latencyMs := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
@@ -554,10 +553,9 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 
 		OriginModelName: common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
 
-		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
-		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
-		TokenUnlimited: common.GetContextKeyBool(c, constant.ContextKeyTokenUnlimited),
-		TokenGroup:     tokenGroup,
+		TokenId:    common.GetContextKeyInt(c, constant.ContextKeyTokenId),
+		TokenKey:   common.GetContextKeyString(c, constant.ContextKeyTokenKey),
+		TokenGroup: tokenGroup,
 
 		isFirstResponse: true,
 		RelayMode:       relayconstant.Path2RelayMode(c.Request.URL.Path),
@@ -754,6 +752,11 @@ type TaskRelayInfo struct {
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string
+	// PersistedTaskID identifies the durable PENDING_SUBMIT marker created
+	// before the first upstream write. Once non-zero, that marker is the single
+	// owner of funding/token rollback; the request-scoped BillingSession must no
+	// longer run its independent refund path.
+	PersistedTaskID int64
 
 	ConsumeQuota bool
 

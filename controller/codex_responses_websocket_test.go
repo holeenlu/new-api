@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -180,7 +182,7 @@ func TestResponsesWebSocketContinuationErrorFramePreservesStableCode(t *testing.
 		}
 		defer conn.Close()
 
-		apiError := responsesWebSocketContinuationError(true, &responsesws.Session{})
+		apiError := responsesWebSocketContinuationError("resp_unavailable", &responsesws.Session{})
 		require.NotNil(t, apiError)
 		serverErr <- writeResponsesWebSocketErrorWithCode(
 			conn,
@@ -486,13 +488,68 @@ func TestResponsesWebSocketFrameReferencesPriorResponse(t *testing.T) {
 }
 
 func TestResponsesWebSocketContinuationRequiresLiveConnectionBeforeRelay(t *testing.T) {
-	require.Nil(t, responsesWebSocketContinuationError(false, nil))
+	require.Nil(t, responsesWebSocketContinuationError("", nil))
 
-	apiError := responsesWebSocketContinuationError(true, &responsesws.Session{})
+	apiError := responsesWebSocketContinuationError("resp_1", &responsesws.Session{})
 	require.NotNil(t, apiError)
 	require.Equal(t, http.StatusBadRequest, apiError.StatusCode)
 	require.Equal(t, types.ErrorCodeWebSocketConnectionLimitReached, apiError.GetErrorCode())
 	require.True(t, types.IsSkipRetryError(apiError))
+}
+
+func TestResponsesWebSocketContinuationRequiresIDOwnedByLiveConnectionBeforeRelay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(
+				websocket.TextMessage,
+				[]byte(`{"type":"response.completed","response":{"id":"resp_owned"}}`),
+			); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	session := &responsesws.Session{}
+	defer session.Close()
+	driver := &ordinaryResponsesSessionTestDriver{upstreamURL: server.URL}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelId:         204,
+		ChannelType:       constant.ChannelTypeOpenAI,
+		ApiKey:            "standard-api-key",
+		UpstreamModelName: "gpt-test",
+	}}
+	response, err := session.DoRequest(
+		newResponsesWebSocketControllerTestContext(),
+		driver,
+		info,
+		strings.NewReader(`{"model":"gpt-test","input":"first"}`),
+	)
+	require.NoError(t, err)
+	_, err = io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+
+	require.Nil(t, responsesWebSocketContinuationError("resp_owned", session))
+	apiError := responsesWebSocketContinuationError("resp_unknown", session)
+	require.NotNil(t, apiError)
+	assert.Equal(t, types.ErrorCodeWebSocketConnectionLimitReached, apiError.GetErrorCode())
+}
+
+func newResponsesWebSocketControllerTestContext() *gin.Context {
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	return context
 }
 
 func TestResponsesWebSocketTurnPinKeepsStatefulCredentialFixed(t *testing.T) {

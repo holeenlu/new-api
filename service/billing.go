@@ -18,6 +18,18 @@ const (
 // PreConsumeBilling 根据用户计费偏好创建 BillingSession 并执行预扣费。
 // 会话存储在 relayInfo.Billing 上，供后续 Settle / Refund 使用。
 func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	return preConsumeBilling(c, preConsumedQuota, relayInfo, false)
+}
+
+// PreConsumeBillingStrict creates a billing session only after the complete
+// funding and token target has been reserved. It is used at irreversible
+// boundaries such as a final provider-ready payload or a policy fee, where the
+// ordinary trusted-wallet optimization is not a valid reservation.
+func PreConsumeBillingStrict(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	return preConsumeBilling(c, preConsumedQuota, relayInfo, true)
+}
+
+func preConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo, strict bool) *types.NewAPIError {
 	if relayInfo != nil && relayInfo.QuotaClamp != nil {
 		return types.NewErrorWithStatusCode(
 			relayInfo.QuotaClamp,
@@ -34,8 +46,18 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
+	var session *BillingSession
+	var apiErr *types.NewAPIError
+	if strict {
+		session, apiErr = newBillingSession(c, relayInfo, preConsumedQuota, true)
+	} else {
+		session, apiErr = NewBillingSession(c, relayInfo, preConsumedQuota)
+	}
 	if apiErr != nil {
+		if session != nil && session.NeedsRefund() {
+			relayInfo.Billing = session
+			session.Refund(c)
+		}
 		return apiErr
 	}
 	relayInfo.Billing = session

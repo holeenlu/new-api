@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
@@ -110,4 +111,16 @@ func TestPreConsumeBillingRejectsNegativeQuotaBeforeDeduction(t *testing.T) {
 	require.Equal(t, types.ErrorCodeModelPriceError, apiErr.GetErrorCode())
 	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 	require.Nil(t, info.Billing)
+}
+
+func TestCalcOpenRouterCacheCreateTokensSaturatesOversizedCost(t *testing.T) {
+	usage := dto.Usage{Cost: float64(common.MaxQuota) * common.QuotaPerUnit}
+	priceData := types.PriceData{
+		ModelRatio:         1,
+		CompletionRatio:    1,
+		CacheRatio:         1,
+		CacheCreationRatio: 2,
+	}
+
+	require.Equal(t, common.MaxQuota, CalcOpenRouterCacheCreateTokens(usage, priceData))
 }

@@ -623,9 +623,14 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	if info.RelayMode == relayconstant.RelayModeResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact {
 		if session := responsesws.SessionFromContext(c); session != nil {
-			useSession := info.ChannelOtherSettings.ResponsesWebSocketEnabled || responsesws.IsContinuationRequired(c)
-			if useSession {
+			if info.ChannelOtherSettings.ResponsesWebSocketEnabled {
 				return session.DoRequest(c, a, info, requestBody)
+			}
+			if session.HasTransportState() {
+				return session.DoRequestOnCurrentTransport(c, a, info, requestBody)
+			}
+			if responsesws.IsContinuationRequired(c) {
+				return nil, responsesws.NewContinuationUnavailableError()
 			}
 		}
 	}

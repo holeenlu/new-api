@@ -273,8 +273,8 @@ func TokenOrUserAuth() func(c *gin.Context) {
 }
 
 // TokenAuthReadOnly 宽松版本的令牌认证中间件，用于只读查询接口。
-// 只验证令牌 key 是否存在，不检查令牌状态、过期时间和额度。
-// 即使令牌已过期、已耗尽或已禁用，也允许访问。
+// 验证令牌 key 存在且未被显式禁用，不检查过期时间和额度。
+// 已过期或已耗尽的令牌仍可访问只读接口。
 // 仍然检查用户是否被封禁。
 func TokenAuthReadOnly() func(c *gin.Context) {
 	return func(c *gin.Context) {
@@ -294,7 +294,10 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		parts := strings.Split(key, "-")
 		key = parts[0]
 
-		token, err := model.GetTokenByKey(key, false)
+		// Read-only access intentionally accepts expired or exhausted tokens, but a
+		// disabled token is still an authorization boundary. Read that state from
+		// the database rather than a best-effort token identity snapshot.
+		token, err := model.GetTokenByKeyForAuthorization(key)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusUnauthorized, gin.H{
@@ -490,10 +493,6 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	c.Set("token_id", token.Id)
 	c.Set("token_key", token.Key)
 	c.Set("token_name", token.Name)
-	c.Set("token_unlimited_quota", token.UnlimitedQuota)
-	if !token.UnlimitedQuota {
-		c.Set("token_quota", token.RemainQuota)
-	}
 	if token.ModelLimitsEnabled {
 		c.Set("token_model_limit_enabled", true)
 		c.Set("token_model_limit", token.GetModelLimitsMap())

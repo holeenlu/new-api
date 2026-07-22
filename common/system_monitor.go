@@ -29,6 +29,12 @@ type SystemStatus struct {
 
 var latestSystemStatus atomic.Value
 
+var (
+	collectCPUPercent    = cpu.Percent
+	collectVirtualMemory = mem.VirtualMemory
+	collectDiskSpaceInfo = GetDiskSpaceInfo
+)
+
 func init() {
 	latestSystemStatus.Store(SystemStatus{})
 }
@@ -53,29 +59,34 @@ func StartSystemMonitor() {
 }
 
 func updateSystemStatus() {
+	latestSystemStatus.Store(CollectSystemStatus())
+}
+
+// CollectSystemStatus 采集当前系统资源状态，不受性能阈值监控开关影响。
+func CollectSystemStatus() SystemStatus {
 	var status SystemStatus
 
 	// CPU
 	// 注意：cpu.Percent(0, false) 返回自上次调用以来的 CPU 使用率
 	// 如果是第一次调用，可能会返回错误或不准确的值，但在循环中会逐渐正常
-	percents, err := cpu.Percent(0, false)
+	percents, err := collectCPUPercent(0, false)
 	if err == nil && len(percents) > 0 {
 		status.CPUUsage = percents[0]
 	}
 
 	// Memory
-	memInfo, err := mem.VirtualMemory()
+	memInfo, err := collectVirtualMemory()
 	if err == nil {
 		status.MemoryUsage = memInfo.UsedPercent
 	}
 
 	// Disk
-	diskInfo := GetDiskSpaceInfo()
+	diskInfo := collectDiskSpaceInfo()
 	if diskInfo.Total > 0 {
 		status.DiskUsage = diskInfo.UsedPercent
 	}
 
-	latestSystemStatus.Store(status)
+	return status
 }
 
 // GetSystemStatus 获取当前系统状态

@@ -111,6 +111,42 @@ func TestQuotaRoundChecked(t *testing.T) {
 	}
 }
 
+func TestQuotaExactInt32BoundariesDoNotReportSaturation(t *testing.T) {
+	tests := []struct {
+		name    string
+		convert func(int) (int, *QuotaClamp)
+	}{
+		{
+			name: "float",
+			convert: func(value int) (int, *QuotaClamp) {
+				return QuotaFromFloatChecked(float64(value))
+			},
+		},
+		{
+			name: "round",
+			convert: func(value int) (int, *QuotaClamp) {
+				return QuotaRoundChecked(float64(value))
+			},
+		},
+		{
+			name: "decimal",
+			convert: func(value int) (int, *QuotaClamp) {
+				return QuotaFromDecimalChecked(decimal.NewFromInt(int64(value)))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, boundary := range []int{MinQuota, MaxQuota} {
+				quota, clamp := test.convert(boundary)
+				assert.Equal(t, boundary, quota)
+				assert.Nil(t, clamp)
+			}
+		})
+	}
+}
+
 // TestQuotaFromDecimalChecked verifies the decimal entry point reports clamps.
 func TestQuotaFromDecimalChecked(t *testing.T) {
 	quota, clamp := QuotaFromDecimalChecked(decimal.NewFromFloat(41.7))

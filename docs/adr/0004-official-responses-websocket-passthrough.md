@@ -60,7 +60,11 @@ Non-negotiable constraints:
 `ChannelOtherSettings.ResponsesWebSocketEnabled`, that declares "this upstream
 implements the standard Responses WebSocket protocol." Channel other-settings is
 the sole owner. Codex subscription channels keep their existing behavior without
-the flag (their WS support is implied by type).
+the flag (their WS support is implied by type). For a standard channel, the flag
+controls admission of new upstream WebSocket connections. It does not take
+ownership away from a WebSocket that is already live: that connection remains
+the transport owner for later self-contained and continuation turns until it is
+invalidated or the downstream session ends.
 
 **Shared transport.** Extract the Codex `ResponsesWebSocketSession` into a shared
 session (e.g. `relay/common` or a new `relay/responsesws` package) parameterized
@@ -91,12 +95,34 @@ that owns that id. This rule is evaluated again from the final outbound JSON
 after channel parameter overrides: an override-injected continuation cannot
 inherit the self-contained turn's retry permission. It also takes precedence
 over `ResponsesWebSocketEnabled`; disabling new WebSocket upgrades cannot move
-an existing connection-local continuation onto HTTP. At the connection lifetime
-limit, or after any path has invalidated the connection (terminal failure,
-truncated stream, cancellation, or early body close), a continuation fails
-locally with a structured non-retryable state-loss/connection-limit error and
-must be resubmitted with full input context. It is never sent to a replacement
-connection. While the original connection remains live, upstream
+an existing connection-local continuation onto HTTP. The same ownership rule
+applies to a self-contained turn: a runtime true-to-false flag change keeps using
+the live socket rather than creating an HTTP response id beside it. At the
+connection lifetime limit, or after any path has invalidated the connection
+(terminal failure, truncated stream, cancellation, or early body close), a
+continuation fails locally with a structured non-retryable
+state-loss/connection-limit error and must be resubmitted with full input
+context. Admission that detects the lifetime boundary synchronously closes the
+expired socket and clears its response ids before returning that error, so a
+client cannot retain an expired upstream descriptor by sending only rejected
+continuations. A continuation is never sent to a replacement connection. With
+new upgrades disabled, a self-contained turn may degrade to HTTP only after the
+old socket is closed; that binding then remains in HTTP fallback across later
+turns and flag changes so ids from the two transports cannot be mixed. The only
+release is the existing relay retry boundary: after proving a self-contained
+turn was not written upstream, `ResetChannelForRetry` may discard the whole
+binding and let the retry establish a fresh WebSocket on a newly selected
+credential. It also discards every old connection id, so this exception cannot
+move a continuation.
+The session records a bounded FIFO set of response ids observed on the current
+connection: at most 4096 entries, 4 KiB per id, and 1 MiB of id payload in total.
+The oldest id is evicted when the entry-count bound is full. A single-id or
+cumulative-byte violation invalidates the connection and clears the registry;
+it cannot turn an attacker-controlled upstream string into unbounded
+session-lifetime memory. A continuation is admitted only when that exact id is
+still owned by that connection generation; eviction therefore fails closed
+locally, and the existence of an unrelated replacement socket is insufficient.
+While the original connection remains live, upstream
 `previous_response_not_found` and failed-turn semantics are surfaced without
 gateway replay.
 
@@ -109,21 +135,42 @@ as a generation. It settles from the upstream's authoritative usage like any
 other turn: reported input usage is charged and output usage is zero. No
 warm-up-specific price path or cross-turn billing state is introduced.
 
+This per-turn rule is specific to the Responses transport in this ADR. The
+legacy OpenAI Realtime endpoint remains one long-lived relay invocation that may
+observe several `response.done` events. That separate handler progressively
+extends its `BillingSession` reservation from cumulative usage at each completed
+response, but it neither consumes quota nor writes a log at those boundaries.
+After the connection's read pumps stop, it returns the accumulated usage for one
+final `PostWssConsumeQuota` settlement. The two WebSocket protocols therefore do
+not share a cross-turn billing ledger or silently apply one another's settlement
+boundary.
+
 **Affinity and failover.** A live upstream WebSocket pins the exact channel,
 model, key index, and stable credential fingerprint that authenticated it.
+The model binding comes from the provider-ready outbound JSON itself (including
+raw-body passthrough), not from pre-conversion mapping metadata, and comparison
+is exact so two payload models cannot hide behind one mapped name.
 Later turns restore that credential after normal middleware distribution and
 fail closed if the key is removed, disabled, or replaced by a different
 credential identity. Normal access-token refresh may preserve a provider-stable
 fingerprint and does not move the live socket to another account. The binding
 may be released only while the relay still proves the current turn replay-safe.
 
-HTTP fallback is allowed only when the WebSocket upgrade is declined before an
-application request frame is written. Once a write is attempted, a transport
-error is ambiguous: upstream may have accepted the turn. Write failure, first
-event timeout, client cancellation, and a stream that ends without a terminal
-event therefore close the upstream connection and return a non-retryable error;
-they never reconnect, switch credentials, or replay over HTTP. This implements
-the project-wide written-request replay invariant.
+HTTP fallback is allowed before an application request frame is written when the
+WebSocket upgrade is declined, when a standard channel starts with new upgrades
+disabled, or when an already-bound session loses its socket and a later
+self-contained turn arrives while new upgrades remain disabled. The last case
+is routed through the session state machine and permanently marks that session
+binding as HTTP fallback; ordinary later turns and flag re-enablement cannot
+redial. A relay retry may clear the entire binding and redial only while its
+attempt-state proof says the current self-contained request was never written;
+this is the same replay-safe affinity-release boundary used for a rejected
+WebSocket handshake. Once a WebSocket write is attempted, a transport error is
+ambiguous: upstream may have accepted the turn. Write failure, first-event
+timeout, client cancellation, and a stream that ends without a terminal event
+therefore close the upstream connection and return a non-retryable error; they
+never reconnect, switch credentials, or replay over HTTP. This implements the
+project-wide written-request replay invariant.
 
 **Lease and reader lifecycle.** Subscription-OAuth capacity is leased per turn,
 not for the lifetime of an idle connection. Closing a response body before a
@@ -179,9 +226,25 @@ Current focused automated coverage proves:
 - Closing a response body before its terminal event invalidates the old
   connection before a later turn can obtain another reader, and per-turn lease
   tests cover release across successful turns.
+- A response id observed on an invalidated connection is rejected after a
+  self-contained turn creates a replacement connection; an id emitted by the
+  replacement remains usable there.
+- Connection-local response-id tracking is capped at 4096 entries, 4 KiB per id,
+  and 1 MiB of id payload, with FIFO eviction at the entry bound; an evicted id
+  fails closed while a retained id remains usable, and a byte-bound violation
+  invalidates the connection.
 - The optional `Generate` DTO field preserves explicit `false` and omits an
   absent value; OpenAI-compatible routing tests cover flag-on WebSocket and
-  flag-off HTTP selection.
+  flag-off HTTP selection. A runtime true-to-false transition keeps an existing
+  live WebSocket as the sole owner. If that bound socket is later lost, the
+  disabled path enters persistent HTTP fallback without a second WebSocket dial,
+  including after the flag is re-enabled; a later continuation fails locally.
+  A focused reset contract also proves that an explicitly replay-safe relay retry
+  releases the whole fallback binding and may dial a fresh WebSocket.
+- Separate legacy OpenAI Realtime aggregation coverage proves that multiple
+  completed responses contribute once to the connection total. This is a scope
+  guard for the distinction above, not evidence for Responses WebSocket ledger
+  parity.
 
 The following required evidence is still outstanding and must not be reported as
 passed until dedicated tests exist and run:
@@ -191,9 +254,8 @@ passed until dedicated tests exist and run:
 - A `generate:false` billing test proving reported input usage is charged and
   output usage is zero without falling back to a local output estimate.
 - Continuation tests for upstream `previous_response_not_found`, terminal-failure
-  invalidation, flag-disabled and parameter-override admission, and every
-  no-live-connection path failing locally without dialing or switching
-  credentials.
+  invalidation, parameter-override admission, and the remaining protocol-error
+  paths failing locally without dialing or switching credentials.
 - Full lifecycle/race coverage for client cancellation, upstream close,
   truncated streams, lifetime expiry, early close, nil leases, and exact
   credential restoration, followed by the relevant package race suites and the
@@ -224,10 +286,13 @@ outstanding billing, lifecycle, race, or repository-wide gates have passed.
 - **Phase 2** — Standard OpenAI-compatible driver
   (`relay/channel/openai/responses_websocket_transport.go`) dials
   `<base>/responses` with Bearer/Azure auth and no capacity lease; the openai
-  `DoRequest` routes Responses turns to the session only when the channel flag is
-  set; the client handler (`controller.CodexResponsesWebSocket`) admits any
-  channel and pins the session per turn. Covered by openai WebSocket routing
-  tests (flag-on uses WS, flag-off uses HTTP).
+  `DoRequest` admits a new upstream WebSocket only when the channel flag is set
+  and keeps an already-live socket as the session owner if the flag changes; the
+  client handler (`controller.CodexResponsesWebSocket`) admits any channel and
+  pins the session per turn. Covered by openai WebSocket routing tests (flag-on
+  uses WS, initially flag-off uses HTTP, a live session survives a runtime flag
+  disable, and a bound session whose socket is lost remains on HTTP without
+  redialing or mixing connection-owned ids).
 - **Phase 3** — 60-minute lifecycle: `Session` recycles a connection at
   `MaxConnectionLifetime` (default 55 min) before the upstream cap only for a
   self-contained turn; a connection-local continuation fails closed instead of

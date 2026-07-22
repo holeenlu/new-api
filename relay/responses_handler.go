@@ -103,7 +103,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		// escape onto HTTP or a replacement upstream connection after its owning
 		// WebSocket has been lost.
 		responsesws.MarkContinuationRequired(c)
-		if !session.HasLiveConnection() {
+		if !session.CanContinue(responsesReq.PreviousResponseID) {
 			return responsesws.NewContinuationUnavailableError()
 		}
 	}
@@ -153,23 +153,44 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 				return newAPIErrorFromParamOverride(err)
 			}
 		}
-		var finalRequest dto.OpenAIResponsesRequest
-		if err := common.Unmarshal(jsonData, &finalRequest); err != nil {
-			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-		}
-		if session := responsesws.SessionFromContext(c); session != nil {
-			if strings.TrimSpace(finalRequest.PreviousResponseID) != "" {
-				responsesws.MarkContinuationRequired(c)
-				if !session.HasLiveConnection() {
-					return responsesws.NewContinuationUnavailableError()
-				}
-			}
-		}
 		if info.ChannelType == appconstant.ChannelTypeCodex && info.IsStream &&
 			codex.IsResponsesLiteRequest(info) {
 			jsonData, err = codex.FilterResponsesLitePayload(jsonData)
 			if err != nil {
 				return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+		}
+		preparedBody, err := relaycommon.PrepareOutboundJSON(jsonData, info.ChannelSetting.Proxy)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		finalJSON := preparedBody.Bytes()
+		var finalRequest dto.OpenAIResponsesRequest
+		if err := common.Unmarshal(finalJSON, &finalRequest); err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if session := responsesws.SessionFromContext(c); session != nil {
+			if strings.TrimSpace(finalRequest.PreviousResponseID) != "" {
+				responsesws.MarkContinuationRequired(c)
+				if !session.CanContinue(finalRequest.PreviousResponseID) {
+					return responsesws.NewContinuationUnavailableError()
+				}
+			}
+			if info.RelayMode != relayconstant.RelayModeResponsesCompact &&
+				(info.ChannelOtherSettings.ResponsesWebSocketEnabled || session.HasTransportState() || responsesws.IsContinuationRequired(c)) {
+				finalModel := strings.TrimSpace(finalRequest.Model)
+				if finalModel == "" {
+					return types.NewErrorWithStatusCode(
+						errors.New("responses websocket upstream model is empty after request overrides"),
+						types.ErrorCodeChannelParamOverrideInvalid,
+						http.StatusBadRequest,
+						types.ErrOptionWithSkipRetry(),
+					)
+				}
+				// Session affinity must follow the actual provider request. A model
+				// override is applied after ordinary mapping and may otherwise let the
+				// request body switch models while the session compares the old name.
+				info.UpstreamModelName = finalModel
 			}
 		}
 		if info.RelayMode == relayconstant.RelayModeResponsesCompact {
@@ -183,14 +204,13 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 				)
 			}
 
-			// Freeze compact pricing from the final JSON that will actually be sent.
-			// A channel override may change the model after ordinary mapping, so both
-			// the upstream affinity model and tier-expression request input must follow
-			// this final payload.
+			// Freeze compact pricing from the privacy-filtered provider payload. The
+			// same PreparedOutboundJSON creates the transport body below, keeping the
+			// model, token estimate, request expressions, and sent bytes in sync.
 			info.UpstreamModelName = finalModel
 			info.OriginModelName = ratio_setting.WithCompactModelSuffix(finalModel)
 			info.TieredBillingSnapshot = nil
-			info.BillingRequestInput = &billingexpr.RequestInput{Body: append([]byte(nil), jsonData...)}
+			info.BillingRequestInput = &billingexpr.RequestInput{Body: finalJSON}
 			// Recount from the provider-ready payload. Codex conversion can add a
 			// channel system prompt and parameter overrides can replace request fields;
 			// reusing the client DTO's estimate would reserve against a body that is not
@@ -213,7 +233,11 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 			if !compactPriceData.FreeModel {
 				if info.Billing == nil {
-					if apiError := service.PreConsumeBilling(c, compactPriceData.QuotaToPreConsume, info); apiError != nil {
+					// Compact skips the client-payload estimate and creates its first
+					// session only after the provider-ready JSON is frozen. This is the
+					// final pre-write reservation boundary, so the trusted-wallet bypass
+					// is not valid even on the first attempt.
+					if apiError := service.PreConsumeBillingStrict(c, compactPriceData.QuotaToPreConsume, info); apiError != nil {
 						return apiError
 					}
 				} else if err := info.Billing.Reserve(compactPriceData.QuotaToPreConsume); err != nil {
@@ -232,8 +256,8 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 		}
 
-		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(jsonData))
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData, info.ChannelSetting.Proxy)
+		logger.LogDebug(c, "upstream request body omitted from logs (%d bytes)", len(finalJSON))
+		body, size, closer, err := preparedBody.NewBody()
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}

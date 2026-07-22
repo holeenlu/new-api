@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -17,7 +21,7 @@ type TaskStatus string
 func (t TaskStatus) ToVideoStatus() string {
 	var status string
 	switch t {
-	case TaskStatusQueued, TaskStatusSubmitted:
+	case TaskStatusPendingSubmit, TaskStatusNotStart, TaskStatusQueued, TaskStatusSubmitted:
 		status = dto.VideoStatusQueued
 	case TaskStatusInProgress:
 		status = dto.VideoStatusInProgress
@@ -32,13 +36,14 @@ func (t TaskStatus) ToVideoStatus() string {
 }
 
 const (
-	TaskStatusNotStart   TaskStatus = "NOT_START"
-	TaskStatusSubmitted             = "SUBMITTED"
-	TaskStatusQueued                = "QUEUED"
-	TaskStatusInProgress            = "IN_PROGRESS"
-	TaskStatusFailure               = "FAILURE"
-	TaskStatusSuccess               = "SUCCESS"
-	TaskStatusUnknown               = "UNKNOWN"
+	TaskStatusPendingSubmit TaskStatus = "PENDING_SUBMIT"
+	TaskStatusNotStart                 = "NOT_START"
+	TaskStatusSubmitted                = "SUBMITTED"
+	TaskStatusQueued                   = "QUEUED"
+	TaskStatusInProgress               = "IN_PROGRESS"
+	TaskStatusFailure                  = "FAILURE"
+	TaskStatusSuccess                  = "SUCCESS"
+	TaskStatusUnknown                  = "UNKNOWN"
 )
 
 // TaskRefundLegacyCutoff separates legacy timeout tasks that intentionally
@@ -110,6 +115,17 @@ type TaskPrivateData struct {
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	// BillingReservation is the authoritative task-owned refund ledger. A nil
+	// value identifies legacy rows whose funding and token reservations both
+	// equal Task.Quota. New rows preserve the two ledgers independently so a
+	// later failed-task refund can never reverse more than was committed.
+	BillingReservation *TaskBillingReservation `json:"billing_reservation,omitempty"`
+}
+
+type TaskBillingReservation struct {
+	FundingQuota int  `json:"funding_quota"`
+	TokenQuota   int  `json:"token_quota"`
+	TokenTracked bool `json:"token_tracked"`
 }
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。
@@ -334,7 +350,11 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("progress != ?", "100%").
+		Where("status NOT IN ?", []TaskStatus{TaskStatusPendingSubmit, TaskStatusFailure, TaskStatusSuccess}).
+		Limit(limit).
+		Order("id").
+		Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -386,6 +406,62 @@ func GetByOnlyTaskId(taskId string) (*Task, bool, error) {
 		return nil, false, err
 	}
 	return task, exist, err
+}
+
+func GetTaskByID(id int64) (*Task, error) {
+	if id <= 0 {
+		return nil, errors.New("invalid task id")
+	}
+	var task Task
+	if err := DB.Where("id = ?", id).First(&task).Error; err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// RenewPendingTaskSubmission moves the pending marker's timeout lease forward
+// before an upstream retry (and once more after the accepted response). The
+// conditional update serializes with the timeout sweeper: a stale sweep must
+// also match the previous SubmitTime and therefore cannot invalidate a renewed
+// marker immediately before an upstream write.
+func RenewPendingTaskSubmission(id int64) (*Task, error) {
+	if id <= 0 {
+		return nil, errors.New("invalid task id")
+	}
+	var renewed Task
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ?", id).First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status != TaskStatusPendingSubmit {
+			return fmt.Errorf("task %d cannot renew submission from status %s", id, task.Status)
+		}
+		previousSubmitTime := task.SubmitTime
+		newSubmitTime := time.Now().Unix()
+		if newSubmitTime <= previousSubmitTime {
+			if previousSubmitTime == math.MaxInt64 {
+				return fmt.Errorf("task %d submission lease overflow", id)
+			}
+			newSubmitTime = previousSubmitTime + 1
+		}
+		update := tx.Model(&Task{}).
+			Where("id = ? AND status = ? AND submit_time = ?", id, TaskStatusPendingSubmit, previousSubmitTime).
+			Update("submit_time", newSubmitTime)
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected != 1 {
+			return fmt.Errorf("task %d pending submission lease changed concurrently", id)
+		}
+		task.SubmitTime = newSubmitTime
+		renewed = task
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &renewed, nil
 }
 
 func GetByTaskId(userId int, taskId string) (*Task, bool, error) {
@@ -465,37 +541,273 @@ func (t *Task) UpdateQuota() error {
 	return DB.Model(t).Update("quota", t.Quota).Error
 }
 
-// ClaimQuotaForRefund atomically clears an expected non-zero quota. A true
-// result grants the caller ownership of the corresponding refund attempt.
-func ClaimQuotaForRefund(id int64, expectedQuota int) (bool, error) {
-	if expectedQuota == 0 {
-		return false, nil
+func taskReservationQuotas(task *Task) (fundingQuota int, tokenQuota int, tokenTracked bool, err error) {
+	if task == nil {
+		return 0, 0, false, errors.New("task is nil")
 	}
-
-	result := DB.Model(&Task{}).
-		Where("id = ? AND quota = ?", id, expectedQuota).
-		Update("quota", 0)
-	if result.Error != nil {
-		return false, result.Error
+	if task.PrivateData.BillingReservation == nil {
+		// Legacy rows used Task.Quota as the common funding/token reservation.
+		if task.Quota < 0 || task.Quota > common.MaxQuota {
+			return 0, 0, false, fmt.Errorf("task %d has invalid legacy quota %d", task.ID, task.Quota)
+		}
+		tokenTracked = task.PrivateData.TokenId > 0
+		if tokenTracked {
+			tokenQuota = task.Quota
+		}
+		return task.Quota, tokenQuota, tokenTracked, nil
 	}
-	return result.RowsAffected > 0, nil
+	reservation := task.PrivateData.BillingReservation
+	if reservation.FundingQuota < 0 || reservation.FundingQuota > common.MaxQuota ||
+		reservation.TokenQuota < 0 || reservation.TokenQuota > common.MaxQuota {
+		return 0, 0, false, fmt.Errorf(
+			"task %d has invalid billing reservation funding=%d token=%d",
+			task.ID,
+			reservation.FundingQuota,
+			reservation.TokenQuota,
+		)
+	}
+	return reservation.FundingQuota, reservation.TokenQuota, reservation.TokenTracked, nil
 }
 
-// RestoreQuotaAfterFailedRefund restores a claimed quota marker only while it
-// is still zero. It is used when the observable funding adjustment fails, so a
-// later reconciliation pass can retry without overwriting another writer.
-func RestoreQuotaAfterFailedRefund(id int64, quota int) (bool, error) {
-	if quota == 0 {
-		return false, nil
+// SettleTaskQuotaAtomically owns the post-acceptance task settlement boundary.
+// Funding, token usage, and the persisted refund ledger either all advance to
+// actualQuota or all remain at their previous reservation. This prevents a
+// later FAILURE refund from reversing a quota delta that never committed. The
+// funding delta is calculated from the locked persisted reservation rather than
+// from a caller snapshot. The boolean result reports whether this call changed
+// any persisted ledger; duplicate callers can therefore skip usage statistics
+// and billing logs without publishing a stale delta.
+func SettleTaskQuotaAtomically(id int64, actualQuota int) (*Task, int, bool, error) {
+	if id <= 0 {
+		return nil, 0, false, errors.New("invalid task id")
+	}
+	if actualQuota < 0 || actualQuota > common.MaxQuota {
+		return nil, 0, false, fmt.Errorf("invalid task settlement quota: %d", actualQuota)
 	}
 
-	result := DB.Model(&Task{}).
-		Where("id = ? AND quota = ?", id, 0).
-		Update("quota", quota)
-	if result.Error != nil {
-		return false, result.Error
+	var settledTask Task
+	committedFundingDelta := 0
+	settlementChanged := false
+	walletUserId := 0
+	tokenKey := ""
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ?", id).First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status == TaskStatusPendingSubmit {
+			return fmt.Errorf("task %d is not accepted upstream", id)
+		}
+		if task.Status == TaskStatusFailure {
+			return fmt.Errorf("task %d cannot settle from status %s", id, task.Status)
+		}
+
+		fundingQuota, tokenQuota, tokenTracked, err := taskReservationQuotas(&task)
+		if err != nil {
+			return err
+		}
+		fundingDelta := int64(actualQuota) - int64(fundingQuota)
+		targetTokenQuota := 0
+		if tokenTracked {
+			targetTokenQuota = actualQuota
+		}
+		tokenDelta := int64(targetTokenQuota) - int64(tokenQuota)
+		if fundingDelta == 0 && tokenDelta == 0 {
+			settledTask = task
+			return nil
+		}
+
+		if fundingDelta != 0 {
+			if task.PrivateData.BillingSource == "subscription" && task.PrivateData.SubscriptionId > 0 {
+				if err := commitUserSubscriptionUsageDeltaTx(tx, task.PrivateData.SubscriptionId, fundingDelta); err != nil {
+					return err
+				}
+			} else {
+				wallet := tx.Model(&User{}).Where("id = ?", task.UserId).
+					Update("quota", gorm.Expr("quota - ?", fundingDelta))
+				if wallet.Error != nil {
+					return wallet.Error
+				}
+				if wallet.RowsAffected != 1 {
+					return fmt.Errorf("task %d settlement updated %d users", id, wallet.RowsAffected)
+				}
+				walletUserId = task.UserId
+			}
+		}
+
+		if tokenDelta != 0 {
+			if task.PrivateData.TokenId <= 0 {
+				return fmt.Errorf("task %d tracks token quota without a token id", id)
+			}
+			var token Token
+			if err := tx.Select("id", "key").Where("id = ?", task.PrivateData.TokenId).First(&token).Error; err != nil {
+				return err
+			}
+			tokenUpdate := tx.Model(&Token{}).Where("id = ?", token.Id).Updates(
+				map[string]interface{}{
+					"remain_quota":  gorm.Expr("remain_quota - ?", tokenDelta),
+					"used_quota":    gorm.Expr("used_quota + ?", tokenDelta),
+					"accessed_time": common.GetTimestamp(),
+				},
+			)
+			if tokenUpdate.Error != nil {
+				return tokenUpdate.Error
+			}
+			if tokenUpdate.RowsAffected != 1 {
+				return fmt.Errorf("task %d settlement updated %d tokens", id, tokenUpdate.RowsAffected)
+			}
+			tokenKey = token.Key
+		}
+
+		if task.PrivateData.BillingReservation == nil {
+			task.PrivateData.BillingReservation = &TaskBillingReservation{}
+		}
+		task.PrivateData.BillingReservation.FundingQuota = actualQuota
+		task.PrivateData.BillingReservation.TokenQuota = targetTokenQuota
+		task.PrivateData.BillingReservation.TokenTracked = tokenTracked
+		task.Quota = actualQuota
+		updated := tx.Model(&Task{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"quota":        task.Quota,
+			"private_data": task.PrivateData,
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return fmt.Errorf("task %d settlement marker updated %d rows", id, updated.RowsAffected)
+		}
+		settledTask = task
+		committedFundingDelta = int(fundingDelta)
+		settlementChanged = true
+		return nil
+	})
+	if err != nil {
+		return nil, 0, false, err
 	}
-	return result.RowsAffected > 0, nil
+
+	if walletUserId > 0 && common.RedisEnabled {
+		if err := invalidateUserCache(walletUserId); err != nil {
+			common.SysLog("failed to invalidate user cache after atomic task settlement: " + err.Error())
+		}
+	}
+	if tokenKey != "" && common.RedisEnabled {
+		if err := cacheDeleteToken(tokenKey); err != nil {
+			common.SysLog("failed to invalidate token cache after atomic task settlement: " + err.Error())
+		}
+	}
+	return &settledTask, committedFundingDelta, settlementChanged, nil
+}
+
+// RefundTaskQuotaAtomically claims a task's persisted refund marker and
+// reverses its funding and token reservations in the same database transaction.
+// A false result with no error means another caller already completed the
+// refund. Cache synchronization happens only after the transaction commits.
+func RefundTaskQuotaAtomically(id int64, expectedQuota int) (bool, error) {
+	if id <= 0 {
+		return false, errors.New("invalid task id")
+	}
+	if expectedQuota <= 0 {
+		return false, errors.New("invalid task refund quota")
+	}
+
+	refunded := false
+	walletUserId := 0
+	tokenKey := ""
+	missingTokenId := 0
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ?", id).First(&task).Error; err != nil {
+			return err
+		}
+		if task.Quota == 0 {
+			return nil
+		}
+		if task.Status != TaskStatusFailure {
+			return fmt.Errorf("task %d cannot refund from status %s", id, task.Status)
+		}
+		if task.Quota != expectedQuota {
+			return fmt.Errorf("task %d refund quota changed from %d to %d", id, expectedQuota, task.Quota)
+		}
+
+		claim := tx.Model(&Task{}).
+			Where("id = ? AND status = ? AND quota = ?", id, TaskStatusFailure, expectedQuota).
+			Update("quota", 0)
+		if claim.Error != nil {
+			return claim.Error
+		}
+		if claim.RowsAffected == 0 {
+			return fmt.Errorf("task %d refund marker was concurrently changed", id)
+		}
+
+		fundingQuota, tokenQuota, _, err := taskReservationQuotas(&task)
+		if err != nil {
+			return err
+		}
+		if task.PrivateData.BillingSource == "subscription" && task.PrivateData.SubscriptionId > 0 {
+			// A task marker owns an exact committed reservation. If the
+			// subscription ledger no longer contains that debit, preserve the
+			// marker for reconciliation instead of silently clamping to zero.
+			if err := commitUserSubscriptionUsageDeltaTx(tx, task.PrivateData.SubscriptionId, -int64(fundingQuota)); err != nil {
+				return err
+			}
+		} else if fundingQuota > 0 {
+			wallet := tx.Model(&User{}).Where("id = ?", task.UserId).
+				Update("quota", gorm.Expr("quota + ?", fundingQuota))
+			if wallet.Error != nil {
+				return wallet.Error
+			}
+			if wallet.RowsAffected != 1 {
+				return fmt.Errorf("task %d wallet refund updated %d users", id, wallet.RowsAffected)
+			}
+			walletUserId = task.UserId
+		}
+
+		if task.PrivateData.TokenId > 0 && tokenQuota > 0 {
+			var token Token
+			if err := tx.Where("id = ?", task.PrivateData.TokenId).First(&token).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					missingTokenId = task.PrivateData.TokenId
+				} else {
+					return err
+				}
+			} else {
+				tokenUpdate := tx.Model(&Token{}).Where("id = ?", token.Id).Updates(
+					map[string]interface{}{
+						"remain_quota":  gorm.Expr("remain_quota + ?", tokenQuota),
+						"used_quota":    gorm.Expr("used_quota - ?", tokenQuota),
+						"accessed_time": common.GetTimestamp(),
+					},
+				)
+				if tokenUpdate.Error != nil {
+					return tokenUpdate.Error
+				}
+				if tokenUpdate.RowsAffected != 1 {
+					return fmt.Errorf("task %d token refund updated %d tokens", id, tokenUpdate.RowsAffected)
+				}
+				tokenKey = token.Key
+			}
+		}
+		refunded = true
+		return nil
+	})
+	if err != nil || !refunded {
+		return refunded, err
+	}
+
+	if walletUserId > 0 && common.RedisEnabled {
+		if err := invalidateUserCache(walletUserId); err != nil {
+			common.SysLog("failed to update user cache after atomic task refund: " + err.Error())
+		}
+	}
+	if tokenKey != "" && common.RedisEnabled {
+		if err := cacheDeleteToken(tokenKey); err != nil {
+			common.SysLog("failed to invalidate token cache after atomic task refund: " + err.Error())
+		}
+	}
+	if missingTokenId > 0 {
+		common.SysLog(fmt.Sprintf("task %d token %d was missing during atomic refund", id, missingTokenId))
+	}
+	return true, nil
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -508,11 +820,64 @@ func RestoreQuotaAfterFailedRefund(id int64, quota int) (bool, error) {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
-	if result.Error != nil {
-		return false, result.Error
-	}
-	return result.RowsAffected > 0, nil
+	updated := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var persisted Task
+		if err := lockForUpdate(tx).Where("id = ?", t.ID).First(&persisted).Error; err != nil {
+			return err
+		}
+		if persisted.Status != fromStatus {
+			return nil
+		}
+
+		// Status pollers own provider metadata, while the locked row owns the
+		// funding/token ledger. A poller can hold a snapshot loaded before task
+		// settlement; never let that snapshot restore an older reservation.
+		t.Quota = persisted.Quota
+		t.PrivateData.BillingReservation = persisted.PrivateData.BillingReservation
+
+		result := tx.Model(&Task{}).
+			Where("id = ? AND status = ?", t.ID, fromStatus).
+			Select("*").
+			Updates(t)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected > 0
+		return nil
+	})
+	return updated, err
+}
+
+// UpdateTimedOutWithStatus is the timeout-specific CAS. SubmitTime is the
+// pending-submission lease generation, so a retry that renewed the marker after
+// the sweep selected it makes this update lose instead of refunding a live
+// upstream attempt.
+func (t *Task) UpdateTimedOutWithStatus(fromStatus TaskStatus, expectedSubmitTime int64) (bool, error) {
+	updated := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var persisted Task
+		if err := lockForUpdate(tx).Where("id = ?", t.ID).First(&persisted).Error; err != nil {
+			return err
+		}
+		if persisted.Status != fromStatus || persisted.SubmitTime != expectedSubmitTime {
+			return nil
+		}
+
+		t.Quota = persisted.Quota
+		t.PrivateData.BillingReservation = persisted.PrivateData.BillingReservation
+
+		result := tx.Model(&Task{}).
+			Where("id = ? AND status = ? AND submit_time = ?", t.ID, fromStatus, expectedSubmitTime).
+			Select("*").
+			Updates(t)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected > 0
+		return nil
+	})
+	return updated, err
 }
 
 // TaskBulkUpdate performs an unconditional bulk UPDATE by upstream task_id strings.

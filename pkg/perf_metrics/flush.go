@@ -12,19 +12,19 @@ import (
 
 func flushLoop() {
 	for {
-		interval := perf_metrics_setting.GetFlushIntervalMinutes()
-		time.Sleep(time.Duration(interval) * time.Minute)
+		interval := perf_metrics_setting.GetSetting().FlushIntervalDuration()
+		time.Sleep(interval)
 		setting := perf_metrics_setting.GetSetting()
 		if !setting.Enabled {
 			continue
 		}
-		flushCompletedBuckets()
-		cleanupExpiredMetrics(setting.RetentionDays)
+		flushCompletedBuckets(setting.BucketSeconds())
+		cleanupExpiredMetrics(setting.RetentionDuration())
 	}
 }
 
-func flushCompletedBuckets() {
-	currentBucket := bucketStart(time.Now().Unix())
+func flushCompletedBuckets(bucketSeconds int64) {
+	currentBucket := bucketStart(time.Now().Unix(), bucketSeconds)
 	hotBuckets.Range(func(key, value any) bool {
 		k := key.(bucketKey)
 		if k.bucketTs >= currentBucket {
@@ -34,7 +34,7 @@ func flushCompletedBuckets() {
 		bucket := value.(*atomicBucket)
 		drained := bucket.drain()
 		if drained.requestCount == 0 {
-			deleteOldEmptyBucket(k, key)
+			deleteOldEmptyBucket(k, key, bucketSeconds)
 			return true
 		}
 
@@ -56,22 +56,22 @@ func flushCompletedBuckets() {
 			return true
 		}
 
-		deleteOldEmptyBucket(k, key)
+		deleteOldEmptyBucket(k, key, bucketSeconds)
 		return true
 	})
 }
 
-func deleteOldEmptyBucket(k bucketKey, rawKey any) {
-	if k.bucketTs < bucketStart(time.Now().Add(-24*time.Hour).Unix()) {
+func deleteOldEmptyBucket(k bucketKey, rawKey any, bucketSeconds int64) {
+	if k.bucketTs < bucketStart(time.Now().Add(-24*time.Hour).Unix(), bucketSeconds) {
 		hotBuckets.Delete(rawKey)
 	}
 }
 
-func cleanupExpiredMetrics(retentionDays int) {
-	if retentionDays <= 0 {
+func cleanupExpiredMetrics(retention time.Duration) {
+	if retention <= 0 {
 		return
 	}
-	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
+	cutoff := time.Now().Add(-retention).Unix()
 	if err := model.DeletePerfMetricsBefore(cutoff); err != nil {
 		common.SysError("failed to cleanup expired perf metrics: " + err.Error())
 	}

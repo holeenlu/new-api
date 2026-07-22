@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -90,6 +91,94 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 	assert.Equal(t, 270, got.UsedQuota)
 	assert.Equal(t, 4, got.RequestCount)
 	assert.Equal(t, "zh", got.GetSetting().Language)
+}
+
+func TestDecreaseUserQuotaIfEnoughCommitsAtMostOneCompetingReservation(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{
+		Id:       3,
+		Username: "strict-quota-user",
+		Password: "password",
+		Status:   common.UserStatusEnabled,
+		Quota:    1000,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			errs[index] = DecreaseUserQuotaIfEnough(user.Id, 700)
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	insufficient := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrInsufficientUserQuota):
+			insufficient++
+		default:
+			require.NoError(t, err)
+		}
+	}
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, 1, insufficient)
+
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, 300, stored.Quota)
+}
+
+func TestDecreaseUserQuotaIfEnoughUsesAuthoritativeLedgerWithBatchUpdates(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{
+		Id:       4,
+		Username: "strict-quota-batch-user",
+		Password: "password",
+		Status:   common.UserStatusEnabled,
+		Quota:    1000,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+	common.BatchUpdateEnabled = true
+
+	err := DecreaseUserQuotaIfEnough(user.Id, 700)
+
+	require.NoError(t, err)
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, 300, stored.Quota)
+}
+
+func TestDecreaseUserQuotaIfEnoughInvalidatesStaleQuotaCache(t *testing.T) {
+	setupUserUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+
+	user := User{
+		Id:          5,
+		Username:    "strict-quota-cache-user",
+		Password:    "password",
+		Status:      common.UserStatusEnabled,
+		Quota:       1000,
+		AuthVersion: 1,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+	require.NoError(t, populateUserCache(user))
+	require.True(t, server.Exists(getUserCacheKey(user.Id)))
+
+	require.NoError(t, DecreaseUserQuotaIfEnough(user.Id, 700))
+
+	assert.False(t, server.Exists(getUserCacheKey(user.Id)))
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, 300, stored.Quota)
 }
 
 func TestEnsureEmailAvailableRejectsExistingEmailCaseInsensitive(t *testing.T) {

@@ -879,7 +879,18 @@ func RelayTask(c *gin.Context) {
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
 	defer func() {
-		if taskErr != nil && relayInfo.Billing != nil {
+		if taskErr == nil {
+			return
+		}
+		if relayInfo.PersistedTaskID > 0 {
+			// Marker ownership begins before the upstream write. Never race its
+			// atomic refund with BillingSession.Refund.
+			if !service.FailTaskSubmission(c, relayInfo.PersistedTaskID, taskErr.Message) {
+				common.SysError(fmt.Sprintf("task %d failure refund remains pending", relayInfo.PersistedTaskID))
+			}
+			return
+		}
+		if relayInfo.Billing != nil {
 			relayInfo.Billing.Refund(c)
 		}
 	}()
@@ -949,31 +960,18 @@ func RelayTask(c *gin.Context) {
 
 	// ── 成功：结算 + 日志 + 插入任务 ──
 	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+		if result == nil || result.Task == nil {
+			common.SysError("accepted upstream task has no persisted marker")
+		} else if settleErr := service.CommitTaskSubmission(c, relayInfo, result.Task, result.Quota); settleErr != nil {
 			common.SysError("settle task billing error: " + settleErr.Error())
 		}
+		if result != nil && result.Task != nil {
+			// Consumption/log statistics must reflect the funding amount that is
+			// actually refundable from the durable task ledger, not an uncommitted
+			// post-submit estimate.
+			relayInfo.PriceData.Quota = result.Task.Quota
+		}
 		service.LogTaskConsumption(c, relayInfo)
-
-		task := model.InitTask(result.Platform, relayInfo)
-		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
-		task.PrivateData.BillingSource = relayInfo.BillingSource
-		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
-		task.PrivateData.TokenId = relayInfo.TokenId
-		task.PrivateData.NodeName = common.NodeName
-		task.PrivateData.BillingContext = &model.TaskBillingContext{
-			ModelPrice:      relayInfo.PriceData.ModelPrice,
-			GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
-			ModelRatio:      relayInfo.PriceData.ModelRatio,
-			OtherRatios:     relayInfo.PriceData.OtherRatios(),
-			OriginModelName: relayInfo.OriginModelName,
-			PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
-		}
-		task.Quota = result.Quota
-		task.Data = result.TaskData
-		task.Action = relayInfo.Action
-		if insertErr := task.Insert(); insertErr != nil {
-			common.SysError("insert task error: " + insertErr.Error())
-		}
 	}
 
 	if taskErr != nil {

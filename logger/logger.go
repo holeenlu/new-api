@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -26,12 +27,38 @@ const (
 
 const maxLogCount = 1000000
 
-var logCount int
+var logCount atomic.Int64
 var setupLogLock sync.Mutex
-var setupLogWorking bool
+var setupLogWorking atomic.Bool
 var currentLogPath string
 var currentLogPathMu sync.RWMutex
 var currentLogFile *os.File
+var accessLogWriter = newDynamicWriter(os.Stdout)
+var errorLogWriter = newDynamicWriter(os.Stderr)
+
+// dynamicWriter is kept stable for the lifetime of the process. Gin captures
+// its output writer when middleware is installed, so log rotation must replace
+// the writer's target rather than replacing gin.DefaultWriter itself.
+type dynamicWriter struct {
+	mu     sync.RWMutex
+	target io.Writer
+}
+
+func newDynamicWriter(target io.Writer) *dynamicWriter {
+	return &dynamicWriter{target: target}
+}
+
+func (writer *dynamicWriter) Write(p []byte) (int, error) {
+	writer.mu.RLock()
+	defer writer.mu.RUnlock()
+	return writer.target.Write(p)
+}
+
+func (writer *dynamicWriter) setTarget(target io.Writer) {
+	writer.mu.Lock()
+	writer.target = target
+	writer.mu.Unlock()
+}
 
 func GetCurrentLogPath() string {
 	currentLogPathMu.RLock()
@@ -40,37 +67,44 @@ func GetCurrentLogPath() string {
 }
 
 func SetupLogger() {
-	defer func() {
-		setupLogWorking = false
-	}()
-	if *common.LogDir != "" {
-		ok := setupLogLock.TryLock()
-		if !ok {
-			log.Println("setup log is already working")
-			return
-		}
-		defer func() {
-			setupLogLock.Unlock()
-		}()
-		logPath := filepath.Join(*common.LogDir, fmt.Sprintf("oneapi-%s.log", time.Now().Format("20060102150405")))
-		fd, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatal("failed to open log file")
-		}
-		currentLogPathMu.Lock()
-		oldFile := currentLogFile
-		currentLogPath = logPath
-		currentLogFile = fd
-		currentLogPathMu.Unlock()
-
-		common.LogWriterMu.Lock()
-		gin.DefaultWriter = io.MultiWriter(os.Stdout, fd)
-		gin.DefaultErrorWriter = io.MultiWriter(os.Stderr, fd)
-		if oldFile != nil {
-			_ = oldFile.Close()
-		}
-		common.LogWriterMu.Unlock()
+	if *common.LogDir == "" {
+		setupLogWorking.Store(false)
+		return
 	}
+	if !setupLogLock.TryLock() {
+		// The goroutine that owns setupLogLock also owns setupLogWorking and
+		// clears it when rotation finishes. A losing caller must not publish a
+		// false idle state while that rotation is still using the old file.
+		log.Println("setup log is already working")
+		return
+	}
+	defer setupLogLock.Unlock()
+	defer setupLogWorking.Store(false)
+
+	logPath := filepath.Join(*common.LogDir, fmt.Sprintf("oneapi-%s.log", time.Now().Format("20060102150405")))
+	fd, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal("failed to open log file")
+	}
+	common.LogWriterMu.Lock()
+	accessLogWriter.setTarget(io.MultiWriter(os.Stdout, fd))
+	errorLogWriter.setTarget(io.MultiWriter(os.Stderr, fd))
+	gin.DefaultWriter = accessLogWriter
+	gin.DefaultErrorWriter = errorLogWriter
+
+	currentLogPathMu.Lock()
+	oldFile := currentLogFile
+	currentLogPath = logPath
+	currentLogFile = fd
+	currentLogPathMu.Unlock()
+
+	// setTarget waits for writes that already captured the old target. After
+	// both targets have moved, no Gin or application logger can still use the
+	// old descriptor, so it is safe to close here.
+	if oldFile != nil {
+		_ = oldFile.Close()
+	}
+	common.LogWriterMu.Unlock()
 }
 
 func LogInfo(ctx context.Context, msg string) {
@@ -109,10 +143,8 @@ func logHelper(ctx context.Context, level string, msg string) {
 	}
 	_, _ = fmt.Fprintf(writer, "[%s] %v | %s | %s \n", level, now.Format("2006/01/02 - 15:04:05"), id, common.RedactSensitiveCredentials(msg))
 	common.LogWriterMu.RUnlock()
-	logCount++ // we don't need accurate count, so no lock here
-	if logCount > maxLogCount && !setupLogWorking {
-		logCount = 0
-		setupLogWorking = true
+	if logCount.Add(1) > maxLogCount && setupLogWorking.CompareAndSwap(false, true) {
+		logCount.Store(0)
 		gopool.Go(func() {
 			SetupLogger()
 		})

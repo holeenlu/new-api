@@ -37,10 +37,54 @@ These rules are release-blocking unless an explicit ADR changes them.
   replay safety, same-group routing boundaries or durable credential isolation.
 - A request that may already have been accepted upstream is not automatically
   replayed unless an explicit, reviewed idempotency policy permits it.
+- A Responses WebSocket continuation is admitted only when its exact
+  `previous_response_id` was emitted by the current live upstream connection;
+  replacement connections and HTTP fallback never inherit those ids.
 
 ## Billing and persistence
 
 - Quota computation must never overflow into a negative charge or credit.
+- Responses compact must price and reserve from the final provider-ready JSON.
+  Its final `Reserve` cannot reuse the trusted-wallet funding bypass; a missing
+  wallet delta must be conditionally reserved before the upstream write against
+  the authoritative database balance.
+- Legacy OpenAI Realtime may extend its reservation from cumulative usage at
+  each `response.done`, but intermediate responses do not consume quota or write
+  consume logs. The connection's accumulated usage settles exactly once after
+  both read pumps stop.
+- A terminal policy fee settles only after its complete funding and limited-token
+  quota are provably reserved. A rejected fee leaves no usage or consume-log
+  entry.
+- Wallet quota is a synchronous, cross-process authoritative database ledger.
+  Wallet reservations use atomic conditional debits; batching is limited to
+  `used_quota`, request-count, and channel-used-quota statistics.
+- Every token reservation, committed debit, and rollback uses the authoritative
+  database row, even while unrelated counters are batched. A limited pre-use
+  reservation is conditional on available quota; usage already served upstream
+  is recorded in full and may leave debt. Unlimited tokens are exempt from the
+  availability condition, not from the database ledger. Redis is only an identity
+  snapshot; security-sensitive token authentication reads persisted state.
+- An asynchronous task has a `PENDING_SUBMIT` marker before upstream I/O. The
+  marker is the only refund owner, is not normally polled until accepted, and
+  remains timeout-reconcilable after a crash. Retry lease renewal invalidates a
+  timeout sweep's stale CAS before another upstream write. Accepted-task funding,
+  token, and reservation-marker adjustments commit in one main-database
+  transaction through `model.SettleTaskQuotaAtomically`; successful completion
+  recalculation uses the same operation. The committed funding delta must come
+  from the locked persisted reservation, never a caller snapshot. Only a
+  `changed=true` caller may write a task billing log or update user
+  used-quota/request-count and channel used-quota statistics, and it must use the
+  returned delta. Same-target stale, duplicate, and concurrent polling callers
+  with `changed=false` must not repeat those effects. A failed-task refund claims
+  its non-zero marker only from `FAILURE` and reverses the persisted funding/token
+  amounts in one transaction. Submit settlement, completion recalculation, and
+  failure refund share one persisted task-ledger owner. Failures preserve the
+  marker for retry; cache synchronization occurs only after commit.
+- Subscription reservations reject use beyond the configured total, while a
+  positive delta for usage already accepted upstream is retained as debt instead
+  of being dropped. Exact negative committed deltas cannot underflow usage.
+- A strict pre-write reservation disables the trusted-wallet bypass; it does not
+  cap authoritative final usage or reject a positive committed settlement delta.
 - A multi-value configuration save is atomic: validation occurs before write,
   and all affected Option values commit or roll back together.
 - Channel, token, and option database changes continue to work on SQLite,

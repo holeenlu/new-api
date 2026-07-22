@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -62,6 +64,10 @@ func (b *compactBillingRecorder) Reserve(targetQuota int) error {
 	b.requestInputAtReserve = b.info.BillingRequestInput
 	b.upstreamModelAtReserve = b.info.UpstreamModelName
 	return b.reserveErr
+}
+
+func (b *compactBillingRecorder) ReserveStrict(targetQuota int) error {
+	return b.Reserve(targetQuota)
 }
 
 func configureCompactRatioPrice(t *testing.T, compactModel, group string, price float64) {
@@ -224,6 +230,164 @@ func TestResponsesCommittedViolationReturnsBeforeOrdinaryUsageSettlement(t *test
 	require.Contains(t, recorder.Body.String(), "response.failed")
 }
 
+func TestResponsesWebSocketAffinityUsesFinalOverrideModelOnLiveSession(t *testing.T) {
+	service.InitHttpClient()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	observedModels := make(chan string, 2)
+	var connectionCount atomic.Int32
+	var turnCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		connectionCount.Add(1)
+		defer conn.Close()
+		for {
+			_, requestBody, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var request map[string]any
+			if err := common.Unmarshal(requestBody, &request); err != nil {
+				t.Errorf("decode websocket request: %v", err)
+				return
+			}
+			model, _ := request["model"].(string)
+			observedModels <- model
+			turn := turnCount.Add(1)
+			if turn == 1 {
+				response := fmt.Sprintf(
+					`{"type":"response.completed","response":{"id":"resp_%d","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+					turn,
+				)
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(response)); err != nil {
+					t.Errorf("write websocket response: %v", err)
+				}
+				continue
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(
+				`{"type":"response.failed","response":{"status":"failed","error":{"type":"invalid_request_error","code":"content_policy_violation","message":"Failed check: SAFETY_CHECK_TYPE"}}}`,
+			)); err != nil {
+				t.Errorf("write websocket failure: %v", err)
+			}
+		}
+	}))
+	defer server.Close()
+
+	session := &responsesws.Session{}
+	defer session.Close()
+	firstContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	firstContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	responsesws.SetSession(firstContext, session)
+	firstInfo := &relaycommon.RelayInfo{
+		IsStream:       true,
+		RelayMode:      relayconstant.RelayModeResponses,
+		RequestURLPath: "/v1/responses",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:            990010,
+			ChannelType:          constant.ChannelTypeOpenAI,
+			ChannelBaseUrl:       server.URL,
+			ApiKey:               "test-key",
+			UpstreamModelName:    "override-model",
+			ChannelOtherSettings: dto.ChannelOtherSettings{ResponsesWebSocketEnabled: true},
+		},
+	}
+	firstResponseAny, err := GetAdaptor(constant.APITypeOpenAI).DoRequest(
+		firstContext,
+		firstInfo,
+		strings.NewReader(`{"model":"override-model","stream":true}`),
+	)
+	require.NoError(t, err)
+	firstResponse, ok := firstResponseAny.(*http.Response)
+	require.True(t, ok)
+	_, err = io.ReadAll(firstResponse.Body)
+	require.NoError(t, err)
+	require.NoError(t, firstResponse.Body.Close())
+	require.True(t, session.HasLiveConnection())
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyChannelId, 990010)
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "test-key")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "original-model")
+	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+		ResponsesWebSocketEnabled: false,
+	})
+	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+		"model": "override-model",
+	})
+	responsesws.SetSession(c, session)
+	info := &relaycommon.RelayInfo{
+		IsStream:        true,
+		DisablePing:     true,
+		RelayMode:       relayconstant.RelayModeResponses,
+		OriginModelName: "original-model",
+		RequestURLPath:  "/v1/responses",
+		Request: &dto.OpenAIResponsesRequest{
+			Model:  "original-model",
+			Stream: common.GetPointer(true),
+		},
+	}
+
+	apiError := ResponsesHelper(c, info)
+
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeViolationFeeGrokCSAM, apiError.GetErrorCode())
+	require.Equal(t, "override-model", info.UpstreamModelName)
+	for turn := 1; turn <= 2; turn++ {
+		select {
+		case model := <-observedModels:
+			require.Equal(t, "override-model", model, "turn %d", turn)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("websocket turn %d did not reach upstream", turn)
+		}
+	}
+	require.Equal(t, int32(1), connectionCount.Load())
+}
+
+func TestResponsesHTTPParamOverrideKeepsExistingBillingModel(t *testing.T) {
+	service.InitHttpClient()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "://must-not-reach-upstream")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "billing-model")
+	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+		ResponsesWebSocketEnabled: false,
+	})
+	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+		"model": "transport-override-model",
+	})
+	responsesws.SetSession(c, &responsesws.Session{})
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeResponses,
+		OriginModelName: "billing-model",
+		RequestURLPath:  "/v1/responses",
+		Request: &dto.OpenAIResponsesRequest{
+			Model: "billing-model",
+		},
+	}
+
+	apiError := ResponsesHelper(c, info)
+
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiError.GetErrorCode())
+	require.Equal(t, "billing-model", info.OriginModelName)
+	require.Equal(t, "billing-model", info.UpstreamModelName)
+}
+
 func TestResponsesCompactParamOverrideFreezesFinalModelForRequestAndReserve(t *testing.T) {
 	compactModel := ratio_setting.WithCompactModelSuffix("override-model")
 	testGroup := "responses-compact-override-billing-test"
@@ -360,6 +524,84 @@ func TestResponsesCompactTieredReserveRecountsFinalOutboundPrompt(t *testing.T) 
 	require.Equal(t, expectedPromptTokens, billing.tieredSnapshotAtReserve.EstimatedPromptTokens)
 	require.Equal(t, expectedPromptTokens, info.GetEstimatePromptTokens())
 	require.Equal(t, "original-model", common.GetContextKeyString(c, constant.ContextKeyOriginalModel))
+}
+
+func TestResponsesCompactBillingUsesPrivacyFilteredOutboundJSON(t *testing.T) {
+	compactModel := ratio_setting.WithCompactModelSuffix("privacy-model")
+	testGroup := "responses-compact-privacy-billing-test"
+	configureCompactRatioPrice(t, compactModel, testGroup, 0.02)
+
+	originalLocationMode := common.GetUpstreamLocationMode()
+	require.NoError(t, common.SetUpstreamLocationMode(common.UpstreamLocationModeStrip))
+	t.Cleanup(func() { require.NoError(t, common.SetUpstreamLocationMode(originalLocationMode)) })
+	savedCountToken := constant.CountToken
+	constant.CountToken = true
+	t.Cleanup(func() { constant.CountToken = savedCountToken })
+
+	billingConfig, ok := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	require.True(t, ok)
+	savedExpressions := billing_setting.GetBillingExprCopy()
+	savedBillingModes := billing_setting.GetBillingModeCopy()
+	t.Cleanup(func() {
+		billingConfig.BillingExpr = savedExpressions
+		billingConfig.BillingMode = savedBillingModes
+	})
+	billingModes := billing_setting.GetBillingModeCopy()
+	billingModes[compactModel] = billing_setting.BillingModeTieredExpr
+	billingConfig.BillingMode = billingModes
+	billingExpressions := billing_setting.GetBillingExprCopy()
+	billingExpressions[compactModel] = `param("metadata.city") == nil ? tier("private", p) : tier("leaked", p * 100)`
+	billingConfig.BillingExpr = billingExpressions
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "privacy-model")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "://must-not-reach-upstream")
+	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+		"metadata": map[string]any{
+			"city": "Shanghai",
+			"keep": "value",
+		},
+	})
+
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeResponsesCompact,
+		OriginModelName: "privacy-model",
+		RequestURLPath:  "/v1/responses/compact",
+		Request: &dto.OpenAIResponsesCompactionRequest{
+			Model: "privacy-model",
+			Input: []byte(`"hello"`),
+		},
+		UsingGroup: testGroup,
+		UserGroup:  testGroup,
+		TokenGroup: testGroup,
+	}
+	reserveError := types.NewErrorWithStatusCode(
+		errors.New("stop after privacy-filtered reserve"),
+		types.ErrorCodeInsufficientUserQuota,
+		http.StatusForbidden,
+		types.ErrOptionWithSkipRetry(),
+	)
+	billing := &compactBillingRecorder{info: info, reserveErr: reserveError}
+	info.Billing = billing
+
+	apiError := ResponsesHelper(c, info)
+
+	require.Same(t, reserveError, apiError)
+	require.NotNil(t, billing.requestInputAtReserve)
+	require.NotNil(t, billing.tieredSnapshotAtReserve)
+	require.Equal(t, "private", billing.tieredSnapshotAtReserve.EstimatedTier)
+	require.NotContains(t, string(billing.requestInputAtReserve.Body), "Shanghai")
+	require.NotContains(t, string(billing.requestInputAtReserve.Body), `"city"`)
+	require.Contains(t, string(billing.requestInputAtReserve.Body), `"keep":"value"`)
+	var finalRequest dto.OpenAIResponsesRequest
+	require.NoError(t, common.Unmarshal(billing.requestInputAtReserve.Body, &finalRequest))
+	finalMeta := finalRequest.GetTokenCountMeta()
+	expectedPromptTokens := service.CountTextToken(finalMeta.CombineText, finalRequest.Model)
+	require.Equal(t, expectedPromptTokens, billing.tieredSnapshotAtReserve.EstimatedPromptTokens)
 }
 
 func TestResponsesCompactParamOverrideContinuationRequiresLiveSession(t *testing.T) {

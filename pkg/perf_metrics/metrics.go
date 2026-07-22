@@ -79,7 +79,7 @@ func Record(sample Sample) {
 	key := bucketKey{
 		model:    sample.Model,
 		group:    sample.Group,
-		bucketTs: bucketStart(time.Now().Unix()),
+		bucketTs: bucketStart(time.Now().Unix(), setting.BucketSeconds()),
 	}
 	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
 	actual.(*atomicBucket).add(sample)
@@ -273,8 +273,7 @@ func allowedGroupSet(groups []string) map[string]struct{} {
 	return allowed
 }
 
-func bucketStart(ts int64) int64 {
-	bucketSeconds := perf_metrics_setting.GetBucketSeconds()
+func bucketStart(ts int64, bucketSeconds int64) int64 {
 	if bucketSeconds <= 0 {
 		bucketSeconds = 3600
 	}
@@ -419,7 +418,7 @@ func mergeRedisActiveBuckets(merged map[bucketKey]counters, params QueryParams, 
 	if !common.RedisEnabled || common.RDB == nil || params.Model == "" || params.Group == "" {
 		return
 	}
-	active := bucketStart(time.Now().Unix())
+	active := bucketStart(time.Now().Unix(), perf_metrics_setting.GetSetting().BucketSeconds())
 	if active < startTs || active > endTs {
 		return
 	}

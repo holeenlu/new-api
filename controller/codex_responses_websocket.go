@@ -148,8 +148,9 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			}
 			continue
 		}
-		turnReferencesPriorResponse = responsesWebSocketFrameReferencesPriorResponse(frame)
-		if apiError := responsesWebSocketContinuationError(turnReferencesPriorResponse, session); apiError != nil {
+		previousResponseID := strings.TrimSpace(stringValue(frame["previous_response_id"]))
+		turnReferencesPriorResponse = previousResponseID != ""
+		if apiError := responsesWebSocketContinuationError(previousResponseID, session); apiError != nil {
 			if writeResponsesWebSocketErrorWithCode(
 				conn,
 				apiError.StatusCode,
@@ -201,8 +202,11 @@ func CodexResponsesWebSocket(c *gin.Context) {
 // responsesWebSocketContinuationError enforces the controller-owned admission
 // boundary before authentication, channel distribution, parameter overrides or
 // billing can run for a connection-local continuation.
-func responsesWebSocketContinuationError(referencesPriorResponse bool, session *responsesws.Session) *types.NewAPIError {
-	if !referencesPriorResponse || session.HasLiveConnection() {
+func responsesWebSocketContinuationError(previousResponseID string, session *responsesws.Session) *types.NewAPIError {
+	if strings.TrimSpace(previousResponseID) == "" {
+		return nil
+	}
+	if session != nil && session.CanContinue(previousResponseID) {
 		return nil
 	}
 	return responsesws.NewContinuationUnavailableError()

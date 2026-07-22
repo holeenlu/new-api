@@ -27,6 +27,7 @@ type TaskSubmitResult struct {
 	TaskData       []byte
 	Platform       constant.TaskPlatform
 	Quota          int
+	Task           *model.Task
 	//PerCallPrice   types.PriceData
 }
 
@@ -216,6 +217,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
+	// The durable marker becomes the single refund owner before the first
+	// irreversible upstream write. If it cannot be inserted, fail locally while
+	// the request-scoped BillingSession can still refund normally.
+	task, err := service.CreateTaskSubmissionMarker(info, platform)
+	if err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "persist_task_marker_failed", http.StatusInternalServerError)
+	}
+
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
@@ -251,11 +260,35 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
+	// Keep the accepted metadata in memory for CommitTaskSubmission. That
+	// function first persists this state (making the row pollable), then settles
+	// all task-owned ledgers atomically.
+	task.ChannelId = info.ChannelId
+	task.Platform = platform
+	task.Action = info.Action
+	task.Data = taskData
+	task.PrivateData.UpstreamTaskID = upstreamTaskID
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.BillingContext = &model.TaskBillingContext{
+		ModelPrice:      info.PriceData.ModelPrice,
+		GroupRatio:      info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio:      info.PriceData.ModelRatio,
+		OtherRatios:     info.PriceData.OtherRatios(),
+		OriginModelName: info.OriginModelName,
+		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice,
+	}
+	task.Properties.UpstreamModelName = info.UpstreamModelName
+	task.Properties.OriginModelName = info.OriginModelName
+
 	return &TaskSubmitResult{
 		UpstreamTaskID: upstreamTaskID,
 		TaskData:       taskData,
 		Platform:       platform,
 		Quota:          finalQuota,
+		Task:           task,
 	}, nil
 }
 

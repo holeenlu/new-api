@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -214,10 +215,8 @@ func seedResponsesCompactBillingRequest(
 	common.SetContextKey(c, constant.ContextKeyTokenId, token.Id)
 	common.SetContextKey(c, constant.ContextKeyTokenKey, token.Key)
 	common.SetContextKey(c, constant.ContextKeyTokenGroup, group)
-	common.SetContextKey(c, constant.ContextKeyTokenUnlimited, false)
 	common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
 	c.Set("token_name", token.Name)
-	c.Set("token_quota", initialQuota)
 	require.Nil(t, middleware.SetupContextForSelectedChannel(
 		c,
 		channel,
@@ -311,6 +310,79 @@ func TestResponsesCompactPricesMappedModelBeforePreConsume(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactFirstAttemptReservesTrustedWalletBeforeUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupResponsesCompactBillingDB(t)
+	service.InitHttpClient()
+
+	const (
+		sourceModel = "compact-trusted-source"
+		mappedModel = "compact-trusted-mapped"
+		group       = "compact-trusted-group"
+		mappedPrice = 0.0001
+		mappedQuota = 50
+	)
+	initialQuota := common.GetTrustQuota() + 1000
+	configureResponsesCompactPrices(t, sourceModel, mappedModel, group, nil, mappedPrice, 1)
+
+	requestArrived := make(chan struct{}, 1)
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestArrived <- struct{}{}
+		<-releaseResponse
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmp_trusted","object":"response.compaction","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	c, recorder := seedResponsesCompactBillingRequest(
+		t,
+		server.URL,
+		sourceModel,
+		mappedModel,
+		group,
+		initialQuota,
+	)
+
+	var releaseOnce sync.Once
+	releaseUpstream := func() {
+		releaseOnce.Do(func() { close(releaseResponse) })
+	}
+	done := make(chan struct{})
+	go func() {
+		Relay(c, types.RelayFormatOpenAIResponsesCompaction)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		releaseUpstream()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	select {
+	case <-requestArrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compact request did not reach upstream")
+	}
+	var reservedUser model.User
+	require.NoError(t, model.DB.First(&reservedUser, 1).Error)
+	assert.Equal(t, initialQuota-mappedQuota, reservedUser.Quota)
+	var reservedToken model.Token
+	require.NoError(t, model.DB.First(&reservedToken, 1).Error)
+	assert.Equal(t, initialQuota-mappedQuota, reservedToken.RemainQuota)
+	assert.Equal(t, mappedQuota, reservedToken.UsedQuota)
+
+	releaseUpstream()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compact relay did not finish")
+	}
+	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
 func TestResponsesCompactViolationSettlesMappedReserveToEffectiveGroupFee(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupResponsesCompactBillingDB(t)
@@ -328,11 +400,19 @@ func TestResponsesCompactViolationSettlesMappedReserveToEffectiveGroupFee(t *tes
 	)
 	configureResponsesCompactPrices(t, sourceModel, mappedModel, group, nil, mappedPrice, groupRatio)
 
-	grokSettings := model_setting.GetGrokSettings()
-	savedGrokSettings := *grokSettings
-	grokSettings.ViolationDeductionEnabled = true
-	grokSettings.ViolationDeductionAmount = 0.001
-	t.Cleanup(func() { *grokSettings = savedGrokSettings })
+	savedGrokSettings := model_setting.GetGrokSettings()
+	registeredGrokSettings := config.GlobalConfig.Get("grok")
+	require.NotNil(t, registeredGrokSettings)
+	require.NoError(t, config.UpdateConfigFromMap(registeredGrokSettings, map[string]string{
+		"violation_deduction_enabled": "true",
+		"violation_deduction_amount":  "0.001",
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.UpdateConfigFromMap(registeredGrokSettings, map[string]string{
+			"violation_deduction_enabled": strconv.FormatBool(savedGrokSettings.ViolationDeductionEnabled),
+			"violation_deduction_amount":  strconv.FormatFloat(savedGrokSettings.ViolationDeductionAmount, 'g', -1, 64),
+		}))
+	})
 
 	var upstreamCalls atomic.Int32
 	requestArrived := make(chan struct{}, 1)
@@ -529,10 +609,8 @@ func TestResponsesCommittedFailureSettlesUsageAndRecordsChannelErrorWithoutRetry
 	common.SetContextKey(c, constant.ContextKeyTokenId, token.Id)
 	common.SetContextKey(c, constant.ContextKeyTokenKey, token.Key)
 	common.SetContextKey(c, constant.ContextKeyTokenGroup, group)
-	common.SetContextKey(c, constant.ContextKeyTokenUnlimited, false)
 	common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
 	c.Set("token_name", token.Name)
-	c.Set("token_quota", initialQuota)
 	require.Nil(t, middleware.SetupContextForSelectedChannel(c, channel, modelName))
 
 	Relay(c, types.RelayFormatOpenAIResponses)

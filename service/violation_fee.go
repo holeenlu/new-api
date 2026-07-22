@@ -33,7 +33,7 @@ func HasCSAMViolationMarker(err *types.NewAPIError) bool {
 		return true
 	}
 	msg := err.ToOpenAIError().Message
-	return strings.Contains(msg, CSAMViolationMarker) || strings.Contains(err.Error(), ContentViolatesUsageMarker)
+	return strings.Contains(msg, CSAMViolationMarker) || strings.Contains(msg, ContentViolatesUsageMarker)
 }
 
 func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
@@ -108,13 +108,18 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	}
 
 	settings := model_setting.GetGrokSettings()
-	if settings == nil || !settings.ViolationDeductionEnabled {
+	if !settings.ViolationDeductionEnabled {
 		return false
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
 	feeQuota, clamp := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
 	noteQuotaClamp(relayInfo, clamp)
+	if clamp != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("violation fee rejected after quota saturation: op=%s kind=%s original=%g clamped=%d user=%d model=%s",
+			clamp.Op, clamp.Kind, clamp.Original, clamp.Clamped, relayInfo.UserId, relayInfo.OriginModelName))
+		return false
+	}
 	if feeQuota <= 0 {
 		return false
 	}
@@ -125,31 +130,30 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		// billing session a paid request would have used instead of falling through to
 		// the legacy wallet-only delta path. Force a real reservation so the fee cannot
 		// enter the trusted-user settle path without funds already held.
-		forcePreConsume := relayInfo.ForcePreConsume
-		relayInfo.ForcePreConsume = true
-		preConsumeErr := PreConsumeBilling(ctx, feeQuota, relayInfo)
-		relayInfo.ForcePreConsume = forcePreConsume
+		preConsumeErr := PreConsumeBillingStrict(ctx, feeQuota, relayInfo)
 		if preConsumeErr != nil {
-			logger.LogError(ctx, fmt.Sprintf("failed to reserve violation fee: %s", preConsumeErr.Error()))
+			logger.LogWarn(ctx, fmt.Sprintf("violation fee not charged because strict pre-consume failed: %s", preConsumeErr.Error()))
 			return false
 		}
 	}
+	if err := relayInfo.Billing.ReserveStrict(feeQuota); err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("violation fee not charged because full reservation failed: %s", err.Error()))
+		return false
+	}
 
-	// Settle the existing reservation synchronously. Refunding first would create a
-	// window where a user whose remaining quota is below the fee cannot be charged,
-	// even though the reservation already covers the fee.
+	// Settle only after the complete fee is held. This makes settlement a zero or
+	// negative delta and prevents wallet funding from being overdrawn by a fee.
 	if err := SettleBilling(ctx, relayInfo, feeQuota); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", err.Error()))
+		logger.LogWarn(ctx, fmt.Sprintf("failed to settle fully reserved violation fee: %s", err.Error()))
 		if relayInfo.Billing == nil || !relayInfo.Billing.FundingCommitted() {
-			// The funding source was never committed (e.g. a trusted-bypass session
-			// whose wallet write failed), so no money moved: do not record a charge.
+			// Returning excess reservation failed at the funding source, so the
+			// original reservation remains refundable and no fee was committed.
 			return false
 		}
-		// BillingSession commits the funding source before adjusting token quota. If
-		// that second step fails, the fee is still financially committed and Refund is
-		// intentionally unavailable. Preserve the consume ledger/log instead of
-		// silently hiding a charge that already happened; BillingSession has already
-		// emitted the token-adjustment reconciliation error.
+		// The funding source returned reservation excess before token quota was
+		// adjusted. If that token step fails, the fee is still financially committed
+		// and Refund is intentionally unavailable. Preserve the consume ledger/log;
+		// BillingSession has already emitted the reconciliation error.
 		logger.LogWarn(ctx, "violation fee funding committed with a token quota adjustment error")
 	}
 

@@ -16,6 +16,8 @@ type FundingSource interface {
 	Source() string
 	// PreConsume 从该资金来源预扣 amount 额度
 	PreConsume(amount int) error
+	// PreConsumeStrict 仅在能够证明完整额度已预留时成功。
+	PreConsumeStrict(amount int) error
 	// Settle 根据差额调整资金来源（正数补扣，负数退还）
 	Settle(delta int) error
 	// Refund 退还所有预扣费
@@ -37,10 +39,21 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	if amount <= 0 {
 		return nil
 	}
-	if err := model.DecreaseUserQuota(w.userId, amount, false); err != nil {
+	if err := model.DecreaseUserQuotaIfEnough(w.userId, amount); err != nil {
 		return err
 	}
-	w.consumed = amount
+	w.consumed += amount
+	return nil
+}
+
+func (w *WalletFunding) PreConsumeStrict(amount int) error {
+	if amount <= 0 {
+		return nil
+	}
+	if err := model.DecreaseUserQuotaIfEnough(w.userId, amount); err != nil {
+		return err
+	}
+	w.consumed += amount
 	return nil
 }
 
@@ -101,11 +114,15 @@ func (s *SubscriptionFunding) PreConsume(_ int) error {
 	return nil
 }
 
+func (s *SubscriptionFunding) PreConsumeStrict(amount int) error {
+	return s.PreConsume(amount)
+}
+
 func (s *SubscriptionFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
-	return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta))
+	return model.CommitUserSubscriptionUsageDelta(s.subscriptionId, int64(delta))
 }
 
 func (s *SubscriptionFunding) Refund() error {

@@ -159,8 +159,11 @@ func CodexAlphaSearch(c *gin.Context) {
 			if readErr == nil {
 				retryParam.MarkSubscriptionOAuthSuccess()
 				if settleErr := service.SettleBilling(c, info, priceData.Quota); settleErr != nil {
-					lastError = types.NewErrorWithStatusCode(settleErr, types.ErrorCodeUpdateDataError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
-					break
+					if info.Billing == nil || !info.Billing.FundingCommitted() {
+						lastError = types.NewErrorWithStatusCode(settleErr, types.ErrorCodeUpdateDataError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+						break
+					}
+					logger.LogWarn(c, "alpha search funding committed with token quota reconciliation error: "+settleErr.Error())
 				}
 				billingSettled = true
 				service.LogAlphaSearchConsumption(c, info, priceData.Quota)

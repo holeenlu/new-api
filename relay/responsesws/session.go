@@ -33,6 +33,12 @@ const (
 	// Keep one upstream event bounded before gorilla/websocket allocates it in
 	// full. The downstream SSE bridge applies the same limit to an unframed event.
 	maxUpstreamMessageBytes = 16 << 20
+
+	// Bound connection-local continuation state. Evicting the oldest id is safe:
+	// it can only make a later continuation fail closed locally.
+	maxTrackedResponseIDsPerConnection = 4096
+	maxTrackedResponseIDBytes          = 4 << 10
+	maxTrackedResponseIDTotalBytes     = 1 << 20
 )
 
 // FirstEventTimeout bounds how long a freshly established upstream WebSocket may
@@ -90,6 +96,10 @@ type Session struct {
 	keyIndex              int
 	credentialFingerprint string
 	model                 string
+	responseIDs           map[string]struct{}
+	responseIDOrder       []string
+	responseIDHead        int
+	responseIDBytes       int
 	httpFallback          bool
 	pendingID             int
 	pendingKeyIndex       int
@@ -175,6 +185,8 @@ func (s *Session) Close() error {
 		err = s.conn.Close()
 		s.conn = nil
 	}
+	s.connectedAt = time.Time{}
+	s.resetResponseIDsLocked()
 	// Per-turn leases are released by the turn's response body (or its failure
 	// path), so there is no connection-scoped lease to release here.
 	return err
@@ -197,7 +209,53 @@ func (s *Session) HasLiveConnection() bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conn != nil && !s.httpFallback
+	return s.hasUsableConnectionLocked()
+}
+
+// HasTransportState reports whether this downstream session is already bound
+// to an upstream transport or credential. A dynamically disabled WebSocket
+// channel must keep routing such a session through its state machine even after
+// the socket was lost, so model affinity and fail-closed continuation rules are
+// not bypassed by a direct HTTP call.
+func (s *Session) HasTransportState() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn != nil || s.httpFallback || s.channelID != 0 || s.pendingID != 0 || s.model != ""
+}
+
+// CanContinue reports whether previousResponseID was observed on the current,
+// still-usable upstream WebSocket. Merely having some live connection is not
+// sufficient: response ids are owned by the connection generation that emitted
+// them and must never be replayed onto a replacement connection.
+func (s *Session) CanContinue(previousResponseID string) bool {
+	if s == nil || strings.TrimSpace(previousResponseID) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasUsableConnectionLocked() {
+		return false
+	}
+	_, ok := s.responseIDs[previousResponseID]
+	return ok
+}
+
+func (s *Session) hasUsableConnectionLocked() bool {
+	if s.conn == nil || s.httpFallback {
+		return false
+	}
+	if !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
+		// Admission can reject a continuation before doRequest runs. Reclaim the
+		// expired socket and its connection-local ids here as well, otherwise a
+		// client that sends only rejected continuations could retain both until the
+		// downstream session eventually disconnects.
+		s.invalidateLocked(s.conn)
+		return false
+	}
+	return true
 }
 
 // Binding returns the credential currently pinned to the session.
@@ -231,6 +289,7 @@ func (s *Session) ResetChannelForRetry() {
 	s.keyIndex = 0
 	s.credentialFingerprint = ""
 	s.model = ""
+	s.resetResponseIDsLocked()
 	s.httpFallback = false
 	s.pendingID = 0
 	s.pendingKeyIndex = 0
@@ -262,6 +321,20 @@ func (s *Session) ConfirmHTTPFallbackSuccess() {
 // SSE-framed HTTP response the relay handler streams to the client. It falls back
 // to HTTP when the upstream does not support WebSocket.
 func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	return s.doRequest(c, driver, info, requestBody, true)
+}
+
+// DoRequestOnCurrentTransport keeps an already-live upstream WebSocket as the
+// owner of this downstream session without permitting a new WebSocket dial. It
+// is used when channel configuration disables new WebSocket upgrades while a
+// session is already active. If the current connection becomes unusable before
+// a self-contained turn is written, the session closes it and explicitly
+// degrades to HTTP; a connection-local continuation still fails closed.
+func (s *Session) DoRequestOnCurrentTransport(c *gin.Context, driver Driver, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	return s.doRequest(c, driver, info, requestBody, false)
+}
+
+func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.RelayInfo, requestBody io.Reader, allowNewWebSocket bool) (*http.Response, error) {
 	if s == nil || c == nil || driver == nil || info == nil || requestBody == nil {
 		return nil, errors.New("responses websocket: invalid request")
 	}
@@ -295,6 +368,16 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	if err != nil {
 		return nil, err
 	}
+	modelValue, ok := payload["model"].(string)
+	if !ok || strings.TrimSpace(modelValue) == "" {
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("responses websocket outbound model is missing or invalid"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	model := modelValue
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -320,8 +403,10 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	model := strings.TrimSpace(info.UpstreamModelName)
-	if s.model != "" && !strings.EqualFold(s.model, model) {
+	// Bind affinity to the exact provider payload rather than RelayInfo. Raw
+	// passthrough intentionally skips model mapping, and parameter overrides can
+	// also change the body after mapping; only the outbound JSON is authoritative.
+	if s.model != "" && s.model != model {
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("responses websocket cannot switch models within one session"),
 			types.ErrorCodeInvalidRequest,
@@ -336,20 +421,37 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		// Proactively recycle the connection before the upstream's 60-minute cap
 		// for a self-contained turn. A previous_response_id is connection-local and
 		// cannot be transparently replayed on a replacement connection.
-		logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
+		if allowNewWebSocket {
+			logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
+		} else {
+			logger.LogInfo(c, "responses websocket connection reached its lifetime; new upgrades are disabled, falling back to HTTP")
+		}
 		s.invalidateLocked(s.conn)
 	}
-	if continuation && (s.conn == nil || s.httpFallback) {
-		// previous_response_id identifies state owned by the live upstream
-		// WebSocket. It is unsafe to establish a replacement connection or send the
-		// request over HTTP because neither transport can resolve that state, and a
-		// replay could execute the continuation against the wrong conversation.
-		return nil, NewContinuationUnavailableError()
+	if continuation {
+		_, ownedByCurrentConnection := s.responseIDs[previousResponseID]
+		if s.conn != nil && !s.httpFallback && ownedByCurrentConnection {
+			// The exact response id was emitted by this connection generation.
+		} else {
+			// previous_response_id identifies state owned by the live upstream
+			// WebSocket. It is unsafe to establish a replacement connection or send the
+			// request over HTTP because neither transport can resolve that state, and a
+			// replay could execute the continuation against the wrong conversation.
+			return nil, NewContinuationUnavailableError()
+		}
 	}
 	if s.httpFallback {
 		// Already degraded to HTTP for this session; the fallback reserves its own
 		// per-request capacity. Continuations were rejected above because their
 		// previous_response_id is connection-local.
+		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
+	}
+	if s.conn == nil && !allowNewWebSocket {
+		// Channel configuration may be disabled while this downstream session is
+		// open. Never turn that into a new upstream WebSocket dial. The prior socket
+		// (if any) has already been invalidated above, so an HTTP response id cannot
+		// later be mixed with state owned by an old WebSocket.
+		s.httpFallback = true
 		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
 	}
 
@@ -362,7 +464,7 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 	justConnected := false
 	if s.conn == nil {
-		if err := s.connect(c, driver, info); err != nil {
+		if err := s.connect(c, driver, info, model); err != nil {
 			if errors.Is(err, ErrUpgradeRequired) {
 				// Reuse this turn's lease for the HTTP fallback rather than reserving a
 				// second slot for the same turn.
@@ -507,9 +609,10 @@ func (s *Session) invalidateLocked(conn *websocket.Conn) {
 		s.conn = nil
 	}
 	s.connectedAt = time.Time{}
+	s.resetResponseIDsLocked()
 }
 
-func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.RelayInfo) error {
+func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.RelayInfo, model string) error {
 	webSocketURL, headers, err := driver.DialUpstream(c, info)
 	if err != nil {
 		return err
@@ -590,7 +693,8 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		info.ChannelMultiKeyIndex,
 		info.ApiKey,
 	)
-	s.model = strings.TrimSpace(info.UpstreamModelName)
+	s.model = model
+	s.resetResponseIDsLocked()
 	driver.OnUpstreamConnected(c, info)
 	return nil
 }
@@ -637,7 +741,10 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 		return false
 	}
 	var event struct {
-		Type string `json:"type"`
+		Type     string `json:"type"`
+		Response struct {
+			ID string `json:"id"`
+		} `json:"response"`
 	}
 	if err := common.Unmarshal(payload, &event); err != nil {
 		s.invalidate(conn)
@@ -653,6 +760,17 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 		}
 		payload = normalized
 		event.Type = normalizedType
+		if err := common.Unmarshal(payload, &event); err != nil {
+			s.invalidate(conn)
+			_ = writer.CloseWithError(err)
+			return true
+		}
+	}
+	if event.Response.ID != "" {
+		if err := s.rememberResponseID(conn, event.Response.ID); err != nil {
+			_ = writer.CloseWithError(err)
+			return true
+		}
 	}
 	if _, err := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
 		// The downstream reader stopped consuming mid-stream. Invalidate the
@@ -677,6 +795,60 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 		return true
 	}
 	return false
+}
+
+func (s *Session) rememberResponseID(conn *websocket.Conn, responseID string) error {
+	if responseID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != conn || s.httpFallback {
+		return nil
+	}
+	if len(responseID) > maxTrackedResponseIDBytes {
+		s.invalidateLocked(conn)
+		return fmt.Errorf(
+			"responses websocket response id exceeds the %d-byte limit",
+			maxTrackedResponseIDBytes,
+		)
+	}
+	if s.responseIDs == nil {
+		s.responseIDs = make(map[string]struct{})
+	}
+	if _, exists := s.responseIDs[responseID]; exists {
+		return nil
+	}
+	evictedID := ""
+	evictedBytes := 0
+	if len(s.responseIDOrder) >= maxTrackedResponseIDsPerConnection {
+		evictedID = s.responseIDOrder[s.responseIDHead]
+		evictedBytes = len(evictedID)
+	}
+	if s.responseIDBytes-evictedBytes > maxTrackedResponseIDTotalBytes-len(responseID) {
+		s.invalidateLocked(conn)
+		return fmt.Errorf(
+			"responses websocket response ids exceed the %d-byte cumulative limit",
+			maxTrackedResponseIDTotalBytes,
+		)
+	}
+	if len(s.responseIDOrder) < maxTrackedResponseIDsPerConnection {
+		s.responseIDOrder = append(s.responseIDOrder, responseID)
+	} else {
+		delete(s.responseIDs, evictedID)
+		s.responseIDOrder[s.responseIDHead] = responseID
+		s.responseIDHead = (s.responseIDHead + 1) % maxTrackedResponseIDsPerConnection
+	}
+	s.responseIDs[responseID] = struct{}{}
+	s.responseIDBytes += len(responseID) - evictedBytes
+	return nil
+}
+
+func (s *Session) resetResponseIDsLocked() {
+	s.responseIDs = nil
+	s.responseIDOrder = nil
+	s.responseIDHead = 0
+	s.responseIDBytes = 0
 }
 
 // streamAsSSE relays upstream WebSocket events to the SSE pipe. firstPayload, if

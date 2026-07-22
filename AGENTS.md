@@ -152,6 +152,27 @@ Classify changes before implementation:
   authentication contracts, billing behavior, or provider integrations require
   an ADR under `docs/adr/` before implementation.
 
+**Change-first evaluation gate.** For any request classified Cross-module or
+Architectural, do not start implementing. First reply with only a short
+evaluation, then stop and wait for the user's decision:
+
+1. **True outcome** — restate the underlying result the user wants, not the
+   shape they asked for; if it is unclear, ask before evaluating.
+2. **Whether to do it at all** — is it worth it, does it solve a real problem,
+   is something else more important first, or is the request unnecessary?
+3. **Smallest viable shape** — can an existing capability be extended or
+   consolidated instead of new code? Is there a smaller change (e.g. a dropdown
+   in an existing screen instead of a new workflow)? Would deleting code be the
+   right move?
+4. **Materially different recommendation** — if the best approach differs from
+   what was asked, say so plainly, with the reason.
+
+Implement only after the user picks a direction. Local changes are exempt — do
+them directly. This gate is architectural pushback, not bureaucracy on every
+edit; when the classification is unclear, state which one you chose and why. The
+user has explicitly asked to be pushed back on: declining or reshaping a request
+with evidence is expected behavior here, not overstepping.
+
 Follow the architecture records in `docs/architecture/`. `overview.md` records
 ownership boundaries, `invariants.md` lists release-blocking guarantees, and
 `health.md` tracks approved structural follow-up. Update the relevant record

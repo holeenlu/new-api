@@ -2,6 +2,9 @@ package config
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testConfigWithMap struct {
@@ -93,4 +96,23 @@ func TestUpdateConfigFromMap_ScalarFieldsUnchanged(t *testing.T) {
 	if cfg.Modes["m"] != "v" {
 		t.Errorf("Modes should be unchanged, got %v", cfg.Modes)
 	}
+}
+
+func TestUpdateConfigFromMapPreservesSharedPointerIdentity(t *testing.T) {
+	type sharedRuntimeState struct {
+		Revision int `json:"revision"`
+	}
+	type pointerBackedConfig struct {
+		State *sharedRuntimeState `json:"state"`
+	}
+
+	runtimeState := &sharedRuntimeState{Revision: 1}
+	cfg := &pointerBackedConfig{State: runtimeState}
+
+	require.NoError(t, UpdateConfigFromMap(cfg, map[string]string{
+		"state": `{"revision":2}`,
+	}))
+
+	assert.Same(t, runtimeState, cfg.State)
+	assert.Equal(t, 2, runtimeState.Revision)
 }

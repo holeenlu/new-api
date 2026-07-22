@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -14,6 +15,191 @@ import (
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
+
+// CreateTaskSubmissionMarker persists the billing owner before the first
+// upstream write. PENDING_SUBMIT rows are excluded from ordinary polling but
+// remain visible to the timeout sweeper, so a crash cannot leave a reservation
+// without a durable reconciliation marker.
+func CreateTaskSubmissionMarker(info *relaycommon.RelayInfo, platform constant.TaskPlatform) (*model.Task, error) {
+	if info == nil || info.TaskRelayInfo == nil {
+		return nil, fmt.Errorf("task relay info is unavailable")
+	}
+	if info.PersistedTaskID > 0 {
+		return model.RenewPendingTaskSubmission(info.PersistedTaskID)
+	}
+
+	fundingQuota := 0
+	tokenQuota := 0
+	tokenTracked := false
+	if info.Billing != nil {
+		session, ok := info.Billing.(*BillingSession)
+		if !ok {
+			return nil, fmt.Errorf("unsupported task billing session %T", info.Billing)
+		}
+		session.mu.Lock()
+		if session.settled || session.refunded {
+			session.mu.Unlock()
+			return nil, fmt.Errorf("task billing session is already closed")
+		}
+		fundingQuota = session.preConsumedQuota
+		tokenQuota = session.tokenConsumed
+		tokenTracked = session.relayInfo != nil && !session.relayInfo.IsPlayground
+		session.mu.Unlock()
+	}
+	if fundingQuota < 0 || fundingQuota > common.MaxQuota || tokenQuota < 0 || tokenQuota > common.MaxQuota {
+		return nil, fmt.Errorf("invalid task billing reservation funding=%d token=%d", fundingQuota, tokenQuota)
+	}
+	if tokenQuota > 0 && info.TokenId <= 0 {
+		return nil, fmt.Errorf("task token reservation %d has no token id", tokenQuota)
+	}
+
+	task := model.InitTask(platform, info)
+	task.Status = model.TaskStatusPendingSubmit
+	task.Action = info.Action
+	task.Quota = fundingQuota
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.BillingReservation = &model.TaskBillingReservation{
+		FundingQuota: fundingQuota,
+		TokenQuota:   tokenQuota,
+		TokenTracked: tokenTracked,
+	}
+	task.PrivateData.BillingContext = &model.TaskBillingContext{
+		ModelPrice:      info.PriceData.ModelPrice,
+		GroupRatio:      info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio:      info.PriceData.ModelRatio,
+		OtherRatios:     info.PriceData.OtherRatios(),
+		OriginModelName: info.OriginModelName,
+		PerCallBilling:  common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice,
+	}
+	if err := task.Insert(); err != nil {
+		return nil, err
+	}
+	info.PersistedTaskID = task.ID
+	return task, nil
+}
+
+// CommitTaskSubmission first makes the accepted upstream task pollable, then
+// atomically advances funding, token usage, and the task refund ledger. If the
+// settlement transaction fails, the accepted task remains persisted with its
+// original exact reservations and can still be polled or refunded later.
+func CommitTaskSubmission(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task, actualQuota int) error {
+	if info == nil || task == nil || task.ID <= 0 {
+		return fmt.Errorf("invalid task submission settlement")
+	}
+	if actualQuota < 0 {
+		return fmt.Errorf("actual task quota cannot be negative: %d", actualQuota)
+	}
+
+	if task.Status == model.TaskStatusPendingSubmit {
+		renewed, err := model.RenewPendingTaskSubmission(task.ID)
+		if err != nil {
+			return fmt.Errorf("renew accepted task marker: %w", err)
+		}
+		// Preserve the accepted metadata assembled from the upstream response;
+		// only the lease generation comes from the renewed persisted row.
+		task.SubmitTime = renewed.SubmitTime
+		fromStatus := task.Status
+		task.Status = model.TaskStatusSubmitted
+		won, err := task.UpdateWithStatus(fromStatus)
+		if err != nil {
+			return fmt.Errorf("persist accepted task: %w", err)
+		}
+		if !won {
+			persisted, err := model.GetTaskByID(task.ID)
+			if err != nil {
+				return fmt.Errorf("reload accepted task: %w", err)
+			}
+			if persisted.Status != model.TaskStatusSubmitted {
+				return fmt.Errorf("task %d changed to status %s before acceptance commit", task.ID, persisted.Status)
+			}
+			*task = *persisted
+		}
+	}
+
+	if info.Billing == nil {
+		if actualQuota != 0 {
+			return fmt.Errorf("task %d has quota %d without a billing session", task.ID, actualQuota)
+		}
+		return nil
+	}
+	session, ok := info.Billing.(*BillingSession)
+	if !ok {
+		return fmt.Errorf("unsupported task billing session %T", info.Billing)
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.refunded {
+		return fmt.Errorf("task billing session already refunded")
+	}
+	if session.settled {
+		persisted, err := model.GetTaskByID(task.ID)
+		if err != nil {
+			return err
+		}
+		*task = *persisted
+		return nil
+	}
+	settledTask, _, _, err := model.SettleTaskQuotaAtomically(task.ID, actualQuota)
+	if err != nil {
+		return err
+	}
+
+	fundingDelta := actualQuota - session.preConsumedQuota
+	session.fundingSettled = true
+	session.settled = true
+	if session.funding.Source() == BillingSourceSubscription {
+		info.SubscriptionPostDelta += int64(fundingDelta)
+	}
+	*task = *settledTask
+
+	if actualQuota != 0 {
+		if info.BillingSource == BillingSourceSubscription {
+			checkAndSendSubscriptionQuotaNotify(info)
+		} else {
+			checkAndSendQuotaNotify(info, fundingDelta, session.preConsumedQuota)
+		}
+	}
+	return nil
+}
+
+// FailTaskSubmission transfers a terminal pre-acceptance failure to the
+// persisted marker and its atomic refund path. Callers must not also invoke
+// BillingSession.Refund after a marker has been created.
+func FailTaskSubmission(ctx context.Context, taskID int64, reason string) bool {
+	task, err := model.GetTaskByID(taskID)
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("load pending task %d for failure: %s", taskID, err.Error()))
+		return false
+	}
+	if task.Status == model.TaskStatusPendingSubmit {
+		fromStatus := task.Status
+		task.Status = model.TaskStatusFailure
+		task.Progress = "100%"
+		task.FinishTime = time.Now().Unix()
+		task.FailReason = reason
+		won, err := task.UpdateWithStatus(fromStatus)
+		if err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("persist pending task %s failure: %s", task.TaskID, err.Error()))
+			return false
+		}
+		if !won {
+			task, err = model.GetTaskByID(taskID)
+			if err != nil {
+				logger.LogWarn(ctx, fmt.Sprintf("reload pending task %d after CAS: %s", taskID, err.Error()))
+				return false
+			}
+		}
+	}
+	if task.Status != model.TaskStatusFailure {
+		logger.LogWarn(ctx, fmt.Sprintf("pending task %s cannot fail from status %s", task.TaskID, task.Status))
+		return false
+	}
+	return RefundTaskQuota(ctx, task, reason)
+}
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
@@ -70,54 +256,6 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo) {
 // 异步任务计费辅助函数
 // ---------------------------------------------------------------------------
 
-// resolveTokenKey 通过 TokenId 运行时获取令牌 Key（用于 Redis 缓存操作）。
-// 如果令牌已被删除或查询失败，返回空字符串。
-func resolveTokenKey(ctx context.Context, tokenId int, taskID string) string {
-	token, err := model.GetTokenById(tokenId)
-	if err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("获取令牌 key 失败 (tokenId=%d, task=%s): %s", tokenId, taskID, err.Error()))
-		return ""
-	}
-	return token.Key
-}
-
-// taskIsSubscription 判断任务是否通过订阅计费。
-func taskIsSubscription(task *model.Task) bool {
-	return task.PrivateData.BillingSource == BillingSourceSubscription && task.PrivateData.SubscriptionId > 0
-}
-
-// taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
-func taskAdjustFunding(task *model.Task, delta int) error {
-	if taskIsSubscription(task) {
-		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
-	}
-	if delta > 0 {
-		return model.DecreaseUserQuota(task.UserId, delta, false)
-	}
-	return model.IncreaseUserQuota(task.UserId, -delta, false)
-}
-
-// taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
-// 需要通过 resolveTokenKey 运行时获取 key（不从 PrivateData 中读取）。
-func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
-	if task.PrivateData.TokenId <= 0 || delta == 0 {
-		return
-	}
-	tokenKey := resolveTokenKey(ctx, task.PrivateData.TokenId, task.TaskID)
-	if tokenKey == "" {
-		return
-	}
-	var err error
-	if delta > 0 {
-		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
-	} else {
-		err = model.IncreaseTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
-	}
-	if err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("调整令牌额度失败 (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
-	}
-}
-
 // taskBillingOther 从 task 的 BillingContext 构建日志 Other 字段。
 func taskBillingOther(task *model.Task) map[string]interface{} {
 	other := make(map[string]interface{})
@@ -161,24 +299,28 @@ func taskModelName(task *model.Task) string {
 }
 
 // RefundTaskQuota 统一的任务失败退款逻辑。
-// 当异步任务失败时，将预扣的 quota 退还给用户（支持钱包和订阅），并退还令牌额度。
-// 返回资金来源是否已成功退还；失败时保留 quota 作为后续对账标记。
+// quota marker、资金来源和 token 账本在同一主库事务中提交；失败时全部
+// 回滚供后续对账重试，重复调用不会再次退款。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
 		return true
 	}
 
-	// 1. 退还资金来源（钱包或订阅）
-	if err := taskAdjustFunding(task, -quota); err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("退还资金来源失败 task %s: %s", task.TaskID, err.Error()))
+	refunded, err := model.RefundTaskQuotaAtomically(task.ID, quota)
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("原子退还任务额度失败 task %s: %s", task.TaskID, err.Error()))
 		return false
 	}
+	task.Quota = 0
+	if !refunded {
+		// Another caller already committed the same refund. Do not duplicate its
+		// accounting log.
+		return true
+	}
 
-	// 2. 退还令牌额度
-	taskAdjustTokenQuota(ctx, task, -quota)
-
-	// 3. 记录日志
+	// The primary-database ledgers and marker are committed exactly once; the
+	// log database remains best-effort observability.
 	other := taskBillingOther(task)
 	other["task_id"] = task.TaskID
 	other["reason"] = reason
@@ -194,12 +336,6 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		Other:     other,
 	})
 
-	// 4. 资金退款完成后再清除持久化标记；失败时保留非零 quota，
-	// 由后续对账重试。回写失败必须显式告警，避免漏掉潜在的重复退款风险。
-	task.Quota = 0
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("退款成功但清除 task quota 失败 task %s: %s", task.TaskID, err.Error()))
-	}
 	return true
 }
 
@@ -211,14 +347,26 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	if actualQuota <= 0 {
 		return
 	}
-	preConsumedQuota := task.Quota
-	quotaDelta := actualQuota - preConsumedQuota
+	if task.ID <= 0 {
+		logger.LogError(ctx, fmt.Sprintf("任务差额原子结算失败 task %s: task is not persisted", task.TaskID))
+		return
+	}
 
-	if quotaDelta == 0 {
+	// Always reconcile against the locked persisted reservation. A caller may
+	// hold an old Task.Quota after another poller has already settled this row;
+	// deriving the delta from that snapshot would duplicate or overstate stats.
+	settledTask, quotaDelta, settlementChanged, err := model.SettleTaskQuotaAtomically(task.ID, actualQuota)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("任务差额原子结算失败 task %s: %s", task.TaskID, err.Error()))
+		return
+	}
+	*task = *settledTask
+	if !settlementChanged {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 预扣费准确（%s，%s）",
 			task.TaskID, logger.LogQuota(actualQuota), reason))
 		return
 	}
+	preConsumedQuota := actualQuota - quotaDelta
 
 	logger.LogInfo(ctx, fmt.Sprintf("任务 %s 差额结算：delta=%s（实际：%s，预扣：%s，%s）",
 		task.TaskID,
@@ -228,26 +376,14 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		reason,
 	))
 
-	// 调整资金来源
-	if err := taskAdjustFunding(task, quotaDelta); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("差额结算资金调整失败 task %s: %s", task.TaskID, err.Error()))
-		return
-	}
-
-	// 调整令牌额度
-	taskAdjustTokenQuota(ctx, task, quotaDelta)
-
-	task.Quota = actualQuota
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
-	}
-
 	var logType int
 	var logQuota int
 	if quotaDelta > 0 {
 		logType = model.LogTypeConsume
 		logQuota = quotaDelta
-		model.UpdateUserUsedQuotaAndRequestCount(task.UserId, quotaDelta)
+		// The accepted submission already owns this task's request count.
+		// Completion reconciliation adjusts usage only.
+		model.UpdateUserUsedQuota(task.UserId, quotaDelta)
 		model.UpdateChannelUsedQuota(task.ChannelId, quotaDelta)
 	} else {
 		logType = model.LogTypeRefund

@@ -163,6 +163,53 @@ func TestSnapshot_Roundtrip(t *testing.T) {
 	assert.JSONEq(t, string(task.Data), string(snap.Data))
 }
 
+func TestPendingTaskLeaseRenewalInvalidatesStaleTimeoutCAS(t *testing.T) {
+	truncateTables(t)
+
+	task := &Task{
+		TaskID:     "task_pending_lease",
+		Status:     TaskStatusPendingSubmit,
+		Progress:   "0%",
+		SubmitTime: time.Now().Add(-time.Hour).Unix(),
+		Quota:      100,
+		Data:       json.RawMessage(`{}`),
+	}
+	insertTask(t, task)
+	staleSubmitTime := task.SubmitTime
+
+	renewed, err := RenewPendingTaskSubmission(task.ID)
+	require.NoError(t, err)
+	assert.Greater(t, renewed.SubmitTime, staleSubmitTime)
+
+	task.Status = TaskStatusFailure
+	task.Progress = "100%"
+	won, err := task.UpdateTimedOutWithStatus(TaskStatusPendingSubmit, staleSubmitTime)
+	require.NoError(t, err)
+	assert.False(t, won, "a sweep selected before lease renewal must lose its CAS")
+
+	stored, err := GetTaskByID(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, TaskStatus(TaskStatusPendingSubmit), stored.Status)
+	assert.Equal(t, renewed.SubmitTime, stored.SubmitTime)
+}
+
+func TestPendingTaskLeaseRenewalRejectsTerminalMarker(t *testing.T) {
+	truncateTables(t)
+
+	task := &Task{
+		TaskID:     "task_terminal_lease",
+		Status:     TaskStatusFailure,
+		Progress:   "100%",
+		SubmitTime: time.Now().Unix(),
+		Quota:      0,
+		Data:       json.RawMessage(`{}`),
+	}
+	insertTask(t, task)
+
+	_, err := RenewPendingTaskSubmission(task.ID)
+	require.Error(t, err)
+}
+
 // ---------------------------------------------------------------------------
 // UpdateWithStatus CAS — DB integration tests
 // ---------------------------------------------------------------------------
@@ -257,28 +304,219 @@ func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {
 	assert.Equal(t, 1, winCount, "exactly one goroutine should win the CAS")
 }
 
-func TestClaimQuotaForRefund_OnlyOneClaimSucceeds(t *testing.T) {
+func TestUpdateWithStatusPreservesSettledTaskLedgerFromStalePoller(t *testing.T) {
 	truncateTables(t)
 
+	user := User{Id: 61, Username: "task-stale-ledger-user", Quota: 900}
+	require.NoError(t, DB.Create(&user).Error)
+	token := Token{
+		Id:          62,
+		UserId:      user.Id,
+		Key:         "task-stale-ledger-token",
+		RemainQuota: 900,
+		UsedQuota:   100,
+	}
+	require.NoError(t, DB.Create(&token).Error)
 	task := &Task{
-		TaskID: "task_refund_claim",
-		Status: TaskStatusFailure,
-		Quota:  1000,
-		Data:   json.RawMessage(`{}`),
+		TaskID:   "task_stale_poll_ledger",
+		UserId:   user.Id,
+		Status:   TaskStatusSubmitted,
+		Quota:    100,
+		Progress: "50%",
+		Data:     json.RawMessage(`{"status":"submitted"}`),
+		PrivateData: TaskPrivateData{
+			BillingSource: "wallet",
+			TokenId:       token.Id,
+			BillingReservation: &TaskBillingReservation{
+				FundingQuota: 100,
+				TokenQuota:   100,
+				TokenTracked: true,
+			},
+		},
 	}
 	insertTask(t, task)
 
-	claimed, err := ClaimQuotaForRefund(task.ID, task.Quota)
-	require.NoError(t, err)
-	assert.True(t, claimed)
+	var stalePoller Task
+	require.NoError(t, DB.First(&stalePoller, task.ID).Error)
 
-	claimed, err = ClaimQuotaForRefund(task.ID, task.Quota)
+	settled, delta, changed, err := SettleTaskQuotaAtomically(task.ID, 300)
 	require.NoError(t, err)
-	assert.False(t, claimed)
+	require.True(t, changed)
+	assert.Equal(t, 200, delta)
+	assert.Equal(t, 300, settled.Quota)
+
+	stalePoller.Status = TaskStatusSuccess
+	stalePoller.Progress = "100%"
+	stalePoller.PrivateData.ResultURL = "https://example.com/final.mp4"
+	stalePoller.Data = json.RawMessage(`{"status":"success"}`)
+	won, err := stalePoller.UpdateWithStatus(TaskStatusSubmitted)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	var storedTask Task
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusSuccess), storedTask.Status)
+	assert.Equal(t, "100%", storedTask.Progress)
+	assert.Equal(t, "https://example.com/final.mp4", storedTask.PrivateData.ResultURL)
+	assert.JSONEq(t, `{"status":"success"}`, string(storedTask.Data))
+	assert.Equal(t, 300, storedTask.Quota)
+	require.NotNil(t, storedTask.PrivateData.BillingReservation)
+	assert.Equal(t, 300, storedTask.PrivateData.BillingReservation.FundingQuota)
+	assert.Equal(t, 300, storedTask.PrivateData.BillingReservation.TokenQuota)
+	assert.True(t, storedTask.PrivateData.BillingReservation.TokenTracked)
+
+	var storedUser User
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, 700, storedUser.Quota)
+	var storedToken Token
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, 700, storedToken.RemainQuota)
+	assert.Equal(t, 300, storedToken.UsedQuota)
+
+	_, delta, changed, err = SettleTaskQuotaAtomically(task.ID, 300)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Zero(t, delta)
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, 700, storedUser.Quota)
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, 700, storedToken.RemainQuota)
+	assert.Equal(t, 300, storedToken.UsedQuota)
+}
+
+func TestUpdateTimedOutWithStatusPreservesSettledTaskLedger(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Id: 63, Username: "task-timeout-ledger-user", Quota: 900}
+	require.NoError(t, DB.Create(&user).Error)
+	token := Token{Id: 64, UserId: user.Id, Key: "task-timeout-ledger-token", RemainQuota: 900, UsedQuota: 100}
+	require.NoError(t, DB.Create(&token).Error)
+	task := &Task{
+		TaskID:     "task_stale_timeout_ledger",
+		UserId:     user.Id,
+		Status:     TaskStatusSubmitted,
+		SubmitTime: TaskRefundLegacyCutoff,
+		Quota:      100,
+		Progress:   "50%",
+		Data:       json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{
+			BillingSource: "wallet",
+			TokenId:       token.Id,
+			BillingReservation: &TaskBillingReservation{
+				FundingQuota: 100,
+				TokenQuota:   100,
+				TokenTracked: true,
+			},
+		},
+	}
+	insertTask(t, task)
+
+	var staleTimeout Task
+	require.NoError(t, DB.First(&staleTimeout, task.ID).Error)
+	_, _, changed, err := SettleTaskQuotaAtomically(task.ID, 300)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	staleTimeout.Status = TaskStatusFailure
+	staleTimeout.Progress = "100%"
+	staleTimeout.FailReason = "timed out"
+	won, err := staleTimeout.UpdateTimedOutWithStatus(TaskStatusSubmitted, task.SubmitTime)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	var storedTask Task
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Equal(t, 300, storedTask.Quota)
+	require.NotNil(t, storedTask.PrivateData.BillingReservation)
+	assert.Equal(t, 300, storedTask.PrivateData.BillingReservation.FundingQuota)
+	assert.Equal(t, 300, storedTask.PrivateData.BillingReservation.TokenQuota)
+}
+
+func TestRefundTaskQuotaAtomicallyCommitsWalletAndTokenOnce(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Id: 71, Username: "task-refund-user", Quota: 700}
+	require.NoError(t, DB.Create(&user).Error)
+	token := Token{
+		Id:          72,
+		UserId:      user.Id,
+		Key:         "task-refund-token",
+		RemainQuota: 700,
+		UsedQuota:   300,
+	}
+	require.NoError(t, DB.Create(&token).Error)
+	task := &Task{
+		TaskID:      "task_refund_atomic",
+		UserId:      user.Id,
+		Status:      TaskStatusFailure,
+		Quota:       300,
+		Data:        json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{BillingSource: "wallet", TokenId: token.Id},
+	}
+	insertTask(t, task)
+
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.NoError(t, err)
+	assert.True(t, refunded)
+
+	refunded, err = RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.NoError(t, err)
+	assert.False(t, refunded)
 
 	var reloaded Task
 	require.NoError(t, DB.First(&reloaded, task.ID).Error)
 	assert.Zero(t, reloaded.Quota)
+	var storedUser User
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, 1000, storedUser.Quota)
+	var storedToken Token
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, 1000, storedToken.RemainQuota)
+	assert.Zero(t, storedToken.UsedQuota)
+}
+
+func TestRefundTaskQuotaAtomicallyUsesSeparateReservationAmounts(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Id: 771, Username: "task-split-refund-user", Quota: 700}
+	require.NoError(t, DB.Create(&user).Error)
+	token := Token{
+		Id:          772,
+		UserId:      user.Id,
+		Key:         "task-split-refund-token",
+		RemainQuota: 900,
+		UsedQuota:   100,
+	}
+	require.NoError(t, DB.Create(&token).Error)
+	task := &Task{
+		TaskID: "task_split_refund_atomic",
+		UserId: user.Id,
+		Status: TaskStatusFailure,
+		Quota:  300,
+		Data:   json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{
+			BillingSource: "wallet",
+			TokenId:       token.Id,
+			BillingReservation: &TaskBillingReservation{
+				FundingQuota: 300,
+				TokenQuota:   100,
+				TokenTracked: true,
+			},
+		},
+	}
+	insertTask(t, task)
+
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.NoError(t, err)
+	assert.True(t, refunded)
+
+	var storedUser User
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, 1000, storedUser.Quota)
+	var storedToken Token
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, 1000, storedToken.RemainQuota)
+	assert.Zero(t, storedToken.UsedQuota)
 }
 
 func TestGetUnrefundedFailedTasks_FiltersAndLimits(t *testing.T) {
@@ -307,32 +545,129 @@ func TestGetUnrefundedFailedTasks_FiltersAndLimits(t *testing.T) {
 	assert.Empty(t, GetUnrefundedFailedTasks(updatedBefore, 0))
 }
 
-func TestRestoreQuotaAfterFailedRefund_OnlyRestoresClaimedMarker(t *testing.T) {
+func TestRefundTaskQuotaAtomicallyRollsBackMarkerAndTokenOnFundingFailure(t *testing.T) {
 	truncateTables(t)
 
+	token := Token{Id: 73, UserId: 1, Key: "failed-task-refund-token", RemainQuota: 250, UsedQuota: 750}
+	require.NoError(t, DB.Create(&token).Error)
 	task := &Task{
-		TaskID: "task_refund_restore",
-		Status: TaskStatusFailure,
-		Quota:  750,
-		Data:   json.RawMessage(`{}`),
+		TaskID:      "task_refund_rollback",
+		Status:      TaskStatusFailure,
+		Quota:       750,
+		Data:        json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{BillingSource: "subscription", SubscriptionId: 9999, TokenId: token.Id},
 	}
 	insertTask(t, task)
 
-	claimed, err := ClaimQuotaForRefund(task.ID, task.Quota)
-	require.NoError(t, err)
-	require.True(t, claimed)
-
-	restored, err := RestoreQuotaAfterFailedRefund(task.ID, task.Quota)
-	require.NoError(t, err)
-	assert.True(t, restored)
-
-	restored, err = RestoreQuotaAfterFailedRefund(task.ID, task.Quota)
-	require.NoError(t, err)
-	assert.False(t, restored)
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.Error(t, err)
+	assert.False(t, refunded)
 
 	var reloaded Task
 	require.NoError(t, DB.First(&reloaded, task.ID).Error)
 	assert.Equal(t, task.Quota, reloaded.Quota)
+	var storedToken Token
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, token.RemainQuota, storedToken.RemainQuota)
+	assert.Equal(t, token.UsedQuota, storedToken.UsedQuota)
+}
+
+func TestRefundTaskQuotaAtomicallyPreservesMarkerOnSubscriptionUnderflow(t *testing.T) {
+	truncateTables(t)
+
+	subscription := UserSubscription{
+		Id:          77,
+		UserId:      78,
+		AmountTotal: 1_000,
+		AmountUsed:  100,
+	}
+	require.NoError(t, DB.Create(&subscription).Error)
+	task := &Task{
+		TaskID: "task_subscription_refund_underflow",
+		UserId: subscription.UserId,
+		Status: TaskStatusFailure,
+		Quota:  300,
+		Data:   json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{
+			BillingSource:  "subscription",
+			SubscriptionId: subscription.Id,
+			BillingReservation: &TaskBillingReservation{
+				FundingQuota: 300,
+			},
+		},
+	}
+	insertTask(t, task)
+
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.Error(t, err)
+	assert.False(t, refunded)
+
+	var storedTask Task
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Equal(t, task.Quota, storedTask.Quota)
+	var storedSubscription UserSubscription
+	require.NoError(t, DB.First(&storedSubscription, subscription.Id).Error)
+	assert.Equal(t, subscription.AmountUsed, storedSubscription.AmountUsed)
+}
+
+func TestRefundTaskQuotaAtomicallyRejectsNonFailedTask(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Id: 74, Username: "successful-task-user", Quota: 700}
+	require.NoError(t, DB.Create(&user).Error)
+	token := Token{Id: 75, UserId: user.Id, Key: "successful-task-token", RemainQuota: 700, UsedQuota: 300}
+	require.NoError(t, DB.Create(&token).Error)
+	task := &Task{
+		TaskID:      "task_refund_success_rejected",
+		UserId:      user.Id,
+		Status:      TaskStatusSuccess,
+		Quota:       300,
+		Data:        json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{BillingSource: "wallet", TokenId: token.Id},
+	}
+	insertTask(t, task)
+
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.Error(t, err)
+	assert.False(t, refunded)
+
+	var storedTask Task
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Equal(t, task.Quota, storedTask.Quota)
+	var storedUser User
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, user.Quota, storedUser.Quota)
+	var storedToken Token
+	require.NoError(t, DB.First(&storedToken, token.Id).Error)
+	assert.Equal(t, token.RemainQuota, storedToken.RemainQuota)
+	assert.Equal(t, token.UsedQuota, storedToken.UsedQuota)
+}
+
+func TestRefundTaskQuotaAtomicallyCompletesWhenReservedTokenWasDeleted(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Id: 76, Username: "deleted-token-task-user", Quota: 700}
+	require.NoError(t, DB.Create(&user).Error)
+	task := &Task{
+		TaskID:      "task_refund_deleted_token",
+		UserId:      user.Id,
+		Status:      TaskStatusFailure,
+		Quota:       300,
+		Data:        json.RawMessage(`{}`),
+		PrivateData: TaskPrivateData{BillingSource: "wallet", TokenId: 9999},
+	}
+	insertTask(t, task)
+
+	refunded, err := RefundTaskQuotaAtomically(task.ID, task.Quota)
+	require.NoError(t, err)
+	assert.True(t, refunded)
+
+	var storedTask Task
+	require.NoError(t, DB.First(&storedTask, task.ID).Error)
+	assert.Zero(t, storedTask.Quota)
+	var storedUser User
+	require.NoError(t, DB.First(&storedUser, user.Id).Error)
+	assert.Equal(t, user.Quota+task.Quota, storedUser.Quota)
 }
 
 func TestHasTaskPollingWork_IncludesOnlyRefundableFailedTasks(t *testing.T) {
