@@ -168,6 +168,7 @@ type RelayInfo struct {
 	upstreamRequestWritten                atomic.Bool
 	upstreamResponseStarted               atomic.Bool
 	upstreamFailureResponse               atomic.Bool
+	committedUpstreamError                atomic.Pointer[types.NewAPIError]
 	RuntimeHeadersOverride                map[string]interface{}
 	UseRuntimeHeadersOverride             bool
 	ParamOverrideAudit                    []string
@@ -218,6 +219,7 @@ func (info *RelayInfo) ResetUpstreamAttemptState() {
 	info.upstreamRequestWritten.Store(false)
 	info.upstreamResponseStarted.Store(false)
 	info.upstreamFailureResponse.Store(false)
+	info.committedUpstreamError.Store(nil)
 }
 
 func (info *RelayInfo) MarkUpstreamRequestWritten() {
@@ -247,6 +249,23 @@ func (info *RelayInfo) UpstreamAttemptState() (written bool, responseStarted boo
 
 func (info *RelayInfo) HasUpstreamFailureResponse() bool {
 	return info != nil && info.upstreamFailureResponse.Load()
+}
+
+// MarkCommittedUpstreamError preserves a terminal upstream failure that was
+// already emitted downstream. The request cannot be retried or returned as an
+// ordinary controller error after that commit, but channel health, billing, and
+// performance accounting still need the typed failure.
+func (info *RelayInfo) MarkCommittedUpstreamError(err *types.NewAPIError) {
+	if info != nil && err != nil {
+		info.committedUpstreamError.Store(err)
+	}
+}
+
+func (info *RelayInfo) CommittedUpstreamError() *types.NewAPIError {
+	if info == nil {
+		return nil
+	}
+	return info.committedUpstreamError.Load()
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {

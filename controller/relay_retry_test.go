@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,13 +23,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type ordinaryResponsesSessionTestDriver struct {
+	upstreamURL string
+}
+
+func (d *ordinaryResponsesSessionTestDriver) DialUpstream(_ *gin.Context, _ *relaycommon.RelayInfo) (string, http.Header, error) {
+	return "ws" + strings.TrimPrefix(d.upstreamURL, "http"), nil, nil
+}
+
+func (d *ordinaryResponsesSessionTestDriver) AcquireCapacity(_ *gin.Context, _ *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
+	return nil, nil
+}
+
+func (d *ordinaryResponsesSessionTestDriver) DoHTTPFallback(
+	_ *gin.Context,
+	_ *relaycommon.RelayInfo,
+	_ []byte,
+	_ *service.SubscriptionOAuthLease,
+) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+}
+
+func (d *ordinaryResponsesSessionTestDriver) OnUpstreamConnected(_ *gin.Context, _ *relaycommon.RelayInfo) {
+}
+
 func TestShouldRetrySubscriptionOAuthTransientError(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Set("channel_type", constant.ChannelTypeCodex)
 	err := types.NewOpenAIError(errors.New("upstream timed out"), types.ErrorCodeBadResponseStatusCode, 524)
 
-	require.False(t, shouldRetry(c, err, 1))
-	require.False(t, shouldRetry(c, err, 0))
+	require.False(t, shouldRetry(c, err, 1, true))
+	require.False(t, shouldRetry(c, err, 0, true))
 }
 
 func TestShouldRetrySubscriptionOAuthTimeoutMappingRequiresExplicitOverride(t *testing.T) {
@@ -37,10 +62,10 @@ func TestShouldRetrySubscriptionOAuthTimeoutMappingRequiresExplicitOverride(t *t
 	err := types.NewOpenAIError(errors.New("upstream timed out"), types.ErrorCodeBadResponseStatusCode, 503)
 	err.UpstreamStatusCode = 524
 
-	require.True(t, shouldRetry(c, err, 1))
+	require.True(t, shouldRetry(c, err, 1, true))
 
 	err.StatusCode = http.StatusBadRequest
-	require.False(t, shouldRetry(c, err, 1))
+	require.False(t, shouldRetry(c, err, 1, true))
 }
 
 func TestShouldRetrySubscriptionOAuthBadResponseBodyNeverReplays(t *testing.T) {
@@ -53,7 +78,7 @@ func TestShouldRetrySubscriptionOAuthBadResponseBodyNeverReplays(t *testing.T) {
 	)
 	err.UpstreamStatusCode = http.StatusInternalServerError
 
-	require.False(t, shouldRetry(c, err, 1))
+	require.False(t, shouldRetry(c, err, 1, true))
 }
 
 func TestShouldRetryKeepsTimeoutRetryDisabledForOtherChannels(t *testing.T) {
@@ -61,7 +86,7 @@ func TestShouldRetryKeepsTimeoutRetryDisabledForOtherChannels(t *testing.T) {
 	c.Set("channel_type", constant.ChannelTypeOpenAI)
 	err := types.NewOpenAIError(errors.New("upstream timed out"), types.ErrorCodeBadResponseStatusCode, http.StatusGatewayTimeout)
 
-	require.False(t, shouldRetry(c, err, 1))
+	require.False(t, shouldRetry(c, err, 1, true))
 }
 
 func TestOrdinaryRelayRetryStopsAfterUpstreamWrite(t *testing.T) {
@@ -79,6 +104,125 @@ func TestOrdinaryRelayRetryStopsAfterUpstreamWrite(t *testing.T) {
 	require.False(t, shouldRetryOrdinaryRelay(c, info, apiError, 1))
 }
 
+func TestOrdinaryRelayRetriesRejectedWebSocketHandshakeBeforeApplicationWrite(t *testing.T) {
+	original := operation_setting.AutomaticRetryStatusCodeRanges
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{
+		{Start: http.StatusTooManyRequests, End: http.StatusTooManyRequests},
+		{Start: http.StatusInternalServerError, End: http.StatusServiceUnavailable},
+	}
+	t.Cleanup(func() { operation_setting.AutomaticRetryStatusCodeRanges = original })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUpgradeRequired)
+	}))
+	t.Cleanup(server.Close)
+	driver := &ordinaryResponsesSessionTestDriver{upstreamURL: server.URL}
+
+	tests := []struct {
+		name                   string
+		statusCode             int
+		internalPin            bool
+		preexistingSpecificPin bool
+		requestWritten         bool
+		responseStarted        bool
+		wantRetry              bool
+		wantChannelID          int
+	}{
+		{
+			name:          "internal pin rate limited during handshake",
+			statusCode:    http.StatusTooManyRequests,
+			internalPin:   true,
+			wantRetry:     true,
+			wantChannelID: 0,
+		},
+		{
+			name:          "internal pin unavailable during handshake",
+			statusCode:    http.StatusServiceUnavailable,
+			internalPin:   true,
+			wantRetry:     true,
+			wantChannelID: 0,
+		},
+		{
+			name:           "application frame may have been written",
+			statusCode:     http.StatusServiceUnavailable,
+			internalPin:    true,
+			requestWritten: true,
+			wantChannelID:  41,
+		},
+		{
+			name:            "application response already started",
+			statusCode:      http.StatusServiceUnavailable,
+			internalPin:     true,
+			responseStarted: true,
+			wantChannelID:   41,
+		},
+		{
+			name:                   "pre-existing explicit pin stays fixed",
+			statusCode:             http.StatusServiceUnavailable,
+			preexistingSpecificPin: true,
+			wantChannelID:          41,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := &responsesws.Session{}
+			defer session.Close()
+			bindContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+			bindContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			bindInfo := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:         41,
+				ChannelType:       constant.ChannelTypeOpenAI,
+				ApiKey:            "standard-api-key",
+				UpstreamModelName: "gpt-test",
+			}}
+			response, err := session.DoRequest(
+				bindContext,
+				driver,
+				bindInfo,
+				strings.NewReader(`{"model":"gpt-test","input":"bind"}`),
+			)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			session.ConfirmHTTPFallbackSuccess()
+			require.Equal(t, 41, session.ChannelID())
+
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Set("channel_type", constant.ChannelTypeOpenAI)
+			if test.preexistingSpecificPin {
+				common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, "99")
+				applyResponsesWebSocketTurnPin(c, 41, false)
+				require.Equal(t, "41", common.GetContextKeyString(c, constant.ContextKeyTokenSpecificChannelId))
+				require.False(t, c.GetBool(responsesWebSocketInternalPinKey))
+			} else {
+				common.SetContextKey(c, constant.ContextKeyTokenSpecificChannelId, "41")
+			}
+			if test.internalPin {
+				c.Set(responsesWebSocketInternalPinKey, true)
+			}
+			responsesws.SetSession(c, session)
+
+			apiError := types.NewOpenAIError(
+				errors.New("websocket handshake rejected"),
+				types.ErrorCodeBadResponseStatusCode,
+				test.statusCode,
+			)
+			apiError.UpstreamStatusCode = test.statusCode
+			info := &relaycommon.RelayInfo{}
+			info.MarkUpstreamFailureResponse()
+			if test.requestWritten {
+				info.MarkUpstreamRequestWritten()
+			}
+			if test.responseStarted {
+				info.MarkUpstreamResponseStarted()
+			}
+
+			require.Equal(t, test.wantRetry, shouldRetryOrdinaryRelay(c, info, apiError, 1))
+			require.Equal(t, test.wantChannelID, session.ChannelID())
+		})
+	}
+}
+
 func TestShouldRetryCodexLocalConcurrencyLimit(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Set("channel_type", constant.ChannelTypeCodex)
@@ -89,8 +233,43 @@ func TestShouldRetryCodexLocalConcurrencyLimit(t *testing.T) {
 		types.ErrOptionWithNoRecordErrorLog(),
 	)
 
-	require.True(t, shouldRetry(c, err, 1))
+	require.True(t, shouldRetry(c, err, 1, true))
 	require.False(t, types.IsRecordErrorLog(err))
+}
+
+func TestShouldRetryCanIgnoreInternalWebSocketChannelPin(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	c.Set("specific_channel_id", "41")
+	apiError := types.NewErrorWithStatusCode(
+		errors.New("upstream unavailable before output"),
+		types.ErrorCodeDoRequestFailed,
+		http.StatusServiceUnavailable,
+	)
+	apiError.UpstreamStatusCode = http.StatusServiceUnavailable
+
+	require.False(t, shouldRetry(c, apiError, 1, true))
+	require.True(t, shouldRetry(c, apiError, 1, false))
+}
+
+func TestParamOverrideContinuationCannotUseInternalWebSocketRetryPin(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	c.Set("specific_channel_id", "41")
+	c.Set(responsesWebSocketInternalPinKey, true)
+	service.DisableSubscriptionOAuthRetry(c)
+	responsesws.MarkContinuationRequired(c)
+
+	apiError := types.NewErrorWithStatusCode(
+		errors.New("credential capacity exhausted before continuation write"),
+		types.ErrorCodeOAuthChannelConcurrencyLimit,
+		http.StatusServiceUnavailable,
+	)
+	retryParam := &service.RetryParam{}
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(41, 0, "credential-a"))
+
+	require.False(t, hasReplaySafeResponsesWebSocketInternalPin(c))
+	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
 }
 
 func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
@@ -106,6 +285,55 @@ func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
 	)
 
 	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
+}
+
+func TestRefreshCodexCredentialHonorsStatefulWebSocketRetryDisable(t *testing.T) {
+	tests := []struct {
+		name                 string
+		internalPin          bool
+		continuationRequired bool
+		wantRefreshAvailable bool
+	}{
+		{name: "stateful continuation", wantRefreshAvailable: true},
+		{name: "self-contained internal pin", internalPin: true, wantRefreshAvailable: false},
+		{name: "param override continuation", internalPin: true, continuationRequired: true, wantRefreshAvailable: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Set("channel_type", constant.ChannelTypeCodex)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "invalid-oauth-key")
+			service.DisableSubscriptionOAuthRetry(c)
+			if test.internalPin {
+				c.Set(responsesWebSocketInternalPinKey, true)
+			}
+			if test.continuationRequired {
+				responsesws.MarkContinuationRequired(c)
+			}
+
+			retryParam := &service.RetryParam{}
+			require.True(t, retryParam.SetSubscriptionOAuthAttempt(41, 0, "credential-a"))
+			apiError := types.NewErrorWithStatusCode(
+				errors.New("access token expired"),
+				types.ErrorCodeOAuthUnauthorized,
+				http.StatusUnauthorized,
+			)
+			apiError.UpstreamStatusCode = http.StatusUnauthorized
+
+			got, retry := refreshCodexCredentialForRetry(
+				c,
+				&relaycommon.RelayInfo{},
+				retryParam,
+				&model.Channel{Id: 41, Type: constant.ChannelTypeCodex},
+				apiError,
+			)
+
+			require.Same(t, apiError, got)
+			require.False(t, retry)
+			require.Equal(t, test.wantRefreshAvailable, retryParam.ClaimSubscriptionOAuthCredentialRefresh())
+		})
+	}
 }
 
 func TestBoundSubscriptionOAuthWebSocketSwitchesOnUsageLimitBeforeOutput(t *testing.T) {
@@ -191,6 +419,32 @@ func TestClearStaleRetryAfter(t *testing.T) {
 	clearStaleRetryAfter(c)
 
 	require.Empty(t, recorder.Header().Get("Retry-After"))
+}
+
+func TestSetRelayRetryAfterHeaderRoundsUp(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	setRelayRetryAfterHeader(c, 1500*time.Millisecond)
+
+	require.Equal(t, "2", recorder.Header().Get("Retry-After"))
+}
+
+func TestEmitResponsesStreamPreflightFailurePreservesUpstreamEventType(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	data := `{"type":"response.error","error":{"type":"server_error","message":"boom"}}`
+	relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
+
+	emitted := emitResponsesStreamPreflightFailure(c)
+
+	require.True(t, emitted)
+	require.True(t, relaycommon.IsResponsesStreamFailureEmitted(c))
+	require.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
+	require.Contains(t, recorder.Body.String(), "event: response.error")
+	require.NotContains(t, recorder.Body.String(), "event: response.failed")
+	require.Contains(t, recorder.Body.String(), data)
 }
 
 func TestShouldRetryTaskRelayUsesConfiguredStatusCodes(t *testing.T) {

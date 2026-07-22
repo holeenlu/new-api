@@ -41,6 +41,14 @@ type BillingSession struct {
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if actualQuota < 0 {
+		return fmt.Errorf("actual quota cannot be negative: %d", actualQuota)
+	}
+	if s.refunded {
+		// 预扣已退回，delta 结算的基准不复存在；此时结算会按 actual-preConsumed
+		// 少扣。会话生命周期要求"先结算、失败才退款"，违反即为调用方时序错误。
+		return fmt.Errorf("billing session already refunded; cannot settle %d", actualQuota)
+	}
 	if s.settled {
 		return nil
 	}
@@ -129,6 +137,15 @@ func (s *BillingSession) NeedsRefund() bool {
 	return s.needsRefundLocked()
 }
 
+// FundingCommitted 返回资金来源是否已成功提交结算。
+// 信任旁路会话在 funding.Settle 失败时该值保持 false，
+// 与 NeedsRefund()==false 区分开"未预扣"与"已收费"两种状态。
+func (s *BillingSession) FundingCommitted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fundingSettled
+}
+
 func (s *BillingSession) needsRefundLocked() bool {
 	if s.settled || s.refunded || s.fundingSettled {
 		// fundingSettled 时资金来源已提交结算，不能再退预扣费
@@ -153,6 +170,14 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if targetQuota < 0 {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("reserve target quota cannot be negative: %d", targetQuota),
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 	if s.settled || s.refunded || s.trusted || targetQuota <= s.preConsumedQuota {
 		return nil
 	}

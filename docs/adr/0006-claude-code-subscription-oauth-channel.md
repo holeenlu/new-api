@@ -118,11 +118,22 @@ per-index CAS, refresh claims, quarantine, and credential replacement.
 ### OAuth completion and replay protection
 
 `StartClaudeOAuth` creates a one-time, expiring auth-flow row with provider
-`claude`, PKCE verifier, and random state, and returns the authorization URL.
+`claude`, PKCE verifier, random state, and the initiating administrator identity
+(`UserId` and, when available, `SessionId`), and returns the authorization URL.
 `CompleteClaudeOAuth` accepts either the pasted callback URL or the documented
-`code#state` form, parses it without logging it, and requires the returned state
-to match the stored flow. Successful exchange consumes the flow exactly once;
-expired, mismatched, or replayed flows fail without calling the token endpoint.
+`code#state` form, parses it without logging it, and requires the provider,
+purpose, intent, initiating identity, and returned state to match the stored
+flow.
+
+After those checks, completion atomically consumes the auth flow **before** it
+calls the token endpoint. This is the only ordering supported by the existing
+`AuthFlow.ConsumedAt` model that prevents two concurrent or replayed completion
+requests from both making the external exchange. Once claimed, the flow stays
+consumed even if the token endpoint times out or rejects the exchange; the
+administrator must start a new authorization flow. Holding a database
+transaction open across the network call, or exchanging first and consuming
+afterward, is forbidden. Expired, mismatched, already-consumed, and concurrently
+losing requests fail without calling the token endpoint.
 
 OAuth endpoint errors are parsed structurally. Only an explicit credential
 failure such as `invalid_grant` / an invalid refresh token makes reauthorization
@@ -136,16 +147,34 @@ singleflight/mutex is only an optimization and is not claimed as a distributed
 lock. Cross-node exclusion uses a short-lived refresh claim embedded in the same
 versioned `channel.Key` JSON and acquired with an optimistic CAS from the exact
 previous key. The claim contains only a random owner ID and expiry, never a
-secret. The winner calls the token endpoint; other nodes wait/reload within a
-bounded request deadline. An expired claim may be taken over by CAS after a
-crashed owner.
+secret. The exact claimed JSON, including owner ID, is the fencing value for
+every later write. The claim lifetime must exceed the provider request timeout
+plus the documented clock-skew and scheduling margin; a token request must have
+a deadline that expires inside that safe claim interval. Other nodes wait/reload
+within a bounded request deadline. Only after the full safety interval has
+expired may another node CAS-take the claim and attempt recovery.
 
 Success atomically replaces the claimed key with a refreshed credential while
-preserving `credential_id`. Failure atomically clears the claim or, for a
-structured permanent credential error, disables the channel through the shared
-credential-isolation path. Every write invalidates channel cache. This provides
-one provider refresh in flight and one persisted rotation across nodes without a
-second credential store.
+preserving `credential_id`. A transient failure clears the claim only with a CAS
+from the exact claimed key. A structured permanent credential error may enter
+the shared credential-isolation path only after a conditional write/transaction
+proves that the caller still owns that exact claim. If ownership was lost because
+another node took over, an administrator changed the channel, or a newer
+credential was persisted, the result is stale: it may reload the winner's state
+but must not clear a claim, overwrite a credential, disable a channel, or
+quarantine the stable fingerprint. Every successful write invalidates channel
+cache.
+
+This lease-and-CAS protocol prevents cooperating nodes from starting concurrent
+refreshes while a valid claim is held; it is not an absolute exactly-once
+guarantee at the external provider. A process can crash or lose connectivity
+after the provider accepts and rotates a single-use refresh token but before the
+success CAS reaches the database. The successor token is then unavailable and
+the persisted token may already be invalid. Expired-claim takeover must handle
+that outcome as an explicit reauthorization-required failure with an
+administrator-visible reason; it must not pretend that the old credential can
+always be recovered. No second token store is introduced to hide this crash
+window.
 
 Both proactive and reactive refresh use this operation:
 
@@ -167,6 +196,15 @@ entry and name/API mappings, and harden all base-URL indexing against unknown
 persistent types. The new type reuses `APITypeAnthropic` and the Claude adaptor.
 The adaptor uses `IsClaudeCodeOAuthChannel` for identity/header behavior, and
 `UsesJSONSubscriptionCredential` only for access-token extraction.
+
+The current pre-feature binary already assigns the sentinel `ChannelTypeDummy`
+the numeric value 60, and its direct channel APIs do not uniformly reject an
+unknown numeric type. The first deployment that gives 60 real meaning therefore
+requires an upgrade preflight that asserts no legacy `channels.type = 60` rows
+exist. If any do, feature activation and automatic reinterpretation are refused;
+operators must inspect and explicitly remove or migrate them before enabling the
+new type. A row that merely resembles the new credential JSON is not sufficient
+proof that it was created by the new workflow.
 
 Implementation must audit every channel-type gate, including:
 
@@ -217,6 +255,8 @@ workflow.
 - Feature exposure: one backend startup capability, disabled by default. Turning
   it off fails closed for new login, refresh, and inference but preserves stored
   credentials for a later safe export or re-enable.
+- Refresh recovery is bounded but not lossless: a crash after provider-side token
+  rotation and before the credential CAS can require reauthorization.
 - No compatibility path changes static type 59. No duplicate token table or
   independent retry ledger is introduced.
 
@@ -229,6 +269,10 @@ credentials securely, disable and remove or migrate every type 60 channel,
 verify the database contains none, and only then deploy the old binary. The
 forward implementation also bounds-checks channel-type array access so unknown
 persisted types fail as validation errors rather than panicking.
+
+Before the first forward deployment, the release runbook also checks for legacy
+numeric type-60 rows created while 60 was only the `ChannelTypeDummy` sentinel.
+The deployment stops rather than reclassifying such rows as OAuth credentials.
 
 Disabling the feature flag is the preferred immediate rollback because it keeps
 the newer binary and stored rows while blocking login, refresh, and inference.
@@ -243,11 +287,19 @@ The operational runbook and rollback test are release requirements.
   across refresh and refresh claims, and yields a stable fingerprint while
   access and refresh tokens rotate.
 - OAuth tests cover PKCE/URL fields, callback URL and `code#state` parsing, state
-  mismatch, expiry, one-time completion, replay, structured endpoint errors,
-  and log redaction.
-- Concurrent two-node tests prove only the refresh-claim winner calls the token
-  endpoint, waiters reload the winning key, expired claims can be recovered, CAS
-  loss cannot overwrite a newer credential, and cancellation bounds all waits.
+  mismatch, initiating user/session mismatch, expiry, atomic pre-exchange
+  consumption, concurrent completion, replay, post-consumption exchange failure,
+  structured endpoint errors, and log redaction. Every losing/replayed request
+  asserts that the token endpoint was not called.
+- Concurrent two-node tests prove only the valid refresh-claim owner starts the
+  token request, the request deadline fits within claim TTL/skew bounds, waiters
+  reload the winning key, and cancellation bounds all waits. Takeover tests cover
+  expiry, a stalled former owner, clock skew, administrator replacement, and CAS
+  loss; a stale success or permanent error must not clear, overwrite, disable, or
+  quarantine newer state.
+- Crash-window tests cover provider success followed by persistence failure and
+  prove that takeover reports reauthorization-required without claiming a
+  recovered successor token.
 - Validator/API tests reject type 60 multi-key configuration through direct API
   and import paths, not only through the UI.
 - Relay tests prove protected Claude identity headers cannot be overridden,
@@ -264,7 +316,8 @@ The operational runbook and rollback test are release requirements.
   guarantee.
 - Rollback rehearsal proves feature disablement is immediate and that the
   documented data cleanup allows the previous binary to start without type 60
-  rows.
+  rows. Forward-upgrade rehearsal proves a legacy sentinel-valued type-60 row
+  blocks activation and is never automatically reinterpreted.
 
 Implementation does not begin while this ADR is Proposed. On acceptance, update
 `docs/architecture/overview.md`, `docs/architecture/health.md`, and the functional

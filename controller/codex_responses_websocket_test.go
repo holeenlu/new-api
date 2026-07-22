@@ -8,7 +8,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/responsesws"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,6 +103,39 @@ func TestNormalizeResponsesWebSocketFrameRejectsAppendBeforeCreate(t *testing.T)
 	require.EqualError(t, err, "response.append received before response.create")
 }
 
+func TestResponsesWebSocketDefaultsResetWhenNewCreateStarts(t *testing.T) {
+	firstCreate, defaults, err := beginResponsesWebSocketTurn(map[string]any{
+		"type":         "response.create",
+		"model":        "gpt-5.6-sol",
+		"instructions": "first defaults",
+		"input":        []any{},
+	}, nil)
+	require.NoError(t, err)
+	require.Nil(t, defaults)
+
+	// Simulate the first create reaching response.completed.
+	defaults = reusableResponsesWebSocketFields(firstCreate)
+	require.NotNil(t, defaults)
+
+	_, defaults, err = beginResponsesWebSocketTurn(map[string]any{
+		"type":         "response.create",
+		"model":        "gpt-5.6-sol",
+		"instructions": "replacement defaults",
+		"input":        []any{},
+	}, defaults)
+	require.NoError(t, err)
+	require.Nil(t, defaults)
+
+	// Simulate the replacement create ending in response.failed: no clean
+	// terminal stores new defaults, so append cannot inherit the first create.
+	_, defaults, err = beginResponsesWebSocketTurn(map[string]any{
+		"type":  "response.append",
+		"input": []any{},
+	}, defaults)
+	require.Nil(t, defaults)
+	require.EqualError(t, err, "response.append received before response.create")
+}
+
 // An upstream failure surfaced over the client WebSocket must keep its
 // classification: a 429 becomes a rate_limit_error carrying the resolved
 // retry_after, not a generic invalid_request_error, so the client can wait.
@@ -126,6 +167,51 @@ func TestResponsesWebSocketErrorFrameCarriesClassificationAndRetryAfter(t *testi
 		`{"type":"error","error":{"message":"Too Many Requests","type":"rate_limit_error","code":429,"retry_after":30}}`,
 		string(frame),
 	)
+	require.NoError(t, <-serverErr)
+}
+
+func TestResponsesWebSocketContinuationErrorFramePreservesStableCode(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		apiError := responsesWebSocketContinuationError(true, &responsesws.Session{})
+		require.NotNil(t, apiError)
+		serverErr <- writeResponsesWebSocketErrorWithCode(
+			conn,
+			apiError.StatusCode,
+			apiError.ToOpenAIError().Message,
+			apiError.GetErrorCode(),
+			"",
+		)
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, frame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	var event struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code       any    `json:"code"`
+			RetryAfter *int   `json:"retry_after"`
+			Message    string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, common.Unmarshal(frame, &event))
+	assert.Equal(t, "error", event.Type)
+	assert.Equal(t, string(types.ErrorCodeWebSocketConnectionLimitReached), event.Error.Code)
+	assert.Nil(t, event.Error.RetryAfter)
+	assert.NotEmpty(t, event.Error.Message)
 	require.NoError(t, <-serverErr)
 }
 
@@ -178,14 +264,107 @@ func TestResponsesWebSocketSSEWriterMarksSuccessOnlyOnCleanTerminal(t *testing.T
 
 func TestResponsesWebSocketTerminalDetectionUsesTopLevelType(t *testing.T) {
 	require.True(t, responsesWebSocketPayloadIsTerminal(`{"type":"response.completed"}`))
+	require.True(t, responsesWebSocketPayloadIsCleanTerminal(`{"type":"response.done","response":{"status":"completed"}}`))
+	require.True(t, responsesWebSocketPayloadIsCleanTerminal(`{"type":"response.done","response":{"status":"incomplete"}}`))
+	require.False(t, responsesWebSocketPayloadIsCleanTerminal(`{"type":"response.done","response":{"status":"failed"}}`))
+	require.False(t, responsesWebSocketPayloadIsCleanTerminal(`{"type":"response.done","response":{"status":"unknown"}}`))
+	require.False(t, responsesWebSocketPayloadIsCleanTerminal(`{"type":"response.done"}`))
 	require.True(t, responsesWebSocketPayloadIsCleanTerminal(`{"type": "response.incomplete"}`))
 	require.False(t, responsesWebSocketPayloadIsTerminal(
-		`{"type":"response.output_text.delta","delta":"quoted event: \\"response.completed\\""}`,
+		`{"type":"response.output_text.delta","delta":"quoted event: \"response.completed\""}`,
 	))
 	require.False(t, responsesWebSocketPayloadIsTerminal(
 		`{"type":"response.output_item.done","response":{"type":"response.failed"}}`,
 	))
 	require.False(t, responsesWebSocketPayloadIsTerminal(`not-json "response.completed"`))
+}
+
+func TestResponsesWebSocketSSEWriterNormalizesResponseDone(t *testing.T) {
+	tests := []struct {
+		name          string
+		payload       string
+		wantType      string
+		wantSucceeded bool
+		wantPreserved string
+	}{
+		{
+			name:          "completed",
+			payload:       `{"type":"response.done","response":{"id":"resp_1","status":"completed","metadata":{"exact_integer":9007199254740993}}}`,
+			wantType:      "response.completed",
+			wantSucceeded: true,
+			wantPreserved: `"exact_integer":9007199254740993`,
+		},
+		{
+			name:          "incomplete",
+			payload:       `{"type":"response.done","response":{"id":"resp_2","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"metadata":{"trace":"keep-incomplete"}}}`,
+			wantType:      "response.incomplete",
+			wantSucceeded: true,
+			wantPreserved: `"trace":"keep-incomplete"`,
+		},
+		{
+			name:          "failed",
+			payload:       `{"type":"response.done","response":{"id":"resp_3","status":"failed","error":{"type":"server_error","code":"upstream_failure","message":"boom"},"metadata":{"trace":"keep-failed"}}}`,
+			wantType:      "response.failed",
+			wantSucceeded: false,
+			wantPreserved: `"code":"upstream_failure"`,
+		},
+		{
+			name:          "error overrides completed status",
+			payload:       `{"type":"response.done","response":{"id":"resp_4","status":"completed","error":{"type":"server_error","message":"late failure"},"metadata":{"trace":"keep-error"}}}`,
+			wantType:      "response.failed",
+			wantSucceeded: false,
+			wantPreserved: `"trace":"keep-error"`,
+		},
+		{
+			name:          "unknown status fails closed",
+			payload:       `{"type":"response.done","response":{"id":"resp_5","status":"mystery","metadata":{"trace":"keep-unknown"}}}`,
+			wantType:      "response.failed",
+			wantSucceeded: false,
+			wantPreserved: `"trace":"keep-unknown"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			type serverResult struct {
+				err       error
+				succeeded bool
+			}
+			serverResultChannel := make(chan serverResult, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					serverResultChannel <- serverResult{err: err}
+					return
+				}
+				defer conn.Close()
+				writer := newResponsesWebSocketSSEWriter(conn)
+				_, err = writer.Write([]byte("data: " + test.payload + "\n\n"))
+				if err == nil {
+					err = writer.Finish()
+				}
+				serverResultChannel <- serverResult{err: err, succeeded: writer.SucceededTurn()}
+			}))
+			defer server.Close()
+
+			url := "ws" + strings.TrimPrefix(server.URL, "http")
+			conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			_, frame, err := conn.ReadMessage()
+			require.NoError(t, err)
+			var event struct {
+				Type string `json:"type"`
+			}
+			require.NoError(t, common.Unmarshal(frame, &event))
+			assert.Equal(t, test.wantType, event.Type)
+			assert.Contains(t, string(frame), test.wantPreserved)
+			result := <-serverResultChannel
+			require.NoError(t, result.err)
+			assert.Equal(t, test.wantSucceeded, result.succeeded)
+		})
+	}
 }
 
 func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
@@ -203,10 +382,12 @@ func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
 				writer.WriteHeader(status)
 				serverErr <- writer.Finish()
 			}))
+			defer server.Close()
 
 			url := "ws" + strings.TrimPrefix(server.URL, "http")
 			conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 			require.NoError(t, err)
+			defer conn.Close()
 			_, frame, err := conn.ReadMessage()
 			require.NoError(t, err)
 			require.JSONEq(t,
@@ -214,8 +395,6 @@ func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
 				string(frame),
 			)
 			require.NoError(t, <-serverErr)
-			require.NoError(t, conn.Close())
-			server.Close()
 		})
 	}
 }
@@ -306,6 +485,54 @@ func TestResponsesWebSocketFrameReferencesPriorResponse(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketContinuationRequiresLiveConnectionBeforeRelay(t *testing.T) {
+	require.Nil(t, responsesWebSocketContinuationError(false, nil))
+
+	apiError := responsesWebSocketContinuationError(true, &responsesws.Session{})
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadRequest, apiError.StatusCode)
+	require.Equal(t, types.ErrorCodeWebSocketConnectionLimitReached, apiError.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiError))
+}
+
+func TestResponsesWebSocketTurnPinKeepsStatefulCredentialFixed(t *testing.T) {
+	cases := []struct {
+		name                    string
+		channelID               int
+		referencesPriorResponse bool
+		existingSpecificChannel string
+		wantSpecificChannel     bool
+		wantSpecificValue       string
+		wantInternalPin         bool
+		wantRetryDisabled       bool
+		wantContinuation        bool
+	}{
+		{"self-contained pinned turn", 42, false, "", true, "42", true, true, false},
+		{"self-contained turn with explicit pin", 42, false, "99", true, "42", false, true, false},
+		{"stateful pinned turn", 42, true, "", true, "42", false, true, true},
+		{"stateful first turn", 0, true, "", false, "", false, true, true},
+		{"self-contained first turn", 0, false, "", false, "", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			turn, _ := gin.CreateTestContext(httptest.NewRecorder())
+			if tc.existingSpecificChannel != "" {
+				common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, tc.existingSpecificChannel)
+			}
+			applyResponsesWebSocketTurnPin(turn, tc.channelID, tc.referencesPriorResponse)
+
+			specificChannel, exists := common.GetContextKey(turn, constant.ContextKeyTokenSpecificChannelId)
+			require.Equal(t, tc.wantSpecificChannel, exists)
+			if exists {
+				require.Equal(t, tc.wantSpecificValue, specificChannel)
+			}
+			require.Equal(t, tc.wantInternalPin, turn.GetBool(responsesWebSocketInternalPinKey))
+			require.Equal(t, tc.wantRetryDisabled, service.IsSubscriptionOAuthRetryDisabled(turn))
+			require.Equal(t, tc.wantContinuation, responsesws.IsContinuationRequired(turn))
+		})
+	}
+}
+
 // An upstream that streams data without an SSE frame boundary must not grow the
 // pending buffer without bound: past the cap Write returns an error and stops.
 func TestResponsesWebSocketSSEWriterBoundsPendingBuffer(t *testing.T) {
@@ -316,4 +543,26 @@ func TestResponsesWebSocketSSEWriterBoundsPendingBuffer(t *testing.T) {
 	require.Error(t, writeErr)
 	require.Contains(t, writeErr.Error(), "buffer limit")
 	require.Len(t, w.pending, pendingBefore)
+}
+
+func TestResponsesWebSocketSSEBoundarySupportsLFAndCRLFWithoutRewriting(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   string
+		wantIndex int
+		wantWidth int
+	}{
+		{name: "lf", payload: "data: one\n\ndata: two", wantIndex: len("data: one"), wantWidth: 2},
+		{name: "crlf", payload: "data: one\r\n\r\ndata: two", wantIndex: len("data: one"), wantWidth: 4},
+		{name: "earliest", payload: "a\r\n\r\nb\n\n", wantIndex: 1, wantWidth: 4},
+		{name: "incomplete", payload: "data: one\r\n", wantIndex: -1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			index, width := responsesWebSocketSSEBoundary([]byte(test.payload))
+			assert.Equal(t, test.wantIndex, index)
+			assert.Equal(t, test.wantWidth, width)
+		})
+	}
 }

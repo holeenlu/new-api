@@ -27,6 +27,44 @@ client -> middleware -> controller -> relay/service -> channel adaptor -> upstre
 
 ## Customized feature domains
 
+### Responses WebSocket transport
+
+- `ChannelOtherSettings.ResponsesWebSocketEnabled` is the sole persisted opt-in
+  for a standard OpenAI-compatible upstream WebSocket. Codex WebSocket support is
+  implied by its channel type and does not add a second setting.
+- `controller/codex_responses_websocket.go` owns the downstream upgrade, the sole
+  client read pump, frame normalization, structured downstream errors, and the
+  serial turn-processing loop. It restores the exact channel/key-index/credential
+  binding after middleware distribution. That controller loop, not the session
+  mutex alone, ensures one response is processed to completion at a time.
+- `relay/responsesws/session.go` owns the upstream connection, its lifetime,
+  transport-field removal, pre-write HTTP fallback decision, and live
+  channel/model/credential binding. Its mutex protects connection and affinity
+  state transitions but is released when the response body is returned. Early
+  body close or an ambiguous/truncated stream invalidates the connection before
+  another reader can start.
+- The normal Relay lifecycle owns each turn's retry and billing state; no billing
+  or retry ledger persists in the WebSocket session. A subscription-OAuth lease
+  remains per-turn, while an ordinary API-key driver has no lease. The controller
+  may release session affinity only after the shared retry decision proves the
+  current turn replay-safe.
+
+A `previous_response_id` is usable only while the owning upstream connection is
+still live. Once that connection is invalidated or reaches its lifetime, a
+continuation fails locally and non-retryably; only a self-contained turn may
+establish a replacement connection.
+
+### Responses compact billing
+
+- `relay/responses_handler.go` owns compact attempt pricing. The provider-ready
+  JSON after field filtering, model mapping, disabled-field removal, and channel
+  parameter overrides is the sole source for `BillingRequestInput`, the billed
+  and upstream model names, the prompt estimate, and the frozen tiered snapshot.
+- Each mapped attempt reserves against that frozen state before sending its
+  request. When the attempt returns, client-level pricing fields are restored;
+  settlement still occurs against the successful attempt's frozen state. This
+  prevents the source request model from becoming a second pricing authority.
+
 ### Subscription OAuth channels
 
 Codex and Claude Code share the subscription OAuth policy surface:
@@ -46,12 +84,6 @@ Codex and Claude Code share the subscription OAuth policy surface:
   capacity.
 - `service/retry_data_policy.go` owns which channels and credentials may be
   selected for a retry.
-- `relay/responsesws/session.go` owns the upstream WebSocket connection and its
-  channel/model/credential binding. The controller restores that exact binding
-  for later turns and may release it only after the shared retry state machine
-  declares the turn safe to replay. Capacity leases remain per-turn, and an
-  early response-body close invalidates the connection before another reader
-  can start.
 - `relay/channel/codex/` and `relay/channel/claude/` own upstream protocol
   construction, credentials, and response-body lease release. The Claude
   adaptor also owns the deployment-scoped switch that can bypass its local

@@ -27,13 +27,13 @@ import (
 const maxResponsesWebSocketErrorBytes = 1 << 20
 
 // maxResponsesWebSocketPendingBytes bounds the unframed SSE bytes buffered while
-// waiting for an event boundary ("\n\n"). A well-behaved upstream (events framed
-// by the relay) never approaches this; the cap stops a misbehaving one from
-// growing the buffer without limit.
-const maxResponsesWebSocketPendingBytes = 16 << 20
+// waiting for an event boundary ("\n\n"). The shared upstream transport permits
+// a 16 MiB JSON message, so leave room for its SSE event/data framing instead of
+// rejecting an otherwise valid maximum-size event at the downstream bridge.
+const maxResponsesWebSocketPendingBytes = (16 << 20) + (64 << 10)
 
 const (
-	maxResponsesWebSocketQueuedFrames = 8
+	maxResponsesWebSocketQueuedFrames = 1
 	responsesWebSocketWriteTimeout    = 30 * time.Second
 )
 
@@ -95,18 +95,7 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	engine.Use(middleware.SystemPerformanceCheck())
 	engine.Use(middleware.TokenAuth())
 	engine.Use(func(turn *gin.Context) {
-		if pinnedChannelID > 0 {
-			common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(pinnedChannelID))
-			turn.Set(responsesWebSocketInternalPinKey, true)
-			service.DisableSubscriptionOAuthRetry(turn)
-		} else if turnReferencesPriorResponse {
-			// Not yet pinned, but this turn depends on a prior response's server-side
-			// state owned by the currently selected account. Disable the credential
-			// switch so a failure is surfaced (the client can resubmit with full
-			// context) rather than retried on an account that cannot resolve the
-			// reference.
-			service.DisableSubscriptionOAuthRetry(turn)
-		}
+		applyResponsesWebSocketTurnPin(turn, pinnedChannelID, turnReferencesPriorResponse)
 		turn.Next()
 	})
 	engine.Use(middleware.ModelRequestRateLimit())
@@ -146,25 +135,43 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		}
 
 		var frame map[string]any
-		if err := common.Unmarshal(clientFrame.payload, &frame); err != nil {
-			writeResponsesWebSocketError(conn, http.StatusBadRequest, "invalid response.create JSON", "")
+		if err := common.UnmarshalWithNumber(clientFrame.payload, &frame); err != nil {
+			if writeResponsesWebSocketError(conn, http.StatusBadRequest, "invalid response.create JSON", "") != nil {
+				return
+			}
 			continue
 		}
-		frame, err = normalizeResponsesWebSocketFrame(frame, previousRequest)
+		frame, previousRequest, err = beginResponsesWebSocketTurn(frame, previousRequest)
 		if err != nil {
-			writeResponsesWebSocketError(conn, http.StatusBadRequest, err.Error(), "")
+			if writeResponsesWebSocketError(conn, http.StatusBadRequest, err.Error(), "") != nil {
+				return
+			}
 			continue
 		}
 		turnReferencesPriorResponse = responsesWebSocketFrameReferencesPriorResponse(frame)
+		if apiError := responsesWebSocketContinuationError(turnReferencesPriorResponse, session); apiError != nil {
+			if writeResponsesWebSocketErrorWithCode(
+				conn,
+				apiError.StatusCode,
+				apiError.ToOpenAIError().Message,
+				apiError.GetErrorCode(),
+				"",
+			) != nil {
+				return
+			}
+			continue
+		}
 		body, err := common.Marshal(frame)
 		if err != nil {
-			writeResponsesWebSocketError(conn, http.StatusBadRequest, err.Error(), "")
+			if writeResponsesWebSocketError(conn, http.StatusBadRequest, err.Error(), "") != nil {
+				return
+			}
 			continue
 		}
 
 		request, err := http.NewRequestWithContext(connectionContext, http.MethodPost, "/v1/responses", bytes.NewReader(body))
 		if err != nil {
-			writeResponsesWebSocketError(conn, http.StatusInternalServerError, err.Error(), "")
+			_ = writeResponsesWebSocketError(conn, http.StatusInternalServerError, err.Error(), "")
 			return
 		}
 		request.Header = c.Request.Header.Clone()
@@ -188,6 +195,46 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			// look valid or carry its parameters forward.
 			previousRequest = reusableResponsesWebSocketFields(frame)
 		}
+	}
+}
+
+// responsesWebSocketContinuationError enforces the controller-owned admission
+// boundary before authentication, channel distribution, parameter overrides or
+// billing can run for a connection-local continuation.
+func responsesWebSocketContinuationError(referencesPriorResponse bool, session *responsesws.Session) *types.NewAPIError {
+	if !referencesPriorResponse || session.HasLiveConnection() {
+		return nil
+	}
+	return responsesws.NewContinuationUnavailableError()
+}
+
+func applyResponsesWebSocketTurnPin(turn *gin.Context, pinnedChannelID int, referencesPriorResponse bool) {
+	if turn == nil {
+		return
+	}
+	if referencesPriorResponse {
+		responsesws.MarkContinuationRequired(turn)
+	}
+	if pinnedChannelID > 0 {
+		_, hadExternalSpecificChannel := common.GetContextKey(turn, constant.ContextKeyTokenSpecificChannelId)
+		common.SetContextKey(turn, constant.ContextKeyTokenSpecificChannelId, strconv.Itoa(pinnedChannelID))
+		if !referencesPriorResponse && !hadExternalSpecificChannel {
+			// A self-contained turn may move to another credential after a provably
+			// replay-safe failure. Mark only a pin introduced here as internal so Relay
+			// may override it. A specific-channel pin already installed by TokenAuth is
+			// an explicit caller constraint: keep its retry policy even though the value
+			// is normalized to the credential already bound to this session. Stateful
+			// continuations likewise keep retry-disabled specific-channel semantics.
+			turn.Set(responsesWebSocketInternalPinKey, true)
+		}
+		service.DisableSubscriptionOAuthRetry(turn)
+		return
+	}
+	if referencesPriorResponse {
+		// This turn depends on server-side state owned by the selected account.
+		// Disable credential switching even before the session has established its
+		// first reusable upstream connection.
+		service.DisableSubscriptionOAuthRetry(turn)
 	}
 }
 
@@ -282,6 +329,20 @@ func reusableResponsesWebSocketFields(frame map[string]any) map[string]any {
 		return nil
 	}
 	return defaults
+}
+
+// beginResponsesWebSocketTurn applies the defaults state transition that occurs
+// before a turn is sent upstream. An explicit response.create starts a new
+// sequence, so the last successful create/append can no longer authorize or
+// supply defaults to a later response.append unless this new turn itself reaches
+// a clean terminal and the caller stores new defaults.
+func beginResponsesWebSocketTurn(frame, previous map[string]any) (map[string]any, map[string]any, error) {
+	requestType, _ := frame["type"].(string)
+	if strings.TrimSpace(requestType) == "response.create" {
+		previous = nil
+	}
+	normalized, err := normalizeResponsesWebSocketFrame(frame, previous)
+	return normalized, previous, err
 }
 
 func normalizeResponsesWebSocketFrame(frame map[string]any, previous map[string]any) (map[string]any, error) {
@@ -456,8 +517,7 @@ func (w *responsesWebSocketSSEWriter) Finish() error {
 
 func (w *responsesWebSocketSSEWriter) drainSSEFrames(flushRemainder bool) {
 	for {
-		w.pending = bytes.ReplaceAll(w.pending, []byte("\r\n"), []byte("\n"))
-		index := bytes.Index(w.pending, []byte("\n\n"))
+		index, boundaryBytes := responsesWebSocketSSEBoundary(w.pending)
 		if index < 0 {
 			if flushRemainder && len(bytes.TrimSpace(w.pending)) > 0 {
 				w.writeSSEBlock(w.pending)
@@ -466,12 +526,26 @@ func (w *responsesWebSocketSSEWriter) drainSSEFrames(flushRemainder bool) {
 			return
 		}
 		block := append([]byte(nil), w.pending[:index]...)
-		w.pending = w.pending[index+2:]
+		w.pending = w.pending[index+boundaryBytes:]
 		w.writeSSEBlock(block)
 		if w.err != nil {
 			return
 		}
 	}
+}
+
+// responsesWebSocketSSEBoundary finds the earliest complete LF or CRLF event
+// boundary without rewriting the entire pending buffer on every streamed chunk.
+func responsesWebSocketSSEBoundary(payload []byte) (int, int) {
+	lfIndex := bytes.Index(payload, []byte("\n\n"))
+	crlfIndex := bytes.Index(payload, []byte("\r\n\r\n"))
+	if crlfIndex >= 0 && (lfIndex < 0 || crlfIndex < lfIndex) {
+		return crlfIndex, 4
+	}
+	if lfIndex >= 0 {
+		return lfIndex, 2
+	}
+	return -1, 0
 }
 
 func (w *responsesWebSocketSSEWriter) writeSSEBlock(block []byte) {
@@ -489,6 +563,15 @@ func (w *responsesWebSocketSSEWriter) writeSSEBlock(block []byte) {
 		return
 	}
 	eventType := responsesWebSocketPayloadType(payload)
+	if eventType == "response.done" {
+		normalizedPayload, normalizedType, err := responsesws.NormalizeResponseDoneEvent([]byte(payload))
+		if err != nil {
+			w.err = err
+			return
+		}
+		payload = string(normalizedPayload)
+		eventType = normalizedType
+	}
 	if responsesWebSocketEventIsTerminal(eventType) {
 		w.sawTerminal = true
 	}
@@ -528,7 +611,7 @@ func responsesWebSocketPayloadType(payload string) string {
 // stream-ending Responses event.
 func responsesWebSocketEventIsTerminal(eventType string) bool {
 	switch eventType {
-	case "response.completed", "response.failed", "response.incomplete", "response.error", "error":
+	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.error", "error":
 		return true
 	default:
 		return false
@@ -549,7 +632,11 @@ func responsesWebSocketEventIsCleanTerminal(eventType string) bool {
 }
 
 func responsesWebSocketPayloadIsCleanTerminal(payload string) bool {
-	return responsesWebSocketEventIsCleanTerminal(responsesWebSocketPayloadType(payload))
+	eventType := responsesWebSocketPayloadType(payload)
+	if eventType == "response.done" {
+		_, eventType, _ = responsesws.NormalizeResponseDoneEvent([]byte(payload))
+	}
+	return responsesWebSocketEventIsCleanTerminal(eventType)
 }
 
 // responsesWebSocketErrorType maps an HTTP status to a Responses error type so a
@@ -636,10 +723,17 @@ func writeResponsesWebSocketErrorObject(conn *websocket.Conn, status int, errorO
 // error type; retryAfter, when a positive delta-seconds value, is preserved as a
 // numeric retry_after so a strict client can wait rather than hammer.
 func writeResponsesWebSocketError(conn *websocket.Conn, status int, message string, retryAfter string) error {
+	return writeResponsesWebSocketErrorWithCode(conn, status, message, status, retryAfter)
+}
+
+// writeResponsesWebSocketErrorWithCode keeps the protocol error code separate
+// from Retry-After. Stateful continuation failures use a stable application code
+// even though their HTTP-compatible status remains 400.
+func writeResponsesWebSocketErrorWithCode(conn *websocket.Conn, status int, message string, code any, retryAfter string) error {
 	errorObject := gin.H{
 		"message": message,
 		"type":    responsesWebSocketErrorType(status),
-		"code":    status,
+		"code":    code,
 	}
 	return writeResponsesWebSocketErrorObject(conn, status, errorObject, retryAfter)
 }

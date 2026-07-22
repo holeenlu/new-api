@@ -621,10 +621,12 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
-	if (info.RelayMode == relayconstant.RelayModeResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact) &&
-		info.ChannelOtherSettings.ResponsesWebSocketEnabled {
+	if info.RelayMode == relayconstant.RelayModeResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact {
 		if session := responsesws.SessionFromContext(c); session != nil {
-			return session.DoRequest(c, a, info, requestBody)
+			useSession := info.ChannelOtherSettings.ResponsesWebSocketEnabled || responsesws.IsContinuationRequired(c)
+			if useSession {
+				return session.DoRequest(c, a, info, requestBody)
+			}
 		}
 	}
 	if info.RelayMode == relayconstant.RelayModeAudioTranscription ||

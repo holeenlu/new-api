@@ -2,6 +2,7 @@ package responsesws
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,12 +27,16 @@ type sessionTestDriver struct {
 	upstreamURL   string
 	acquire       func(*gin.Context, *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error)
 	fallbackBody  chan []byte
+	dialErr       error
 	dialCalls     atomic.Int32
 	fallbackCalls atomic.Int32
 }
 
 func (d *sessionTestDriver) DialUpstream(_ *gin.Context, _ *relaycommon.RelayInfo) (string, http.Header, error) {
 	d.dialCalls.Add(1)
+	if d.dialErr != nil {
+		return "", nil, d.dialErr
+	}
 	return "ws" + strings.TrimPrefix(d.upstreamURL, "http"), nil, nil
 }
 
@@ -136,6 +141,93 @@ func TestResponseBodyCloseHandlesNilFields(t *testing.T) {
 	require.NoError(t, (&responseBody{}).Close())
 }
 
+func TestDoRequestHandlesNilCapacityLeaseWhenDialSetupFails(t *testing.T) {
+	dialErr := errors.New("cannot build upstream websocket URL")
+	driver := &sessionTestDriver{dialErr: dialErr}
+	session := &Session{}
+
+	response, err := session.DoRequest(
+		newSessionTestContext(),
+		driver,
+		newSessionTestRelayInfo(101, 0, "standard-api-key"),
+		strings.NewReader(`{"model":"gpt-test","input":"hello"}`),
+	)
+
+	require.Nil(t, response)
+	require.ErrorIs(t, err, dialErr)
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+	assert.Zero(t, driver.fallbackCalls.Load())
+}
+
+func TestNormalizeResponseDoneEventUsesNestedTerminalState(t *testing.T) {
+	tests := []struct {
+		name         string
+		payload      string
+		wantType     string
+		wantError    string
+		wantMetadata string
+	}{
+		{
+			name:         "completed",
+			payload:      `{"type":"response.done","response":{"status":"completed","metadata":{"request_id":"req_completed"}},"metadata":{"exact_integer":9007199254740993}}`,
+			wantType:     "response.completed",
+			wantMetadata: `"exact_integer":9007199254740993`,
+		},
+		{
+			name:         "incomplete",
+			payload:      `{"type":"response.done","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"metadata":{"request_id":"req_incomplete"}}}`,
+			wantType:     "response.incomplete",
+			wantMetadata: `"request_id":"req_incomplete"`,
+		},
+		{
+			name:         "failed",
+			payload:      `{"type":"response.done","response":{"status":"failed","error":{"type":"server_error","code":"upstream_failure","message":"boom"},"metadata":{"request_id":"req_failed"}}}`,
+			wantType:     "response.failed",
+			wantError:    `"code":"upstream_failure"`,
+			wantMetadata: `"request_id":"req_failed"`,
+		},
+		{
+			name:         "error overrides completed status",
+			payload:      `{"type":"response.done","response":{"status":"completed","error":{"type":"server_error","message":"late failure"},"metadata":{"request_id":"req_error"}}}`,
+			wantType:     "response.failed",
+			wantError:    `"message":"late failure"`,
+			wantMetadata: `"request_id":"req_error"`,
+		},
+		{
+			name:         "top-level error overrides completed status",
+			payload:      `{"type":"response.done","error":{"type":"server_error","message":"transport failure"},"response":{"status":"completed","metadata":{"request_id":"req_top_error"}}}`,
+			wantType:     "response.failed",
+			wantError:    `"message":"transport failure"`,
+			wantMetadata: `"request_id":"req_top_error"`,
+		},
+		{
+			name:         "unknown status fails closed",
+			payload:      `{"type":"response.done","response":{"status":"mystery","metadata":{"request_id":"req_unknown"}}}`,
+			wantType:     "response.failed",
+			wantMetadata: `"request_id":"req_unknown"`,
+		},
+		{
+			name:         "missing response fails closed",
+			payload:      `{"type":"response.done","metadata":{"request_id":"req_missing"}}`,
+			wantType:     "response.failed",
+			wantMetadata: `"request_id":"req_missing"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, eventType, err := NormalizeResponseDoneEvent([]byte(test.payload))
+			require.NoError(t, err)
+			assert.Equal(t, test.wantType, eventType)
+			assert.Contains(t, string(normalized), `"type":"`+test.wantType+`"`)
+			assert.Contains(t, string(normalized), test.wantMetadata)
+			if test.wantError != "" {
+				assert.Contains(t, string(normalized), test.wantError)
+			}
+		})
+	}
+}
+
 func TestDoRequestOmitsHTTPOnlyFieldsFromWebSocketEvent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
@@ -151,7 +243,7 @@ func TestDoRequestOmitsHTTPOnlyFieldsFromWebSocketEvent(t *testing.T) {
 			return
 		}
 		requestPayload <- payload
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed","metadata":{"exact_integer":9007199254740993}}}`))
 	}))
 	defer server.Close()
 
@@ -162,15 +254,19 @@ func TestDoRequestOmitsHTTPOnlyFieldsFromWebSocketEvent(t *testing.T) {
 		newSessionTestContext(),
 		driver,
 		newSessionTestRelayInfo(101, 4, "credential-a"),
-		strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true,"stream_options":{"include_usage":true},"background":false}`),
+		strings.NewReader(`{"model":"gpt-test","input":"hello","metadata":{"exact_integer":9007199254740993},"stream":true,"stream_options":{"include_usage":true},"background":false}`),
 	)
 	require.NoError(t, err)
-	_, err = io.ReadAll(response.Body)
+	responsePayload, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
+	assert.Contains(t, string(responsePayload), `"type":"response.completed"`)
+	assert.Contains(t, string(responsePayload), `"exact_integer":9007199254740993`)
+	upstreamRequestPayload := <-requestPayload
+	assert.Contains(t, string(upstreamRequestPayload), `"exact_integer":9007199254740993`)
 
 	var event map[string]any
-	require.NoError(t, common.Unmarshal(<-requestPayload, &event))
+	require.NoError(t, common.UnmarshalWithNumber(upstreamRequestPayload, &event))
 	assert.Equal(t, "response.create", event["type"])
 	assert.Equal(t, "gpt-test", event["model"])
 	assert.Equal(t, "hello", event["input"])
@@ -211,6 +307,87 @@ func TestDoRequestPreservesTransportFieldsForHTTPFallback(t *testing.T) {
 	assert.NotContains(t, request, "type")
 	assert.Zero(t, driver.dialCalls.Load())
 	assert.Equal(t, int32(1), driver.fallbackCalls.Load())
+}
+
+func TestDoRequestLeavesApplicationAttemptReplaySafeAfterRejectedHandshake(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+	}{
+		{name: "rate limited", statusCode: http.StatusTooManyRequests},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "7")
+				w.WriteHeader(test.statusCode)
+				_, _ = w.Write([]byte(`{"error":{"type":"server_error","message":"try another channel"}}`))
+			}))
+			defer server.Close()
+
+			driver := &sessionTestDriver{upstreamURL: server.URL}
+			session := &Session{}
+			info := newSessionTestRelayInfo(110, 0, "standard-api-key")
+			response, err := session.DoRequest(
+				newSessionTestContext(),
+				driver,
+				info,
+				strings.NewReader(`{"model":"gpt-test","input":"hello"}`),
+			)
+
+			require.Nil(t, response)
+			require.Error(t, err)
+			var apiError *types.NewAPIError
+			require.ErrorAs(t, err, &apiError)
+			assert.Equal(t, test.statusCode, apiError.StatusCode)
+			assert.Equal(t, test.statusCode, apiError.UpstreamStatusCode)
+			assert.Equal(t, 7*time.Second, apiError.RetryAfter)
+			written, responseStarted := info.UpstreamAttemptState()
+			assert.False(t, written)
+			assert.False(t, responseStarted)
+			assert.True(t, info.HasUpstreamFailureResponse())
+			assert.Zero(t, session.ChannelID())
+			assert.Equal(t, int32(1), driver.dialCalls.Load())
+			assert.Zero(t, driver.fallbackCalls.Load())
+		})
+	}
+}
+
+func TestDoRequestFallsBackToHTTPForNonErrorHandshakeResponse(t *testing.T) {
+	for _, statusCode := range []int{http.StatusOK, http.StatusFound, http.StatusUpgradeRequired} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+			}))
+			defer server.Close()
+
+			fallbackBody := make(chan []byte, 1)
+			driver := &sessionTestDriver{upstreamURL: server.URL, fallbackBody: fallbackBody}
+			session := &Session{}
+			defer session.Close()
+			info := newSessionTestRelayInfo(111, 0, "standard-api-key")
+			response, err := session.DoRequest(
+				newSessionTestContext(),
+				driver,
+				info,
+				strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`),
+			)
+
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			require.NoError(t, response.Body.Close())
+			assert.Equal(t, int32(1), driver.dialCalls.Load())
+			assert.Equal(t, int32(1), driver.fallbackCalls.Load())
+			assert.Contains(t, string(<-fallbackBody), `"stream":true`)
+			written, responseStarted := info.UpstreamAttemptState()
+			assert.False(t, written)
+			assert.False(t, responseStarted)
+			assert.False(t, info.HasUpstreamFailureResponse())
+		})
+	}
 }
 
 func TestDoRequestRejectsCredentialSwitchOnPersistentConnection(t *testing.T) {
@@ -264,6 +441,161 @@ func TestDoRequestRejectsCredentialSwitchOnPersistentConnection(t *testing.T) {
 	assert.True(t, types.IsSkipRetryError(apiError))
 	assert.Equal(t, int32(1), driver.dialCalls.Load())
 	assert.Equal(t, int32(1), requestCount.Load())
+}
+
+func TestDoRequestReturnsConflictForSessionAffinitySwitch(t *testing.T) {
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeOpenAI,
+		107,
+		0,
+		"credential-a",
+	)
+	tests := []struct {
+		name    string
+		session *Session
+		info    *relaycommon.RelayInfo
+	}{
+		{
+			name:    "channel",
+			session: &Session{channelID: 107},
+			info:    newSessionTestRelayInfo(108, 0, "credential-a"),
+		},
+		{
+			name: "model",
+			session: &Session{
+				channelID:             107,
+				credentialFingerprint: fingerprint,
+				model:                 "gpt-other",
+			},
+			info: newSessionTestRelayInfo(107, 0, "credential-a"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			driver := &sessionTestDriver{}
+			response, err := test.session.DoRequest(
+				newSessionTestContext(),
+				driver,
+				test.info,
+				strings.NewReader(`{"model":"gpt-test","input":"hello"}`),
+			)
+			require.Nil(t, response)
+			require.Error(t, err)
+			var apiError *types.NewAPIError
+			require.ErrorAs(t, err, &apiError)
+			assert.Equal(t, http.StatusConflict, apiError.StatusCode)
+			assert.Equal(t, types.ErrorCodeInvalidRequest, apiError.GetErrorCode())
+			assert.True(t, types.IsSkipRetryError(apiError))
+			assert.Zero(t, driver.dialCalls.Load())
+			assert.Zero(t, driver.fallbackCalls.Load())
+		})
+	}
+}
+
+func TestDoRequestRejectsContinuationWithoutLiveUpstreamConnection(t *testing.T) {
+	const channelID = 108
+	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeOpenAI,
+		channelID,
+		0,
+		"credential-a",
+	)
+	tests := []struct {
+		name    string
+		session *Session
+	}{
+		{
+			name:    "first turn continuation",
+			session: &Session{},
+		},
+		{
+			name: "detected disconnected session",
+			session: &Session{
+				channelID:             channelID,
+				credentialFingerprint: fingerprint,
+				model:                 "gpt-test",
+			},
+		},
+		{
+			name:    "http fallback session",
+			session: &Session{httpFallback: true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			acquireCalls := atomic.Int32{}
+			driver := &sessionTestDriver{
+				acquire: func(_ *gin.Context, _ *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {
+					acquireCalls.Add(1)
+					return nil, nil
+				},
+			}
+			response, err := test.session.DoRequest(
+				newSessionTestContext(),
+				driver,
+				newSessionTestRelayInfo(channelID, 0, "credential-a"),
+				strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"continue"}`),
+			)
+			require.Nil(t, response)
+			require.Error(t, err)
+			var apiError *types.NewAPIError
+			require.ErrorAs(t, err, &apiError)
+			assert.Equal(t, http.StatusBadRequest, apiError.StatusCode)
+			assert.Equal(t, types.ErrorCodeWebSocketConnectionLimitReached, apiError.GetErrorCode())
+			assert.True(t, types.IsSkipRetryError(apiError))
+			assert.Zero(t, acquireCalls.Load())
+			assert.Zero(t, driver.dialCalls.Load())
+			assert.Zero(t, driver.fallbackCalls.Load())
+		})
+	}
+}
+
+func TestDoRequestAllowsContinuationOnLiveUpstreamConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	requestCount := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			requestCount.Add(1)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	for _, body := range []string{
+		`{"model":"gpt-test","input":"first"}`,
+		`{"model":"gpt-test","previous_response_id":"resp_1","input":"continue"}`,
+	} {
+		response, err := session.DoRequest(
+			newSessionTestContext(),
+			driver,
+			newSessionTestRelayInfo(109, 0, "credential-a"),
+			strings.NewReader(body),
+		)
+		require.NoError(t, err)
+		_, err = io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+	assert.Zero(t, driver.fallbackCalls.Load())
+	assert.Equal(t, int32(2), requestCount.Load())
 }
 
 func TestDoRequestDoesNotReplayAfterWebSocketWriteFailure(t *testing.T) {

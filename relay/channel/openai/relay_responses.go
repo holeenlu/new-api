@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -50,17 +51,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// 写入新的 response body
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
-	// compute usage
-	usage := dto.Usage{}
-	if responsesResponse.Usage != nil {
-		usage.PromptTokens = responsesResponse.Usage.InputTokens
-		usage.CompletionTokens = responsesResponse.Usage.OutputTokens
-		usage.TotalTokens = responsesResponse.Usage.TotalTokens
-		if responsesResponse.Usage.InputTokensDetails != nil {
-			usage.PromptTokensDetails.CachedTokens = responsesResponse.Usage.InputTokensDetails.CachedTokens
-			usage.PromptTokensDetails.CacheWriteTokens = responsesResponse.Usage.InputTokensDetails.CacheWriteTokens
-		}
-	}
+	usage := normalizeResponsesUsage(responsesResponse.Usage)
 	if info == nil || info.ResponsesUsageInfo == nil || info.ResponsesUsageInfo.BuiltInTools == nil {
 		return &usage, nil
 	}
@@ -99,6 +90,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 	var preflightError *types.NewAPIError
 	hasAuthoritativeUsage := false
+	var terminalResolved atomic.Bool
 
 	flushPendingEvents := func() {
 		for _, event := range pendingEvents {
@@ -114,30 +106,53 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		helper.CopyCodexSSEHeaders(c, resp)
 		flushPendingEvents()
 	}
+	stopProtocolFailure := func(err error, sr *helper.StreamResult) {
+		terminalResolved.Store(true)
+		logger.LogError(c, "invalid upstream Responses stream event: "+err.Error())
+		info.MarkUpstreamFailureResponse()
+		candidate := types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
+		candidate.UpstreamStatusCode = http.StatusBadGateway
+		candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
+		if isSubscriptionOAuth && !downstreamCommitted.Load() {
+			preflightError = candidate
+		} else {
+			info.MarkCommittedUpstreamError(candidate)
+			if !responsesws.IsSessionResponse(c) {
+				emitResponsesStreamProtocolError(c, "upstream returned an invalid Responses stream event")
+			}
+		}
+		sr.Stop(candidate)
+	}
 
 	handleStreamData := func(data string, sr *helper.StreamResult) {
 		if info.ResponsesStreamEventTransform != nil {
 			data = info.ResponsesStreamEventTransform(data)
 		}
+		if gjson.Get(data, "type").String() == "response.done" {
+			normalized, _, err := responsesws.NormalizeResponseDoneEvent([]byte(data))
+			if err != nil {
+				stopProtocolFailure(fmt.Errorf("normalize response.done event: %w", err), sr)
+				return
+			}
+			data = string(normalized)
+		}
 
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
-			sr.Error(err)
+			stopProtocolFailure(fmt.Errorf("decode Responses stream event: %w", err), sr)
 			return
 		}
 		switch streamResponse.Type {
-		case "response.completed", "response.incomplete", "response.done":
+		case "response.completed", "response.incomplete", "response.done",
+			"response.failed", "response.error", "error":
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					hasAuthoritativeUsage = true
-					usage.PromptTokens = streamResponse.Response.Usage.InputTokens
-					usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
-					usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
-					if streamResponse.Response.Usage.InputTokensDetails != nil {
-						usage.PromptTokensDetails.CachedTokens = streamResponse.Response.Usage.InputTokensDetails.CachedTokens
-						usage.PromptTokensDetails.CacheWriteTokens = streamResponse.Response.Usage.InputTokensDetails.CacheWriteTokens
-					}
+					*usage = normalizeResponsesUsage(streamResponse.Response.Usage)
 				}
 				if streamResponse.Response.HasImageGenerationCall() {
 					c.Set("image_generation_call", true)
@@ -155,9 +170,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 		}
+		cleanTerminal := streamResponse.Type == "response.completed" ||
+			streamResponse.Type == "response.incomplete" || streamResponse.Type == "response.done"
 		streamError := streamResponse.GetOpenAIError()
 		terminalFailure := streamResponse.Type == "response.failed" ||
 			streamResponse.Type == "response.error" || streamResponse.Type == "error"
+		if cleanTerminal || terminalFailure {
+			terminalResolved.Store(true)
+		}
 		if terminalFailure {
 			if streamError == nil {
 				streamError = &types.OpenAIError{Type: "unknown_error", Message: "upstream Responses stream failed without error details"}
@@ -169,7 +189,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			upstreamStatus := responsesStreamErrorStatus(data, streamError)
 			candidate := types.WithOpenAIError(*streamError, upstreamStatus)
 			candidate.UpstreamStatusCode = upstreamStatus
-			candidate.RetryAfter = service.ParseUpstreamRetryDelay(http.Header{}, []byte(data), time.Now())
+			candidate.RetryAfter = service.ParseUpstreamRetryDelay(resp.Header, []byte(data), time.Now())
 			candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
 			if isSubscriptionOAuth {
 				if !downstreamCommitted.Load() {
@@ -182,14 +202,17 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					sr.Stop(candidate)
 					return
 				}
-				sr.Error(candidate)
 			} else {
 				// Non-subscription channels treat the downstream as committed from the
 				// first event, so the turn cannot be safely retried; log for visibility
 				// and forward the failure event to the client below.
 				logger.LogError(c, fmt.Sprintf("responses stream terminal failure on non-subscription channel: type=%s message=%s", streamResponse.Type, streamError.Message))
-				sr.Error(candidate)
 			}
+			info.MarkCommittedUpstreamError(candidate)
+			relaycommon.MarkResponsesStreamFailureEmitted(c)
+			sendResponsesStreamData(c, streamResponse, data)
+			sr.Stop(candidate)
+			return
 		}
 		if isSubscriptionOAuth && !downstreamCommitted.Load() {
 			switch streamResponse.Type {
@@ -201,14 +224,20 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 				commitPreflight()
 				return
-			case "response.completed", "response.done":
+			case "response.completed", "response.incomplete", "response.done":
 				pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
 				commitPreflight()
+				if !responsesws.IsSessionResponse(c) {
+					sr.Done()
+				}
 				return
 			}
 			commitPreflight()
 		}
 		sendResponsesStreamData(c, streamResponse, data)
+		if cleanTerminal && !responsesws.IsSessionResponse(c) {
+			sr.Done()
+		}
 	}
 	if isSubscriptionOAuth {
 		helper.StreamScannerHandlerWithPreflight(
@@ -248,6 +277,30 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			http.StatusBadGateway,
 		)
 	}
+	if !terminalResolved.Load() && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason != relaycommon.StreamEndReasonClientGone {
+		endErr := info.StreamStatus.EndError
+		if endErr == nil {
+			endErr = fmt.Errorf("upstream Responses stream ended with reason %q before a terminal event", info.StreamStatus.EndReason)
+		} else {
+			endErr = fmt.Errorf("upstream Responses stream ended before a terminal event: %w", endErr)
+		}
+		candidate := types.NewErrorWithStatusCode(
+			endErr,
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
+		candidate.UpstreamStatusCode = http.StatusBadGateway
+		candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
+		if isSubscriptionOAuth && !downstreamCommitted.Load() {
+			helper.ClearEventStreamHeaders(c)
+			return nil, candidate
+		}
+		info.MarkCommittedUpstreamError(candidate)
+		if !responsesws.IsSessionResponse(c) {
+			emitResponsesStreamProtocolError(c, "upstream Responses stream ended before a terminal event")
+		}
+	}
 	if len(pendingEvents) > 0 {
 		commitPreflight()
 	}
@@ -271,6 +324,53 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	return usage, nil
+}
+
+func emitResponsesStreamProtocolError(c *gin.Context, message string) {
+	failurePayload, err := common.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    "server_error",
+			"code":    types.ErrorCodeBadResponseBody,
+			"message": message,
+		},
+	})
+	if err != nil {
+		return
+	}
+	if helper.ResponseChunkData(
+		c,
+		dto.ResponsesStreamResponse{Type: "error"},
+		string(failurePayload),
+	) == nil {
+		relaycommon.MarkResponsesStreamFailureEmitted(c)
+	}
+}
+
+func normalizeResponsesUsage(upstream *dto.Usage) dto.Usage {
+	if upstream == nil {
+		return dto.Usage{}
+	}
+
+	usage := *upstream
+	usage.PromptTokens = upstream.InputTokens
+	usage.CompletionTokens = upstream.OutputTokens
+	usage.TotalTokens = upstream.TotalTokens
+	usage.UsageSource = dto.BillingUsageSourceOAIResponses
+	usage.UsageSemantic = dto.BillingUsageSemanticOpenAI
+	usage.BillingUsage = nil
+	if upstream.InputTokensDetails != nil {
+		inputDetails := *upstream.InputTokensDetails
+		usage.InputTokensDetails = &inputDetails
+		usage.PromptTokensDetails = inputDetails
+	}
+	if upstream.OutputTokensDetails != nil {
+		outputDetails := *upstream.OutputTokensDetails
+		usage.OutputTokensDetails = &outputDetails
+		usage.CompletionTokenDetails = outputDetails
+	}
+	usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(&usage)
+	return usage
 }
 
 func responsesWrappedError(info *relaycommon.RelayInfo, resp *http.Response, responseBody []byte, upstreamError *types.OpenAIError) *types.NewAPIError {

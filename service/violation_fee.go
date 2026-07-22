@@ -12,8 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
-	"github.com/shopspring/decimal"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -81,26 +79,23 @@ func shouldChargeViolationFee(err *types.NewAPIError) bool {
 	return HasCSAMViolationMarker(err)
 }
 
-func calcViolationFeeQuota(amount, groupRatio float64) int {
+func calcViolationFeeQuota(amount, groupRatio float64) (int, *common.QuotaClamp) {
 	if amount <= 0 {
-		return 0
+		return 0, nil
 	}
 	if groupRatio <= 0 {
-		return 0
+		return 0, nil
 	}
-	quota := decimal.NewFromFloat(amount).
-		Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
-		Mul(decimal.NewFromFloat(groupRatio)).
-		Round(0).
-		IntPart()
+	quota, clamp := common.QuotaRoundChecked(amount * common.QuotaPerUnit * groupRatio)
 	if quota <= 0 {
-		return 0
+		return 0, clamp
 	}
-	return int(quota)
+	return quota, clamp
 }
 
-// ChargeViolationFeeIfNeeded charges an additional fee after the normal flow finishes (including refund).
-// It uses Grok fee settings as the fee policy.
+// ChargeViolationFeeIfNeeded settles a failed request to the configured violation fee.
+// It returns true only when the fee was committed. Callers must refund the ordinary
+// reservation when it returns false.
 func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.NewAPIError) bool {
 	if ctx == nil || relayInfo == nil || apiErr == nil {
 		return false
@@ -118,14 +113,44 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
-	feeQuota := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
+	feeQuota, clamp := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
+	noteQuotaClamp(relayInfo, clamp)
 	if feeQuota <= 0 {
 		return false
 	}
 
-	if err := PostConsumeQuota(relayInfo, feeQuota, 0, true); err != nil {
+	if relayInfo.Billing == nil {
+		// Free models normally skip pre-consume, but a policy fee still has to honor
+		// the user's wallet/subscription preference and quota bounds. Create the same
+		// billing session a paid request would have used instead of falling through to
+		// the legacy wallet-only delta path. Force a real reservation so the fee cannot
+		// enter the trusted-user settle path without funds already held.
+		forcePreConsume := relayInfo.ForcePreConsume
+		relayInfo.ForcePreConsume = true
+		preConsumeErr := PreConsumeBilling(ctx, feeQuota, relayInfo)
+		relayInfo.ForcePreConsume = forcePreConsume
+		if preConsumeErr != nil {
+			logger.LogError(ctx, fmt.Sprintf("failed to reserve violation fee: %s", preConsumeErr.Error()))
+			return false
+		}
+	}
+
+	// Settle the existing reservation synchronously. Refunding first would create a
+	// window where a user whose remaining quota is below the fee cannot be charged,
+	// even though the reservation already covers the fee.
+	if err := SettleBilling(ctx, relayInfo, feeQuota); err != nil {
 		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", err.Error()))
-		return false
+		if relayInfo.Billing == nil || !relayInfo.Billing.FundingCommitted() {
+			// The funding source was never committed (e.g. a trusted-bypass session
+			// whose wallet write failed), so no money moved: do not record a charge.
+			return false
+		}
+		// BillingSession commits the funding source before adjusting token quota. If
+		// that second step fails, the fee is still financially committed and Refund is
+		// intentionally unavailable. Preserve the consume ledger/log instead of
+		// silently hiding a charge that already happened; BillingSession has already
+		// emitted the token-adjustment reconciliation error.
+		logger.LogWarn(ctx, "violation fee funding committed with a token quota adjustment error")
 	}
 
 	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
@@ -146,6 +171,7 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		"upstream_error_code":  fmt.Sprintf("%v", oai.Code),
 		"violation_fee_marker": CSAMViolationMarker,
 	}
+	attachQuotaSaturation(ctx, relayInfo, other)
 
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:      relayInfo.ChannelId,

@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 )
 
@@ -17,7 +18,20 @@ func Unmarshal(data []byte, v any) error {
 func UnmarshalWithNumber(data []byte, v any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	return decoder.Decode(v)
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+
+	// Probe for trailing content with a single token read instead of decoding a
+	// full second document, so junk after the value is rejected without paying to
+	// parse and materialize it.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid trailing data after JSON value")
+	}
+	return nil
 }
 
 func UnmarshalJsonStr(data string, v any) error {

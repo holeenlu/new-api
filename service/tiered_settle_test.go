@@ -9,6 +9,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Claude Sonnet-style tiered expression: standard vs long-context
@@ -85,7 +87,7 @@ func TestTryTieredSettleUsesFrozenRequestInput(t *testing.T) {
 	}
 }
 
-func TestTryTieredSettleFallsBackToFrozenPreConsumeOnExprError(t *testing.T) {
+func TestTryTieredSettleFallsBackToCurrentSnapshotEstimateOnExprError(t *testing.T) {
 	relayInfo := &relaycommon.RelayInfo{
 		FinalPreConsumedQuota: 321,
 		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
@@ -98,15 +100,9 @@ func TestTryTieredSettleFallsBackToFrozenPreConsumeOnExprError(t *testing.T) {
 	}
 
 	ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 100})
-	if !ok {
-		t.Fatal("expected tiered settle to apply")
-	}
-	if quota != 321 {
-		t.Fatalf("quota = %d, want 321", quota)
-	}
-	if result != nil {
-		t.Fatalf("result = %#v, want nil", result)
-	}
+	require.True(t, ok)
+	assert.Equal(t, 123, quota)
+	assert.Nil(t, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,9 +406,103 @@ func TestTryTieredSettle_ErrorFallbackToEstimatedQuotaAfterGroup(t *testing.T) {
 	}
 }
 
+func TestTryTieredSettleNegativeExpressionFallsBackToCurrentSnapshotEstimate(t *testing.T) {
+	exprStr := `tier("invalid", -p)`
+	info := &relaycommon.RelayInfo{
+		FinalPreConsumedQuota: 321,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:              "tiered_expr",
+			ExprString:               exprStr,
+			ExprHash:                 billingexpr.ExprHashString(exprStr),
+			GroupRatio:               1,
+			QuotaPerUnit:             testQuotaPerUnit,
+			EstimatedQuotaAfterGroup: 999,
+		},
+	}
+
+	ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{P: 100})
+
+	require.True(t, ok)
+	assert.Equal(t, 999, quota)
+	assert.Nil(t, result)
+}
+
+func TestTryTieredSettleNeverReturnsNegativeFallback(t *testing.T) {
+	exprStr := `invalid expr!!!`
+	info := &relaycommon.RelayInfo{
+		FinalPreConsumedQuota: -321,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:              "tiered_expr",
+			ExprString:               exprStr,
+			ExprHash:                 billingexpr.ExprHashString(exprStr),
+			GroupRatio:               1,
+			EstimatedQuotaAfterGroup: -999,
+		},
+	}
+
+	ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{P: 100})
+
+	require.True(t, ok)
+	assert.Zero(t, quota)
+	assert.Nil(t, result)
+}
+
+func TestTryTieredSettleClampsEveryTokenDimension(t *testing.T) {
+	exprStr := `tier("base", p + c + len + cr + cc + cc1h + img + img_o + ai + ao)`
+	info := &relaycommon.RelayInfo{
+		FinalPreConsumedQuota: 777,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:  "tiered_expr",
+			ExprString:   exprStr,
+			ExprHash:     billingexpr.ExprHashString(exprStr),
+			GroupRatio:   1,
+			QuotaPerUnit: 1_000_000,
+		},
+	}
+
+	ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{
+		P: -1, C: -2, Len: -3, CR: -4, CC: -5,
+		CC1h: -6, Img: -7, ImgO: -8, AI: -9, AO: -10,
+	})
+
+	require.True(t, ok)
+	assert.Zero(t, quota)
+	require.NotNil(t, result)
+	assert.Equal(t, "base", result.MatchedTier)
+}
+
 // ---------------------------------------------------------------------------
 // BuildTieredTokenParams: token normalization and ratio parity tests
 // ---------------------------------------------------------------------------
+
+func TestBuildTieredTokenParamsClampsEveryTokenDimension(t *testing.T) {
+	usage := &dto.Usage{
+		PromptTokens:     -1,
+		CompletionTokens: -2,
+		UsageSemantic:    "anthropic",
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:         -3,
+			CachedCreationTokens: -4,
+			CacheWriteTokens:     -5,
+			ImageTokens:          -6,
+			AudioTokens:          -7,
+		},
+		CompletionTokenDetails: dto.OutputTokenDetails{
+			ImageTokens: -8,
+			AudioTokens: -9,
+		},
+		ClaudeCacheCreation5mTokens: -10,
+		ClaudeCacheCreation1hTokens: -11,
+	}
+	usedVars := map[string]bool{
+		"cr": true, "cc": true, "cc1h": true, "img": true,
+		"img_o": true, "ai": true, "ao": true,
+	}
+
+	params := BuildTieredTokenParams(usage, true, usedVars)
+
+	assert.Equal(t, billingexpr.TokenParams{}, params)
+}
 
 func tieredQuota(exprStr string, usage *dto.Usage, isClaudeSemantic bool, groupRatio float64) float64 {
 	usedVars := billingexpr.UsedVars(exprStr)

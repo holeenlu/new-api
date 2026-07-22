@@ -98,7 +98,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				newAPIError.GetErrorCode(),
 				newAPIError.Error(),
 			))
-			if newAPIError.StatusCode == http.StatusGatewayTimeout &&
+			if newAPIError.RetryAfter > 0 {
+				setRelayRetryAfterHeader(c, newAPIError.RetryAfter)
+			} else if newAPIError.StatusCode == http.StatusGatewayTimeout &&
 				relaycommon.IsSubscriptionOAuthChannel(c.GetInt("channel_type")) {
 				c.Header("Retry-After", "2")
 			}
@@ -172,31 +174,40 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
-	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
-	if err != nil {
-		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
-		return
-	}
-
-	// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)
-
-	if priceData.FreeModel {
-		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
-	} else {
-		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
-		if newAPIError != nil {
+	if relayInfo.RelayMode != relayconstant.RelayModeResponsesCompact {
+		priceData, priceErr := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+		if priceErr != nil {
+			newAPIError = types.NewError(priceErr, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 			return
+		}
+
+		// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)
+
+		if priceData.FreeModel {
+			logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
+		} else {
+			newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
+			if newAPIError != nil {
+				return
+			}
 		}
 	}
 
 	defer func() {
-		// Only return quota if downstream failed and quota was actually pre-consumed
+		// A terminal violation settles the existing reservation directly to the fee.
+		// Every other failure follows the ordinary refund path.
 		if newAPIError != nil {
 			newAPIError = service.NormalizeViolationFeeError(newAPIError)
-			if relayInfo.Billing != nil {
+			if relayInfo.RelayMode == relayconstant.RelayModeResponsesCompact {
+				// Compact pricing is scoped to each mapped attempt and restored before
+				// control returns here. Re-resolve the request's effective group ratio so
+				// a provider violation cannot bypass its fixed fee through a zero-value
+				// restored PriceData.
+				relayInfo.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, relayInfo)
+			}
+			if !service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError) && relayInfo.Billing != nil {
 				relayInfo.Billing.Refund(c)
 			}
-			service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError)
 		}
 	}()
 
@@ -267,6 +278,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryParam.CaptureSubscriptionOAuthAttemptMetadata(c)
 
 		if newAPIError == nil {
+			// A terminal Responses failure may arrive after SSE output was committed.
+			// ResponsesHelper deliberately completes usage settlement in that case and
+			// returns success so the request is neither retried nor refunded. Preserve
+			// the upstream failure as a channel-health/error-log outcome here.
+			if committedError := relayInfo.CommittedUpstreamError(); committedError != nil {
+				recordChannelAttemptError(c, channel, committedError)
+			}
 			affinitySuccess := true
 			if relayInfo.StreamStatus != nil &&
 				(!relayInfo.StreamStatus.IsNormalEnd() || relayInfo.StreamStatus.HasErrors()) {
@@ -295,17 +313,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if isSubscriptionOAuth {
 			if !shouldContinueSubscriptionOAuthRetry(c, relayInfo, retryParam, newAPIError) {
 				if relayInfo.RelayMode == relayconstant.RelayModeResponses && !c.Writer.Written() {
-					if data, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c); exists {
-						eventType := "response.failed"
-						var streamResponse dto.ResponsesStreamResponse
-						if err := common.UnmarshalJsonStr(data, &streamResponse); err == nil && streamResponse.Type != "" {
-							eventType = streamResponse.Type
-						}
-						helper.SetEventStreamHeaders(c)
-						if helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, data) == nil {
-							relaycommon.MarkResponsesStreamFailureEmitted(c)
-						}
-					}
+					emitResponsesStreamPreflightFailure(c)
 				}
 				break
 			}
@@ -323,10 +331,31 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		logger.LogInfo(c, retryLogStr)
 	}
 	if newAPIError != nil {
-		gopool.Go(func() {
-			perfmetrics.RecordRelaySample(relayInfo, false, 0)
-		})
+		if sample, ok := perfmetrics.SnapshotRelaySample(relayInfo, false, 0); ok {
+			gopool.Go(func() {
+				perfmetrics.Record(sample)
+			})
+		}
 	}
+}
+
+func emitResponsesStreamPreflightFailure(c *gin.Context) bool {
+	data, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c)
+	if !exists {
+		return false
+	}
+
+	eventType := "response.failed"
+	var streamResponse dto.ResponsesStreamResponse
+	if err := common.UnmarshalJsonStr(data, &streamResponse); err == nil && streamResponse.Type != "" {
+		eventType = streamResponse.Type
+	}
+	helper.SetEventStreamHeaders(c)
+	if helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, data) != nil {
+		return false
+	}
+	relaycommon.MarkResponsesStreamFailureEmitted(c)
+	return true
 }
 
 func refreshCodexCredentialForRetry(
@@ -338,7 +367,8 @@ func refreshCodexCredentialForRetry(
 ) (*types.NewAPIError, bool) {
 	if c == nil || info == nil || retryParam == nil || channel == nil ||
 		!service.ShouldRefreshCodexOAuthCredential(channel.Type, apiError) ||
-		c.Writer.Written() {
+		c.Writer.Written() ||
+		(service.IsSubscriptionOAuthRetryDisabled(c) && !hasReplaySafeResponsesWebSocketInternalPin(c)) {
 		return apiError, false
 	}
 	written, _ := info.UpstreamAttemptState()
@@ -371,11 +401,28 @@ func refreshCodexCredentialForRetry(
 }
 
 func shouldRetryOrdinaryRelay(c *gin.Context, info *relaycommon.RelayInfo, apiError *types.NewAPIError, retryTimes int) bool {
-	if !shouldRetry(c, apiError, retryTimes) || c == nil || c.Writer == nil || c.Writer.Written() {
+	if c == nil || info == nil || c.Writer == nil || c.Writer.Written() {
+		return false
+	}
+	internalWebSocketPin := hasReplaySafeResponsesWebSocketInternalPin(c)
+	if !shouldRetry(c, apiError, retryTimes, !internalWebSocketPin) {
 		return false
 	}
 	written, responseStarted := info.UpstreamAttemptState()
-	return !written && !responseStarted
+	if written || responseStarted {
+		return false
+	}
+	if internalWebSocketPin {
+		// A self-contained Responses turn is pinned only to reuse its current
+		// upstream connection. A rejected WebSocket handshake happens before the
+		// response.create frame is written, so release that internal binding before
+		// ordinary channel selection fails over. User/admin pins and stateful
+		// previous_response_id turns never carry this marker and remain fixed.
+		if session := responsesws.SessionFromContext(c); session != nil {
+			session.ResetChannelForRetry()
+		}
+	}
+	return true
 }
 
 func shouldContinueSubscriptionOAuthRetry(
@@ -386,7 +433,7 @@ func shouldContinueSubscriptionOAuthRetry(
 ) bool {
 	written, responseStarted := info.UpstreamAttemptState()
 	_, specificChannel := c.Get("specific_channel_id")
-	internalWebSocketPin := c.GetBool(responsesWebSocketInternalPinKey)
+	internalWebSocketPin := hasReplaySafeResponsesWebSocketInternalPin(c)
 	if internalWebSocketPin {
 		// This pin is an implementation detail of the reusable upstream
 		// WebSocket, not an administrator/user request to force one channel.
@@ -401,11 +448,10 @@ func shouldContinueSubscriptionOAuthRetry(
 		DownstreamStarted:       c.Writer.Written(),
 		RetryDisabled:           service.IsSubscriptionOAuthRetryDisabled(c) && !internalWebSocketPin,
 		SpecificChannel:         specificChannel,
-		Retryable:               shouldRetry(c, apiError, common.SubscriptionOAuthUpstreamRetryTimes),
+		Retryable:               shouldRetry(c, apiError, common.SubscriptionOAuthUpstreamRetryTimes, !internalWebSocketPin),
 	})
 	if retryAfter > 0 {
-		seconds := int((retryAfter + time.Second - 1) / time.Second)
-		c.Header("Retry-After", strconv.Itoa(max(seconds, 1)))
+		setRelayRetryAfterHeader(c, retryAfter)
 	}
 	if decision == service.SubscriptionOAuthSwitchCredential {
 		if session := responsesws.SessionFromContext(c); session != nil {
@@ -413,6 +459,14 @@ func shouldContinueSubscriptionOAuthRetry(
 		}
 	}
 	return decision != service.SubscriptionOAuthRetryStop
+}
+
+// hasReplaySafeResponsesWebSocketInternalPin distinguishes a controller-owned
+// channel-affinity hint from a stateful continuation. Parameter overrides can
+// add previous_response_id after the turn middleware installed the internal pin;
+// once that happens, the pin must no longer authorize credential failover.
+func hasReplaySafeResponsesWebSocketInternalPin(c *gin.Context) bool {
+	return c != nil && c.GetBool(responsesWebSocketInternalPinKey) && !responsesws.IsContinuationRequired(c)
 }
 
 var upgrader = websocket.Upgrader{
@@ -433,6 +487,14 @@ func clearStaleRetryAfter(c *gin.Context) {
 		return
 	}
 	c.Writer.Header().Del("Retry-After")
+}
+
+func setRelayRetryAfterHeader(c *gin.Context, retryAfter time.Duration) {
+	if c == nil || retryAfter <= 0 {
+		return
+	}
+	seconds := int((retryAfter + time.Second - 1) / time.Second)
+	c.Header("Retry-After", strconv.Itoa(max(seconds, 1)))
 }
 
 func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) bool {
@@ -571,11 +633,11 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
-func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, respectSpecificChannel bool) bool {
 	if openaiErr == nil {
 		return false
 	}
-	if _, ok := c.Get("specific_channel_id"); ok {
+	if _, ok := c.Get("specific_channel_id"); ok && respectSpecificChannel {
 		return false
 	}
 	if service.IsSubscriptionOAuthCapacityFailure(c.GetInt("channel_type"), openaiErr) {

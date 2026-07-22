@@ -1,8 +1,9 @@
 # ADR 0003: Unified relay billing attempt loop
 
 Status: Partially implemented. Phase 1 (shared per-attempt channel-error
-accounting) is done. Phase 2 (a single shared attempt loop owning the billing
-settle) is deferred — see "Implementation status" below.
+accounting) and the independent violation-fee settlement safety fix are done.
+Phase 2 (a single shared attempt loop owning the billing settle) is deferred —
+see "Implementation status" below.
 
 ## Context
 
@@ -36,7 +37,12 @@ Non-negotiable constraints:
   safety, lease release) must hold identically on every path.
 - The alpha-search endpoint has a different request/response contract from
   `/v1/responses` and cannot simply call `Relay()` verbatim.
-- No behavior change to the ordinary relay path for non-Codex traffic.
+- Except for the explicit violation-fee safety fix below, ordinary non-violation
+  relay behavior for non-Codex traffic must not change.
+
+Terminal provider-policy violations are a billing exception to the ordinary
+"failure means full refund" rule. The configured fee must replace the request's
+normal charge without creating a refund/recharge race.
 
 ## Decision
 
@@ -61,6 +67,19 @@ State ownership: the shared primitive owns the retry ledger, the used-channel
 set, and the billing settlement flag for one request. Adapters own only their
 request/response translation.
 
+For a terminal violation-fee error, `Relay` resolves the effective group ratio
+and synchronously settles the request's existing `BillingSession` to the fee
+quota. It does not asynchronously refund the reservation and then start a second
+charge. If no billing session exists (for example, an otherwise free model), the
+fee first creates a fully reserved session through the user's normal
+wallet/subscription preference; it must not fall through to an implicit wallet
+delta. A non-applicable fee or a settlement failure that remains refundable
+falls back to the ordinary idempotent refund; a successfully settled fee is
+never followed by `Refund`. If the funding source committed but the later token
+ledger adjustment failed, the session is no longer refundable: the charge is
+still recorded in the consume ledger while the existing reconciliation warning
+surfaces the token adjustment failure.
+
 Failure/rollback: if the extraction regresses, the adapters can be reverted to
 their inline loops without touching the shared primitive's callers, because the
 primitive is additive. The compatibility trigger for removing any transitional
@@ -84,7 +103,14 @@ inline code is "all relay entry points route through `RunRelayAttempts`."
 Billing pre-consume/settle/refund and subscription-OAuth failover live in one
 tested primitive, so an invariant fix applies to every relay entry point at
 once. `codex_alpha_search.go` shrinks to an adapter and loses its second
-settlement path. The ordinary relay path for non-Codex traffic is unchanged.
+settlement path. Except for the explicit violation-fee safety fix, the ordinary
+non-violation relay path for non-Codex traffic is unchanged.
+
+Violation fees now reuse the request reservation and settlement ledger. This
+removes the temporary balance gap between asynchronous refund and a separate fee
+charge. Otherwise-free requests now create the same funding session as paid
+requests, retaining wallet/subscription selection, token-quota adjustment, and
+the existing saturation audit on the computed fee.
 
 Must be monitored during rollout: refund-once and no-double-charge behavior on
 alpha search, subscription-OAuth lease release on every exit path, and parity of
@@ -102,6 +128,9 @@ retry counts/`processChannelError` accounting between old and new loops.
   upstream outcomes, before and after the change.
 - Regression: existing `controller` and `service` billing/task test suites pass
   unchanged.
+- Violation-fee regression: a reserved failed request ends with exactly the fee
+  deducted from wallet/subscription and token quota, records one fee log, and
+  does not perform a later asynchronous refund or a second charge.
 
 ## Implementation status
 
@@ -111,7 +140,18 @@ capacity-failover log or `processChannelError` — was duplicated verbatim in
 `Relay()` and `CodexAlphaSearch()`. It is now a single `recordChannelAttemptError`
 helper in `controller/relay.go` used by both. This is the highest-drift-risk
 shared code (a divergence here wrongly disables or spares a channel), and the
-extraction is behavior-preserving by construction. No billing behavior changed.
+extraction is behavior-preserving by construction. This phase itself did not
+change billing behavior.
+
+**Independent violation-fee safety fix (done).** A provider-policy violation no
+longer triggers an asynchronous refund followed by a separate charge. `Relay`
+synchronously settles the request's existing reservation to the configured fee;
+an otherwise-free request first creates a fully reserved billing session through
+the user's wallet/subscription preference. A settlement that remains refundable
+falls back to the ordinary refund, while a funding source that already committed
+is recorded and never refunded after a token-ledger adjustment error. Fee quota
+conversion uses the shared checked saturation path and attaches the existing
+admin-only quota-saturation audit marker.
 
 **Phase 2 (deferred).** Collapsing both attempt loops into one shared primitive
 that also owns the billing settle was evaluated against the two real loops and

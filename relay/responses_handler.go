@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,11 +11,14 @@ import (
 	appconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -87,35 +91,30 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
-	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
-		// Compact pricing follows the mapped upstream model. Freeze it before the
-		// request is sent so a missing rule cannot turn an already-written response
-		// into an unpriced fallback, and so settlement uses the same tiered snapshot
-		// that was validated here.
-		info.TieredBillingSnapshot = nil
-		info.BillingRequestInput = nil
-		compactPriceData, err := helper.ModelPriceHelper(c, info, info.GetEstimatePromptTokens(), &types.TokenCountMeta{})
-		if err != nil {
-			return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithStatusCode(http.StatusBadRequest))
-		}
-		if !compactPriceData.FreeModel {
-			if info.Billing == nil {
-				if apiError := service.PreConsumeBilling(c, compactPriceData.QuotaToPreConsume, info); apiError != nil {
-					return apiError
-				}
-			} else if err := info.Billing.Reserve(compactPriceData.QuotaToPreConsume); err != nil {
-				return types.NewError(err, types.ErrorCodePreConsumeTokenQuotaFailed, types.ErrOptionWithSkipRetry())
-			}
-		}
-	}
-
 	adaptor := GetAdaptor(info.ApiType)
 	if adaptor == nil {
 		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
 	adaptor.Init(info)
+	if session := responsesws.SessionFromContext(c); session != nil &&
+		strings.TrimSpace(responsesReq.PreviousResponseID) != "" {
+		// Raw body passthrough skips conversion and final-JSON inspection below.
+		// Detect a continuation from the already parsed request so it can never
+		// escape onto HTTP or a replacement upstream connection after its owning
+		// WebSocket has been lost.
+		responsesws.MarkContinuationRequired(c)
+		if !session.HasLiveConnection() {
+			return responsesws.NewContinuationUnavailableError()
+		}
+	}
 	var requestBody io.Reader
 	passThroughEnabled := relaycommon.IsRequestPassThroughEnabled(info)
+	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+		// Compact always uses the converted request. Besides enforcing the endpoint's
+		// documented field whitelist, this ensures suffix removal, model mapping and
+		// parameter overrides are visible before pricing is frozen.
+		passThroughEnabled = false
+	}
 	if passThroughEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
@@ -154,11 +153,82 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 				return newAPIErrorFromParamOverride(err)
 			}
 		}
+		var finalRequest dto.OpenAIResponsesRequest
+		if err := common.Unmarshal(jsonData, &finalRequest); err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if session := responsesws.SessionFromContext(c); session != nil {
+			if strings.TrimSpace(finalRequest.PreviousResponseID) != "" {
+				responsesws.MarkContinuationRequired(c)
+				if !session.HasLiveConnection() {
+					return responsesws.NewContinuationUnavailableError()
+				}
+			}
+		}
 		if info.ChannelType == appconstant.ChannelTypeCodex && info.IsStream &&
 			codex.IsResponsesLiteRequest(info) {
 			jsonData, err = codex.FilterResponsesLitePayload(jsonData)
 			if err != nil {
 				return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+		}
+		if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+			finalModel := strings.TrimSpace(finalRequest.Model)
+			if finalModel == "" {
+				return types.NewErrorWithStatusCode(
+					errors.New("responses compact upstream model is empty after request overrides"),
+					types.ErrorCodeChannelParamOverrideInvalid,
+					http.StatusBadRequest,
+					types.ErrOptionWithSkipRetry(),
+				)
+			}
+
+			// Freeze compact pricing from the final JSON that will actually be sent.
+			// A channel override may change the model after ordinary mapping, so both
+			// the upstream affinity model and tier-expression request input must follow
+			// this final payload.
+			info.UpstreamModelName = finalModel
+			info.OriginModelName = ratio_setting.WithCompactModelSuffix(finalModel)
+			info.TieredBillingSnapshot = nil
+			info.BillingRequestInput = &billingexpr.RequestInput{Body: append([]byte(nil), jsonData...)}
+			// Recount from the provider-ready payload. Codex conversion can add a
+			// channel system prompt and parameter overrides can replace request fields;
+			// reusing the client DTO's estimate would reserve against a body that is not
+			// the one sent upstream.
+			compactMeta := finalRequest.GetTokenCountMeta()
+			if compactMeta == nil {
+				compactMeta = &types.TokenCountMeta{}
+			}
+			contextModelName := common.GetContextKeyString(c, appconstant.ContextKeyOriginalModel)
+			common.SetContextKey(c, appconstant.ContextKeyOriginalModel, finalModel)
+			finalPromptTokens, countErr := service.EstimateRequestToken(c, compactMeta, info)
+			common.SetContextKey(c, appconstant.ContextKeyOriginalModel, contextModelName)
+			if countErr != nil {
+				return types.NewError(countErr, types.ErrorCodeCountTokenFailed)
+			}
+			info.SetEstimatePromptTokens(finalPromptTokens)
+			compactPriceData, err := helper.ModelPriceHelper(c, info, finalPromptTokens, compactMeta)
+			if err != nil {
+				return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithStatusCode(http.StatusBadRequest))
+			}
+			if !compactPriceData.FreeModel {
+				if info.Billing == nil {
+					if apiError := service.PreConsumeBilling(c, compactPriceData.QuotaToPreConsume, info); apiError != nil {
+						return apiError
+					}
+				} else if err := info.Billing.Reserve(compactPriceData.QuotaToPreConsume); err != nil {
+					var apiError *types.NewAPIError
+					if errors.As(err, &apiError) {
+						return apiError
+					}
+					return types.NewErrorWithStatusCode(
+						err,
+						types.ErrorCodePreConsumeTokenQuotaFailed,
+						http.StatusForbidden,
+						types.ErrOptionWithSkipRetry(),
+						types.ErrOptionWithNoRecordErrorLog(),
+					)
+				}
 			}
 		}
 
@@ -198,6 +268,17 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
+	}
+	if committedError := info.CommittedUpstreamError(); committedError != nil {
+		committedError = service.NormalizeViolationFeeError(committedError)
+		info.MarkCommittedUpstreamError(committedError)
+		if service.IsViolationFeeCode(committedError.GetErrorCode()) {
+			// A committed provider-policy terminal has already been sent to the SSE
+			// client, but its configured fee replaces ordinary usage billing. Return it
+			// before PostTextConsumeQuota so Relay settles the existing reservation to
+			// the violation fee without refunding, retrying, or appending another body.
+			return committedError
+		}
 	}
 
 	usageDto := usage.(*dto.Usage)

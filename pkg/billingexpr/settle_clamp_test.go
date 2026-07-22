@@ -51,3 +51,156 @@ func TestComputeTieredQuota_NoClampInRange(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, result.Clamp, "in-range settlement must not report a clamp")
 }
+
+func TestComputeTieredQuotaRejectsNegativeCharge(t *testing.T) {
+	tests := []struct {
+		name         string
+		expr         string
+		params       billingexpr.TokenParams
+		quotaPerUnit float64
+		groupRatio   float64
+		wantError    string
+	}{
+		{
+			name:         "negative expression cost",
+			expr:         `tier("base", -p)`,
+			params:       billingexpr.TokenParams{P: 100},
+			quotaPerUnit: 500_000,
+			groupRatio:   1,
+			wantError:    "negative cost",
+		},
+		{
+			name:         "negative quota unit",
+			expr:         `tier("base", p)`,
+			params:       billingexpr.TokenParams{P: 100},
+			quotaPerUnit: -500_000,
+			groupRatio:   1,
+			wantError:    "negative quota before group ratio",
+		},
+		{
+			name:         "negative group ratio",
+			expr:         `tier("base", p)`,
+			params:       billingexpr.TokenParams{P: 100},
+			quotaPerUnit: 500_000,
+			groupRatio:   -1,
+			wantError:    "negative quota after group ratio",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snap := &billingexpr.BillingSnapshot{
+				BillingMode:  "tiered_expr",
+				ExprString:   test.expr,
+				ExprHash:     billingexpr.ExprHashString(test.expr),
+				GroupRatio:   test.groupRatio,
+				QuotaPerUnit: test.quotaPerUnit,
+			}
+
+			result, err := billingexpr.ComputeTieredQuota(snap, test.params)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantError)
+			assert.Equal(t, billingexpr.TieredResult{}, result)
+		})
+	}
+}
+
+func TestComputeTieredQuotaRejectsNaNAtEveryChargeStage(t *testing.T) {
+	tests := []struct {
+		name         string
+		params       billingexpr.TokenParams
+		quotaPerUnit float64
+		groupRatio   float64
+		wantError    string
+	}{
+		{
+			name:         "expression cost",
+			params:       billingexpr.TokenParams{P: math.NaN()},
+			quotaPerUnit: 500_000,
+			groupRatio:   1,
+			wantError:    "NaN cost",
+		},
+		{
+			name:         "quota before group ratio",
+			params:       billingexpr.TokenParams{P: 1},
+			quotaPerUnit: math.NaN(),
+			groupRatio:   1,
+			wantError:    "NaN quota before group ratio",
+		},
+		{
+			name:         "quota after group ratio",
+			params:       billingexpr.TokenParams{P: 1},
+			quotaPerUnit: 1_000_000,
+			groupRatio:   math.NaN(),
+			wantError:    "NaN quota after group ratio",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exprStr := `tier("base", p)`
+			snap := &billingexpr.BillingSnapshot{
+				BillingMode:  "tiered_expr",
+				ExprString:   exprStr,
+				ExprHash:     billingexpr.ExprHashString(exprStr),
+				GroupRatio:   test.groupRatio,
+				QuotaPerUnit: test.quotaPerUnit,
+			}
+
+			result, err := billingexpr.ComputeTieredQuota(snap, test.params)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantError)
+			assert.Equal(t, billingexpr.TieredResult{}, result)
+		})
+	}
+}
+
+func TestComputeTieredQuotaAuditsPositiveInfinityAtEveryChargeStage(t *testing.T) {
+	tests := []struct {
+		name         string
+		params       billingexpr.TokenParams
+		quotaPerUnit float64
+		groupRatio   float64
+	}{
+		{
+			name:         "expression cost",
+			params:       billingexpr.TokenParams{P: math.Inf(1)},
+			quotaPerUnit: 500_000,
+			groupRatio:   1,
+		},
+		{
+			name:         "quota before group ratio",
+			params:       billingexpr.TokenParams{P: 1},
+			quotaPerUnit: math.Inf(1),
+			groupRatio:   1,
+		},
+		{
+			name:         "quota after group ratio",
+			params:       billingexpr.TokenParams{P: 1},
+			quotaPerUnit: 1_000_000,
+			groupRatio:   math.Inf(1),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exprStr := `tier("base", p)`
+			snap := &billingexpr.BillingSnapshot{
+				BillingMode:  "tiered_expr",
+				ExprString:   exprStr,
+				ExprHash:     billingexpr.ExprHashString(exprStr),
+				GroupRatio:   test.groupRatio,
+				QuotaPerUnit: test.quotaPerUnit,
+			}
+
+			result, err := billingexpr.ComputeTieredQuota(snap, test.params)
+
+			require.NoError(t, err)
+			assert.Equal(t, math.MaxInt32, result.ActualQuotaAfterGroup)
+			require.NotNil(t, result.Clamp)
+			assert.Equal(t, common.QuotaClampOverflow, result.Clamp.Kind)
+		})
+	}
+}

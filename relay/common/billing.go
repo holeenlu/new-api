@@ -16,6 +16,11 @@ type BillingSettler interface {
 	// NeedsRefund 返回会话是否存在需要退还的预扣状态（未结算且未退款）。
 	NeedsRefund() bool
 
+	// FundingCommitted 返回资金来源是否已成功提交结算。
+	// 用于 Settle 失败后的判定：资金已提交（仅令牌调整失败）时收费已发生，
+	// 必须保留消费账目；资金未提交时收费未发生，不得记账。
+	FundingCommitted() bool
+
 	// GetPreConsumedQuota 返回实际预扣的额度值（信任用户可能为 0）。
 	GetPreConsumedQuota() int
 

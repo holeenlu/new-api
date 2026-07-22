@@ -36,13 +36,18 @@ func init() {
 // StartSystemMonitor 启动系统监控
 func StartSystemMonitor() {
 	// 在实例首次上报前生成快照，避免启动阶段显示空指标。
-	updateSystemStatus()
+	// 禁用监控时不采样，保持 monitor_enabled 的原有语义。
+	if GetPerformanceMonitorConfig().Enabled {
+		updateSystemStatus()
+	}
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			updateSystemStatus()
+			if GetPerformanceMonitorConfig().Enabled {
+				updateSystemStatus()
+			}
 		}
 	}()
 }

@@ -659,11 +659,11 @@ func TestResponsesWebSocketSessionReleasesLeasePerTurn(t *testing.T) {
 	lease.Release()
 }
 
-// A silent stream whose handshake response headers prove the usage window is
-// exhausted must be classified as a usage limit (429, with a reset time) rather
-// than failed as a generic non-retryable turn — so the credential is cooled and
-// routing can fail over to another account. Mirrors the Claude silent-stream path.
-func TestResponsesWebSocketClassifiesUsageLimitFromHandshakeHeaders(t *testing.T) {
+// Handshake rate-limit headers cannot prove that a response.create frame was not
+// accepted. Once that frame is written, a silent stream must fail without HTTP
+// fallback or credential failover, even when the handshake carried usage-limit
+// metadata that belongs to another provider protocol.
+func TestResponsesWebSocketDoesNotReplaySilentPostWriteFromHandshakeUsageHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalInterval := CodexOAuthMinRequestInterval
 	CodexOAuthMinRequestInterval = 0
@@ -674,7 +674,15 @@ func TestResponsesWebSocketClassifiesUsageLimitFromHandshakeHeaders(t *testing.T
 	service.InitHttpClient()
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var websocketAttempts atomic.Int32
+	var httpFallbackAttempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			httpFallbackAttempts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		websocketAttempts.Add(1)
 		respHeader := http.Header{}
 		respHeader.Set("anthropic-ratelimit-unified-status", "rejected")
 		respHeader.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10))
@@ -711,9 +719,12 @@ func TestResponsesWebSocketClassifiesUsageLimitFromHandshakeHeaders(t *testing.T
 	require.Error(t, err)
 	var apiErr *types.NewAPIError
 	require.ErrorAs(t, err, &apiErr)
-	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiErr.GetErrorCode())
-	require.Equal(t, http.StatusTooManyRequests, apiErr.GetUpstreamStatusCode())
-	require.Greater(t, apiErr.RetryAfter, time.Duration(0))
-	// A usage limit must stay routable (cool + fail over), not a hard skip-retry.
-	require.False(t, types.IsSkipRetryError(apiErr))
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusBadGateway, apiErr.GetUpstreamStatusCode())
+	require.Zero(t, apiErr.RetryAfter)
+	require.True(t, types.IsSkipRetryError(apiErr))
+	written, _ := info.UpstreamAttemptState()
+	require.True(t, written)
+	require.Equal(t, int32(1), websocketAttempts.Load())
+	require.Zero(t, httpFallbackAttempts.Load())
 }

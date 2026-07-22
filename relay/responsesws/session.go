@@ -124,17 +124,18 @@ func (b *responseBody) Close() error {
 		return nil
 	}
 	b.once.Do(func() {
-		if b.session != nil {
-			if b.done == nil {
-				b.session.invalidate(b.conn)
-			} else {
-				select {
-				case <-b.done:
-					// A terminal event already ended the reader; keep the connection reusable.
-				default:
-					b.session.invalidate(b.conn)
-				}
+		streamFinished := false
+		if b.done != nil {
+			select {
+			case <-b.done:
+				streamFinished = true
+			default:
 			}
+		}
+		if !streamFinished && b.session != nil {
+			// An unfinished reader leaves upstream events in flight. Drop its
+			// connection before another turn can start a reader.
+			b.session.invalidate(b.conn)
 		}
 		if b.ReadCloser != nil {
 			b.err = b.ReadCloser.Close()
@@ -186,6 +187,17 @@ func (s *Session) ChannelID() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.channelID
+}
+
+// HasLiveConnection reports whether this downstream session still owns the
+// upstream WebSocket required to resolve connection-local response ids.
+func (s *Session) HasLiveConnection() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn != nil && !s.httpFallback
 }
 
 // Binding returns the credential currently pinned to the session.
@@ -253,6 +265,7 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	if s == nil || c == nil || driver == nil || info == nil || requestBody == nil {
 		return nil, errors.New("responses websocket: invalid request")
 	}
+	c.Set(sessionResponseKey, false)
 	requestLimit := common.MaxRequestBodyBytes()
 	body, err := io.ReadAll(io.LimitReader(requestBody, requestLimit+1))
 	if err != nil {
@@ -268,7 +281,7 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 	httpBody := append([]byte(nil), body...)
 	var payload map[string]any
-	if err := common.Unmarshal(body, &payload); err != nil {
+	if err := common.UnmarshalWithNumber(body, &payload); err != nil {
 		return nil, err
 	}
 	payload["type"] = "response.create"
@@ -286,7 +299,12 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.channelID != 0 && s.channelID != info.ChannelId {
-		return nil, errors.New("responses websocket cannot switch channels within one session")
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("responses websocket cannot switch channels within one session"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusConflict,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	credentialFingerprint := service.SubscriptionOAuthCredentialFingerprint(
 		info.ChannelType,
@@ -304,13 +322,15 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 	model := strings.TrimSpace(info.UpstreamModelName)
 	if s.model != "" && !strings.EqualFold(s.model, model) {
-		return nil, errors.New("responses websocket cannot switch models within one session")
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("responses websocket cannot switch models within one session"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusConflict,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
-	if s.httpFallback {
-		// Already degraded to HTTP for this session; the fallback reserves its own
-		// per-request capacity.
-		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
-	}
+	previousResponseID, _ := payload["previous_response_id"].(string)
+	continuation := strings.TrimSpace(previousResponseID) != ""
 
 	if s.conn != nil && !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
 		// Proactively recycle the connection before the upstream's 60-minute cap
@@ -318,15 +338,19 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		// cannot be transparently replayed on a replacement connection.
 		logger.LogInfo(c, "responses websocket connection reached its lifetime; reconnecting")
 		s.invalidateLocked(s.conn)
-		previousResponseID, _ := payload["previous_response_id"].(string)
-		if strings.TrimSpace(previousResponseID) != "" {
-			return nil, types.NewErrorWithStatusCode(
-				errors.New("responses websocket connection lifetime reached; reconnect and retry with full input context"),
-				types.ErrorCodeWebSocketConnectionLimitReached,
-				http.StatusBadRequest,
-				types.ErrOptionWithSkipRetry(),
-			)
-		}
+	}
+	if continuation && (s.conn == nil || s.httpFallback) {
+		// previous_response_id identifies state owned by the live upstream
+		// WebSocket. It is unsafe to establish a replacement connection or send the
+		// request over HTTP because neither transport can resolve that state, and a
+		// replay could execute the continuation against the wrong conversation.
+		return nil, NewContinuationUnavailableError()
+	}
+	if s.httpFallback {
+		// Already degraded to HTTP for this session; the fallback reserves its own
+		// per-request capacity. Continuations were rejected above because their
+		// previous_response_id is connection-local.
+		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
 	}
 
 	// Reserve capacity for THIS turn only. The lease is released when the turn's
@@ -346,7 +370,9 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
 			}
 			written, responseStarted := info.UpstreamAttemptState()
-			lease.FinishFailedAttempt(written || responseStarted)
+			if lease != nil {
+				lease.FinishFailedAttempt(written || responseStarted)
+			}
 			return nil, err
 		}
 		justConnected = true
@@ -358,7 +384,9 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := s.conn.WriteMessage(websocket.TextMessage, body); err != nil {
 		s.invalidateLocked(s.conn)
-		lease.FinishFailedAttempt(true)
+		if lease != nil {
+			lease.FinishFailedAttempt(true)
+		}
 		return nil, types.NewErrorWithStatusCode(
 			fmt.Errorf("responses websocket write failed after the request may have reached upstream: %w", err),
 			types.ErrorCodeDoRequestFailed,
@@ -393,7 +421,9 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 			s.invalidateLocked(conn)
 			// The request frame was written, so this is a real failed attempt against
 			// the credential.
-			lease.FinishFailedAttempt(true)
+			if lease != nil {
+				lease.FinishFailedAttempt(true)
+			}
 			// Otherwise the response.create frame was already written to this
 			// connection, so the upstream may have received and begun executing it — a
 			// silent probe cannot prove otherwise. Do NOT replay the turn over HTTP,
@@ -416,12 +446,13 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	reader, writer := io.Pipe()
 	streamDone := make(chan struct{})
 	go s.streamAsSSE(c.Request.Context(), conn, writer, firstPayload, streamDone)
-	var responseBody io.ReadCloser = &responseBody{
+	streamBody := &responseBody{
 		ReadCloser: reader,
 		session:    s,
 		conn:       conn,
 		done:       streamDone,
 	}
+	var responseBody io.ReadCloser = streamBody
 	if lease != nil {
 		// Finalize the per-turn lease exactly like the HTTP path: the relay closes
 		// this body when the stream ends (releasing the slot) and marks the turn's
@@ -429,6 +460,7 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		service.BindSubscriptionOAuthResponseLease(c, lease)
 		responseBody = service.NewSubscriptionOAuthResponseBody(responseBody, lease)
 	}
+	c.Set(sessionResponseKey, true)
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header: http.Header{
@@ -509,13 +541,15 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	conn, response, err := dialer.DialContext(c.Request.Context(), webSocketURL, headers)
 	if err != nil {
 		logger.LogError(c, "responses websocket handshake failed: "+err.Error())
-		if response != nil && response.StatusCode > 0 && response.StatusCode != http.StatusUpgradeRequired {
+		if response != nil && response.StatusCode >= http.StatusBadRequest && response.StatusCode != http.StatusUpgradeRequired {
 			// A genuine upstream HTTP status reached us (e.g. 429 or 5xx). Surface it
 			// so the relay applies its normal retry/failover and Retry-After handling
-			// instead of masking a rate limit or outage behind an HTTP fallback. The
-			// caller finalizes this turn's capacity lease (responseStarted is now set,
-			// so it counts as a real attempt against the credential).
-			info.MarkUpstreamResponseStarted()
+			// instead of masking a rate limit or outage behind an HTTP fallback. This
+			// response belongs to the WebSocket handshake, not to response.create: no
+			// application frame has been written, so the application attempt remains
+			// replay-safe and an ordinary API-key channel may fail over. Keep the
+			// explicit failure marker for channel health and subscription-OAuth retry
+			// classification without marking the application response as started.
 			info.MarkUpstreamFailureResponse()
 			if response.Body != nil {
 				return service.RelayErrorHandler(c.Request.Context(), response)
@@ -532,11 +566,13 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		if response != nil && response.Body != nil {
 			response.Body.Close()
 		}
-		// Either the upstream explicitly asked to upgrade elsewhere (426) or the dial
-		// produced no usable HTTP response at all — a malformed/HTTP-2 framed reply,
-		// a TLS error, or a connection-level failure. In every one of these cases the
-		// endpoint does not speak the Responses WebSocket protocol, so serve this turn
-		// and the rest of the connection over HTTP rather than failing the turn hard.
+		// Either the upstream explicitly reported that this upgrade is unsupported
+		// (426), returned a non-error HTTP response instead of 101, or the dial produced
+		// no usable HTTP response at all — a malformed/HTTP-2 framed reply, a TLS error,
+		// or a connection-level failure. In every one of these cases the endpoint does
+		// not speak the Responses WebSocket protocol, so serve this turn and the rest
+		// of the connection over HTTP rather than returning a misleading 2xx/3xx API
+		// error or failing the turn hard.
 		return ErrUpgradeRequired
 	}
 	if response != nil && response.Body != nil {
@@ -609,21 +645,14 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 		return true
 	}
 	if event.Type == "response.done" {
-		var normalized map[string]any
-		if err := common.Unmarshal(payload, &normalized); err != nil {
-			s.invalidate(conn)
-			_ = writer.CloseWithError(err)
-			return true
-		}
-		normalized["type"] = "response.completed"
-		marshaled, err := common.Marshal(normalized)
+		normalized, normalizedType, err := NormalizeResponseDoneEvent(payload)
 		if err != nil {
 			s.invalidate(conn)
 			_ = writer.CloseWithError(err)
 			return true
 		}
-		payload = marshaled
-		event.Type = "response.completed"
+		payload = normalized
+		event.Type = normalizedType
 	}
 	if _, err := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
 		// The downstream reader stopped consuming mid-stream. Invalidate the

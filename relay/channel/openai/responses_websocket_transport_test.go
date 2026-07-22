@@ -1,10 +1,12 @@
 package openai
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -13,6 +15,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -85,6 +88,79 @@ func TestResponsesWebSocketOpenAIAdaptorUsesUpstreamWebSocket(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(body), "event: response.completed")
 	require.Contains(t, string(body), `"total_tokens":3`)
+}
+
+func TestResponsesWebSocketStreamHandlerPreservesConnectionAfterCleanTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var connectionCount atomic.Int32
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		connectionCount.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn := requestCount.Add(1)
+			payload := `{"type":"response.completed","response":{"id":"resp_` +
+				fmt.Sprint(turn) + `","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	session := &responsesws.Session{}
+	defer session.Close()
+	for index, body := range []string{
+		`{"model":"gpt-5","input":"first","stream":true}`,
+		`{"model":"gpt-5","previous_response_id":"resp_1","input":"continue","stream":true}`,
+	} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		responsesws.SetSession(c, session)
+		info := &relaycommon.RelayInfo{
+			IsStream:       true,
+			RelayMode:      relayconstant.RelayModeResponses,
+			RequestURLPath: "/v1/responses",
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:            990005,
+				ChannelType:          constant.ChannelTypeOpenAI,
+				ChannelBaseUrl:       server.URL,
+				ApiKey:               "test-key",
+				UpstreamModelName:    "gpt-5",
+				ChannelSetting:       dto.ChannelSettings{},
+				ChannelOtherSettings: dto.ChannelOtherSettings{ResponsesWebSocketEnabled: true},
+			},
+		}
+
+		respAny, err := (&Adaptor{}).DoRequest(c, info, strings.NewReader(body))
+		require.NoError(t, err)
+		resp, ok := respAny.(*http.Response)
+		require.True(t, ok)
+		usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+		require.Nil(t, apiError)
+		require.Equal(t, 2, usage.TotalTokens)
+		require.Contains(t, recorder.Body.String(), "response.completed")
+		require.True(t, session.HasLiveConnection(), "turn %d invalidated the reusable upstream", index+1)
+	}
+
+	require.Equal(t, int32(1), connectionCount.Load())
+	require.Equal(t, int32(2), requestCount.Load())
 }
 
 // A response.incomplete event (e.g. max output tokens or a content filter) is a
@@ -196,4 +272,56 @@ func TestResponsesWebSocketOpenAIAdaptorSkipsWebSocketWithoutFlag(t *testing.T) 
 	require.NoError(t, resp.Body.Close())
 	// Zero WebSocket upgrades: the plain HTTP handler served the request.
 	require.Zero(t, session.ChannelID())
+}
+
+func TestResponsesWebSocketOpenAIAdaptorHonorsFinalContinuationMarkerBeforeHTTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+
+	var httpCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	session := &responsesws.Session{}
+	defer session.Close()
+	responsesws.SetSession(c, session)
+	responsesws.MarkContinuationRequired(c)
+
+	info := &relaycommon.RelayInfo{
+		IsStream:       true,
+		RelayMode:      relayconstant.RelayModeResponses,
+		RequestURLPath: "/v1/responses",
+		Request: &dto.OpenAIResponsesRequest{
+			Model: "gpt-5",
+		},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:            990004,
+			ChannelType:          constant.ChannelTypeOpenAI,
+			ChannelBaseUrl:       server.URL,
+			ApiKey:               "test-key",
+			UpstreamModelName:    "gpt-5",
+			ChannelSetting:       dto.ChannelSettings{},
+			ChannelOtherSettings: dto.ChannelOtherSettings{ResponsesWebSocketEnabled: false},
+		},
+	}
+
+	response, err := (&Adaptor{}).DoRequest(
+		c,
+		info,
+		strings.NewReader(`{"model":"gpt-5","previous_response_id":"resp_missing","stream":true}`),
+	)
+
+	require.Nil(t, response)
+	require.Error(t, err)
+	var apiError *types.NewAPIError
+	require.ErrorAs(t, err, &apiError)
+	require.Equal(t, types.ErrorCodeWebSocketConnectionLimitReached, apiError.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiError))
+	require.Zero(t, httpCalls.Load())
 }

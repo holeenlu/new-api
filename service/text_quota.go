@@ -502,7 +502,9 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(summary.CompletionTokens))
-	})
+	if sample, ok := perfmetrics.SnapshotRelaySample(relayInfo, true, int64(summary.CompletionTokens)); ok {
+		gopool.Go(func() {
+			perfmetrics.Record(sample)
+		})
+	}
 }

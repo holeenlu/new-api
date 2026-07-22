@@ -24,9 +24,19 @@ func Init() {
 	go flushLoop()
 }
 
-func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens int64) {
+// SnapshotRelaySample copies the request fields needed by the asynchronous
+// metrics writer. RelayInfo is mutable during model mapping and billing, so a
+// goroutine must never retain and read it after the request path continues.
+func SnapshotRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens int64) (Sample, bool) {
 	if info == nil {
-		return
+		return Sample{}, false
+	}
+	// A Responses terminal failure can be committed to the downstream after
+	// authoritative usage has arrived. The relay then settles that usage and
+	// returns through its non-retry path, but the upstream attempt is still a
+	// failure for availability metrics regardless of a caller's success flag.
+	if info.CommittedUpstreamError() != nil {
+		success = false
 	}
 	now := time.Now()
 	hasTtft := info.IsStream && info.HasSendResponse()
@@ -42,7 +52,7 @@ func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens i
 	if generationMs <= 0 {
 		generationMs = latencyMs
 	}
-	Record(Sample{
+	return Sample{
 		Model:        info.OriginModelName,
 		Group:        info.UsingGroup,
 		LatencyMs:    latencyMs,
@@ -51,7 +61,7 @@ func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens i
 		Success:      success,
 		OutputTokens: outputTokens,
 		GenerationMs: generationMs,
-	})
+	}, true
 }
 
 func Record(sample Sample) {

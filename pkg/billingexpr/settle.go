@@ -1,6 +1,11 @@
 package billingexpr
 
-import "github.com/QuantumNous/new-api/common"
+import (
+	"fmt"
+	"math"
+
+	"github.com/QuantumNous/new-api/common"
+)
 
 // quotaConversion converts raw expression output to quota based on the
 // expression version. This is the central dispatch point for future versions
@@ -23,9 +28,31 @@ func ComputeTieredQuotaWithRequest(snap *BillingSnapshot, params TokenParams, re
 	if err != nil {
 		return TieredResult{}, err
 	}
+	if math.IsNaN(cost) {
+		return TieredResult{}, fmt.Errorf("billing expression produced NaN cost")
+	}
+	if cost < 0 {
+		return TieredResult{}, fmt.Errorf("billing expression produced negative cost: %g", cost)
+	}
 
 	quotaBeforeGroup := quotaConversion(cost, snap)
-	afterGroup, clamp := common.QuotaRoundChecked(quotaBeforeGroup * snap.GroupRatio)
+	if math.IsNaN(quotaBeforeGroup) {
+		return TieredResult{}, fmt.Errorf("billing expression produced NaN quota before group ratio")
+	}
+	if quotaBeforeGroup < 0 {
+		return TieredResult{}, fmt.Errorf("billing expression produced negative quota before group ratio: %g", quotaBeforeGroup)
+	}
+	quotaAfterGroup := quotaBeforeGroup * snap.GroupRatio
+	if math.IsNaN(quotaAfterGroup) {
+		return TieredResult{}, fmt.Errorf("billing expression produced NaN quota after group ratio")
+	}
+	if quotaAfterGroup < 0 {
+		return TieredResult{}, fmt.Errorf("billing expression produced negative quota after group ratio: %g", quotaAfterGroup)
+	}
+	afterGroup, clamp := common.QuotaRoundChecked(quotaAfterGroup)
+	if afterGroup < 0 {
+		return TieredResult{}, fmt.Errorf("billing expression produced negative rounded quota: %d", afterGroup)
+	}
 	crossed := trace.MatchedTier != snap.EstimatedTier
 
 	return TieredResult{

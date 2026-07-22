@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/QuantumNous/new-api/types"
@@ -37,4 +38,15 @@ func TestRelayInfoGetFinalRequestRelayFormatFallsBackToRelayFormat(t *testing.T)
 func TestRelayInfoGetFinalRequestRelayFormatNilReceiver(t *testing.T) {
 	var info *RelayInfo
 	require.Equal(t, types.RelayFormat(""), info.GetFinalRequestRelayFormat())
+}
+
+func TestRelayInfoResetUpstreamAttemptClearsCommittedError(t *testing.T) {
+	info := &RelayInfo{}
+	committedError := types.NewError(errors.New("terminal failure"), types.ErrorCodeBadResponse)
+	info.MarkCommittedUpstreamError(committedError)
+	require.Same(t, committedError, info.CommittedUpstreamError())
+
+	info.ResetUpstreamAttemptState()
+
+	require.Nil(t, info.CommittedUpstreamError())
 }

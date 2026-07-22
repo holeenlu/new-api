@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
@@ -214,6 +215,106 @@ func TestCodexResponsesStreamFlushesPreflightEventsInOrder(t *testing.T) {
 	require.Less(t, strings.Index(body, `event: response.in_progress`), strings.Index(body, `event: response.output_text.delta`))
 }
 
+func TestOaiResponsesStreamStopsAtCleanTerminalWhileHTTPUpstreamStaysOpen(t *testing.T) {
+	for _, eventType := range []string{"response.completed", "response.incomplete"} {
+		t.Run(eventType, func(t *testing.T) {
+			c, recorder, resp, info := newCodexResponsesStreamTest(t)
+			reader, writer := io.Pipe()
+			resp.Body = reader
+			result := make(chan *types.NewAPIError, 1)
+			go func() {
+				_, apiError := OaiResponsesStreamHandler(c, info, resp)
+				result <- apiError
+			}()
+
+			_, writeErr := io.WriteString(writer,
+				`data: {"type":"`+eventType+`","response":{"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\n",
+			)
+			require.NoError(t, writeErr)
+
+			select {
+			case apiError := <-result:
+				require.Nil(t, apiError)
+			case <-time.After(time.Second):
+				_ = writer.Close()
+				<-result
+				t.Fatal("Responses handler waited for HTTP upstream EOF after a terminal event")
+			}
+			require.NoError(t, writer.Close())
+			require.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+			require.Contains(t, recorder.Body.String(), eventType)
+		})
+	}
+}
+
+func TestOaiResponsesStreamIgnoresEventsAfterCleanTerminal(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`,
+		`data: {"type":"response.output_text.delta","delta":"must-not-be-forwarded"}`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.Equal(t, 3, usage.TotalTokens)
+	require.Contains(t, recorder.Body.String(), "response.completed")
+	require.NotContains(t, recorder.Body.String(), "must-not-be-forwarded")
+	require.True(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestCodexResponsesStreamRejectsEOFBeforeTerminalDuringPreflight(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeBadResponseBody, apiError.GetErrorCode())
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+	require.Nil(t, info.CommittedUpstreamError())
+	require.False(t, relaycommon.IsResponsesStreamFailureEmitted(c))
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("Content-Type"))
+}
+
+func TestOaiResponsesStreamSynthesizesFailureWhenCommittedStreamEndsWithoutTerminal(t *testing.T) {
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"type":"response.created","response":{"id":"resp_partial"}}` + "\n",
+		)),
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenAI,
+			UpstreamModelName: "gpt-test",
+		},
+		IsStream:    true,
+		DisablePing: true,
+	}
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.NotNil(t, usage)
+	require.NotNil(t, info.CommittedUpstreamError())
+	require.Equal(t, types.ErrorCodeBadResponseBody, info.CommittedUpstreamError().GetErrorCode())
+	require.True(t, relaycommon.IsResponsesStreamFailureEmitted(c))
+	require.Contains(t, recorder.Body.String(), `"id":"resp_partial"`)
+	require.Contains(t, recorder.Body.String(), "event: error")
+	require.Contains(t, recorder.Body.String(), "ended before a terminal event")
+}
+
 func TestCodexResponsesStreamDoesNotRetryCapacityAfterOutput(t *testing.T) {
 	c, recorder, resp, info := newCodexResponsesStreamTest(t,
 		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"call_1","name":"lookup"}}`,
@@ -252,8 +353,11 @@ func TestOaiResponsesHandlerDerivesStatusFromWrapped200Error(t *testing.T) {
 	body := `{"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded","message":"Rate limit reached"}}`
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{"17"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
 	}
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
 
@@ -262,6 +366,72 @@ func TestOaiResponsesHandlerDerivesStatusFromWrapped200Error(t *testing.T) {
 	require.Nil(t, usage)
 	require.NotNil(t, apiError)
 	require.Equal(t, http.StatusTooManyRequests, apiError.StatusCode)
+	require.Equal(t, http.StatusTooManyRequests, apiError.UpstreamStatusCode)
+	require.Equal(t, 17*time.Second, apiError.RetryAfter)
+	require.True(t, info.HasUpstreamFailureResponse())
+}
+
+func TestOaiResponsesHandlerNormalizesAuthoritativeUsageDetails(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := `{"id":"resp_1","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2,"text_tokens":4,"image_tokens":1,"audio_tokens":1},"output_tokens_details":{"reasoning_tokens":5,"text_tokens":2}}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.NotNil(t, usage)
+	require.Equal(t, 11, usage.PromptTokens)
+	require.Equal(t, 7, usage.CompletionTokens)
+	require.Equal(t, 18, usage.TotalTokens)
+	require.Equal(t, dto.BillingUsageSourceOAIResponses, usage.UsageSource)
+	require.Equal(t, dto.BillingUsageSemanticOpenAI, usage.UsageSemantic)
+	require.Equal(t, 3, usage.PromptTokensDetails.CachedTokens)
+	require.Equal(t, 2, usage.PromptTokensDetails.CacheWriteTokens)
+	require.Equal(t, 4, usage.PromptTokensDetails.TextTokens)
+	require.Equal(t, 1, usage.PromptTokensDetails.ImageTokens)
+	require.Equal(t, 1, usage.PromptTokensDetails.AudioTokens)
+	require.Equal(t, 5, usage.CompletionTokenDetails.ReasoningTokens)
+	require.Equal(t, 2, usage.CompletionTokenDetails.TextTokens)
+	require.NotNil(t, usage.BillingUsage)
+	require.Equal(t, dto.BillingUsageSourceOAIResponses, usage.BillingUsage.Source)
+	require.Equal(t, dto.BillingUsageSemanticOpenAI, usage.BillingUsage.Semantic)
+	require.NotNil(t, usage.BillingUsage.OpenAIUsage)
+	require.NotNil(t, usage.BillingUsage.OpenAIUsage.InputTokensDetails)
+	require.NotNil(t, usage.BillingUsage.OpenAIUsage.OutputTokensDetails)
+	require.Equal(t, 2, usage.BillingUsage.OpenAIUsage.InputTokensDetails.CacheWriteTokens)
+	require.Equal(t, 5, usage.BillingUsage.OpenAIUsage.OutputTokensDetails.ReasoningTokens)
+	require.JSONEq(t, body, recorder.Body.String())
+}
+
+func TestOaiResponsesCompactionHandlerPreservesWrappedErrorMetadata(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	body := `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"overloaded"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{"9"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesCompactionHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusServiceUnavailable, apiError.StatusCode)
+	require.Equal(t, http.StatusServiceUnavailable, apiError.UpstreamStatusCode)
+	require.Equal(t, 9*time.Second, apiError.RetryAfter)
+	require.True(t, info.HasUpstreamFailureResponse())
 }
 
 // ③ A preflight-stage terminal failure of type response.error (not only
@@ -297,9 +467,13 @@ func TestOaiResponsesStreamNonSubscriptionMarksUpstreamFailure(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+			"Retry-After":  []string{"7"},
+		},
 		Body: io.NopCloser(strings.NewReader(
 			`data: {"type":"response.failed","response":{"error":{"type":"server_error","message":"boom"}}}` + "\n" +
+				`data: {"type":"response.output_text.delta","delta":"must-not-be-forwarded"}` + "\n" +
 				`data: [DONE]` + "\n")),
 	}
 	info := &relaycommon.RelayInfo{
@@ -313,5 +487,172 @@ func TestOaiResponsesStreamNonSubscriptionMarksUpstreamFailure(t *testing.T) {
 	require.Nil(t, apiError) // already committed downstream: forwarded, not retried
 	require.NotNil(t, usage)
 	require.True(t, info.HasUpstreamFailureResponse())
+	require.True(t, info.StreamStatus.HasErrors())
+	require.NotNil(t, info.CommittedUpstreamError())
+	require.Equal(t, 7*time.Second, info.CommittedUpstreamError().RetryAfter)
 	require.Contains(t, recorder.Body.String(), "response.failed")
+	require.NotContains(t, recorder.Body.String(), "must-not-be-forwarded")
+}
+
+func TestOaiResponsesStreamStopsOnMalformedProtocolEvent(t *testing.T) {
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.done\",\"response\":" + "\n" +
+				`data: {"type":"response.output_text.delta","delta":"must-not-be-forwarded"}` + "\n",
+		)),
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenAI,
+			UpstreamModelName: "gpt-test",
+		},
+		IsStream:    true,
+		DisablePing: true,
+	}
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.NotNil(t, usage)
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.NotNil(t, info.CommittedUpstreamError())
+	require.Equal(t, types.ErrorCodeBadResponseBody, info.CommittedUpstreamError().GetErrorCode())
+	require.True(t, info.StreamStatus.HasErrors())
+	require.True(t, relaycommon.IsResponsesStreamFailureEmitted(c))
+	require.Contains(t, recorder.Body.String(), "event: error")
+	require.Contains(t, recorder.Body.String(), string(types.ErrorCodeBadResponseBody))
+	require.NotContains(t, recorder.Body.String(), "must-not-be-forwarded")
+}
+
+func TestOaiResponsesStreamUsesAuthoritativeUsageAndImageFromEveryTerminalEvent(t *testing.T) {
+	for _, eventType := range []string{
+		"response.completed",
+		"response.incomplete",
+		"response.done",
+		"response.failed",
+		"response.error",
+		"error",
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			previousStreamingTimeout := constant.StreamingTimeout
+			constant.StreamingTimeout = 30
+			t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			responseStatus := ""
+			if eventType == "response.done" {
+				responseStatus = `"status":"completed",`
+			}
+			body := strings.Join([]string{
+				`data: {"type":"response.output_text.delta","delta":"must not become estimated completion usage"}`,
+				`data: {"type":"` + eventType + `","response":{` + responseStatus + `"usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2,"text_tokens":1,"image_tokens":1,"audio_tokens":1},"output_tokens_details":{"reasoning_tokens":0,"text_tokens":0}},"output":[{"type":"image_generation_call","quality":"high","size":"1024x1024"}]}}`,
+				`data: [DONE]`,
+			}, "\n") + "\n"
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+			info := &relaycommon.RelayInfo{
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenAI,
+					UpstreamModelName: "gpt-test",
+				},
+				IsStream:    true,
+				DisablePing: true,
+			}
+
+			usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+			require.Nil(t, apiError)
+			require.Equal(t, 7, usage.PromptTokens)
+			require.Zero(t, usage.CompletionTokens)
+			require.Equal(t, 7, usage.TotalTokens)
+			require.Equal(t, 3, usage.PromptTokensDetails.CachedTokens)
+			require.Equal(t, 2, usage.PromptTokensDetails.CacheWriteTokens)
+			require.Equal(t, 1, usage.PromptTokensDetails.TextTokens)
+			require.Equal(t, 1, usage.PromptTokensDetails.ImageTokens)
+			require.Equal(t, 1, usage.PromptTokensDetails.AudioTokens)
+			require.NotNil(t, usage.OutputTokensDetails)
+			require.NotNil(t, usage.BillingUsage)
+			require.Equal(t, dto.BillingUsageSourceOAIResponses, usage.BillingUsage.Source)
+			require.NotNil(t, usage.BillingUsage.OpenAIUsage)
+			require.NotNil(t, usage.BillingUsage.OpenAIUsage.InputTokensDetails)
+			require.NotNil(t, usage.BillingUsage.OpenAIUsage.OutputTokensDetails)
+			require.True(t, c.GetBool("image_generation_call"))
+			require.Equal(t, "high", c.GetString("image_generation_call_quality"))
+			require.Equal(t, "1024x1024", c.GetString("image_generation_call_size"))
+		})
+	}
+}
+
+func TestCodexResponsesStreamNormalizesFailedResponseDoneDuringPreflight(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.done","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","code":"server_error","message":"retry elsewhere"}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusInternalServerError, apiError.GetUpstreamStatusCode())
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.Empty(t, recorder.Body.String())
+	require.False(t, recorder.Flushed)
+	failureEvent, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c)
+	require.True(t, exists)
+	require.Contains(t, failureEvent, `"type":"response.failed"`)
+	require.NotContains(t, failureEvent, `"type":"response.done"`)
+}
+
+func TestOaiResponsesStreamNormalizesFailedResponseDoneBeforeAccounting(t *testing.T) {
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"do not estimate this"}`,
+		`data: {"type":"response.done","response":{"status":"failed","error":{"type":"server_error","message":"boom"},"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}`,
+		`data: [DONE]`,
+	}, "\n") + "\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenAI,
+			UpstreamModelName: "gpt-test",
+		},
+		IsStream:    true,
+		DisablePing: true,
+	}
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.Equal(t, 5, usage.PromptTokens)
+	require.Zero(t, usage.CompletionTokens)
+	require.Equal(t, 5, usage.TotalTokens)
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.True(t, info.StreamStatus.HasErrors())
+	require.Contains(t, recorder.Body.String(), `"type":"response.failed"`)
+	require.NotContains(t, recorder.Body.String(), `"type":"response.done"`)
 }
