@@ -25,6 +25,7 @@ import (
 type sessionTestDriver struct {
 	upstreamURL   string
 	acquire       func(*gin.Context, *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error)
+	fallbackBody  chan []byte
 	dialCalls     atomic.Int32
 	fallbackCalls atomic.Int32
 }
@@ -44,10 +45,13 @@ func (d *sessionTestDriver) AcquireCapacity(c *gin.Context, info *relaycommon.Re
 func (d *sessionTestDriver) DoHTTPFallback(
 	_ *gin.Context,
 	_ *relaycommon.RelayInfo,
-	_ []byte,
+	body []byte,
 	_ *service.SubscriptionOAuthLease,
 ) (*http.Response, error) {
 	d.fallbackCalls.Add(1)
+	if d.fallbackBody != nil {
+		d.fallbackBody <- append([]byte(nil), body...)
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body: io.NopCloser(strings.NewReader(
@@ -184,6 +188,29 @@ func TestDoRequestOmitsHTTPOnlyFieldsFromWebSocketEvent(t *testing.T) {
 		4,
 		"credential-a",
 	), binding.Fingerprint)
+}
+
+func TestDoRequestPreservesTransportFieldsForHTTPFallback(t *testing.T) {
+	fallbackBody := make(chan []byte, 1)
+	driver := &sessionTestDriver{fallbackBody: fallbackBody}
+	session := &Session{httpFallback: true}
+	response, err := session.DoRequest(
+		newSessionTestContext(),
+		driver,
+		newSessionTestRelayInfo(106, 0, "credential-a"),
+		strings.NewReader(`{"model":"gpt-test","stream":true,"stream_options":{"include_usage":true},"background":false}`),
+	)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+
+	var request map[string]any
+	require.NoError(t, common.Unmarshal(<-fallbackBody, &request))
+	assert.Equal(t, true, request["stream"])
+	assert.Equal(t, false, request["background"])
+	assert.Contains(t, request, "stream_options")
+	assert.NotContains(t, request, "type")
+	assert.Zero(t, driver.dialCalls.Load())
+	assert.Equal(t, int32(1), driver.fallbackCalls.Load())
 }
 
 func TestDoRequestRejectsCredentialSwitchOnPersistentConnection(t *testing.T) {

@@ -296,8 +296,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if !shouldContinueSubscriptionOAuthRetry(c, relayInfo, retryParam, newAPIError) {
 				if relayInfo.RelayMode == relayconstant.RelayModeResponses && !c.Writer.Written() {
 					if data, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c); exists {
+						eventType := "response.failed"
+						var streamResponse dto.ResponsesStreamResponse
+						if err := common.UnmarshalJsonStr(data, &streamResponse); err == nil && streamResponse.Type != "" {
+							eventType = streamResponse.Type
+						}
 						helper.SetEventStreamHeaders(c)
-						if helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.failed"}, data) == nil {
+						if helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, data) == nil {
 							relaycommon.MarkResponsesStreamFailureEmitted(c)
 						}
 					}

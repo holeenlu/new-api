@@ -70,9 +70,43 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		return types.NewError(fmt.Errorf("failed to copy request to GeneralOpenAIRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
+	originModelName := info.OriginModelName
+	originPriceData := info.PriceData
+	originTieredBillingSnapshot := info.TieredBillingSnapshot
+	originBillingRequestInput := info.BillingRequestInput
+	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+		defer func() {
+			info.OriginModelName = originModelName
+			info.PriceData = originPriceData
+			info.TieredBillingSnapshot = originTieredBillingSnapshot
+			info.BillingRequestInput = originBillingRequestInput
+		}()
+	}
+
 	err = helper.ModelMappedHelper(c, info, request)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
+	}
+	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+		// Compact pricing follows the mapped upstream model. Freeze it before the
+		// request is sent so a missing rule cannot turn an already-written response
+		// into an unpriced fallback, and so settlement uses the same tiered snapshot
+		// that was validated here.
+		info.TieredBillingSnapshot = nil
+		info.BillingRequestInput = nil
+		compactPriceData, err := helper.ModelPriceHelper(c, info, info.GetEstimatePromptTokens(), &types.TokenCountMeta{})
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithStatusCode(http.StatusBadRequest))
+		}
+		if !compactPriceData.FreeModel {
+			if info.Billing == nil {
+				if apiError := service.PreConsumeBilling(c, compactPriceData.QuotaToPreConsume, info); apiError != nil {
+					return apiError
+				}
+			} else if err := info.Billing.Reserve(compactPriceData.QuotaToPreConsume); err != nil {
+				return types.NewError(err, types.ErrorCodePreConsumeTokenQuotaFailed, types.ErrOptionWithSkipRetry())
+			}
+		}
 	}
 
 	adaptor := GetAdaptor(info.ApiType)
@@ -168,24 +202,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 	usageDto := usage.(*dto.Usage)
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
-		originModelName := info.OriginModelName
-		originPriceData := info.PriceData
-
-		if _, err := helper.ModelPriceHelper(c, info, info.GetEstimatePromptTokens(), &types.TokenCountMeta{}); err != nil {
-			// The upstream already produced a billable response, so a compact-specific
-			// pricing failure must not drop the charge. Fall back to the request's
-			// original price data (set by the main relay flow) and still bill the
-			// consumed usage instead of returning an error after the body was sent.
-			info.OriginModelName = originModelName
-			info.PriceData = originPriceData
-			logger.LogError(c, "compact price helper failed; billing with original price data: "+err.Error())
-			service.PostTextConsumeQuota(c, info, usageDto, nil)
-			return nil
-		}
 		service.PostTextConsumeQuota(c, info, usageDto, nil)
-
-		info.OriginModelName = originModelName
-		info.PriceData = originPriceData
 		return nil
 	}
 
