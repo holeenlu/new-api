@@ -16,6 +16,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRelayErrorHandlerSurfacesRateLimitHeadersOn429(t *testing.T) {
+	header := http.Header{
+		"Content-Type":                       []string{"application/json"},
+		"Anthropic-Ratelimit-Unified-Status": []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-Reset":  []string{fmt.Sprintf("%d", time.Now().Add(3*time.Hour).Unix())},
+		"Retry-After":                        []string{"5"},
+	}
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`)),
+	}
+
+	err := RelayErrorHandler(context.Background(), response)
+	require.NotNil(t, err)
+	require.Contains(t, err.Error(), "ratelimit_headers:")
+	require.Contains(t, err.Error(), "anthropic-ratelimit-unified-status=rejected")
+	require.Contains(t, err.Error(), "retry-after=5")
+	// The unified reset (rejected window, hours out) is the authoritative cooldown,
+	// taking precedence over the short Retry-After on the same response.
+	require.InDelta(t, (3 * time.Hour).Seconds(), err.RetryAfter.Seconds(), 5)
+}
+
+func TestRelayErrorHandlerOmitsRateLimitHeadersOnNon429(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{"5"},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"api_error","message":"boom"}}`)),
+	}
+
+	err := RelayErrorHandler(context.Background(), response)
+	require.NotNil(t, err)
+	require.NotContains(t, err.Error(), "ratelimit_headers:")
+}
+
 func TestRelayErrorHandlerPreservesRetryAfter(t *testing.T) {
 	response := &http.Response{
 		StatusCode: http.StatusTooManyRequests,
@@ -117,6 +155,35 @@ func TestParseUpstreamRetryDelayUsesUnifiedUsageResetHeader(t *testing.T) {
 	allowed.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(4*time.Hour).Unix()))
 	allowed.Set("Retry-After", "30")
 	require.Equal(t, 30*time.Second, ParseUpstreamRetryDelay(allowed, body, now))
+}
+
+func TestSubscriptionOAuthUsageLimitFromResponseHeaders(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+
+	rejected := http.Header{}
+	rejected.Set("anthropic-ratelimit-unified-status", "rejected")
+	rejected.Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", now.Add(4*time.Hour).Unix()))
+	apiErr := SubscriptionOAuthUsageLimitFromResponseHeaders(rejected, now)
+	require.NotNil(t, apiErr)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusTooManyRequests, apiErr.GetUpstreamStatusCode())
+	require.Equal(t, 4*time.Hour, apiErr.RetryAfter)
+
+	// Exhausted per-window status but no usable reset timestamp still classifies as
+	// a usage limit (reset zero → downstream one-hour fallback), never a nil miss.
+	windowNoReset := http.Header{}
+	windowNoReset.Set("anthropic-ratelimit-unified-7d-status", "exceeded")
+	apiErr = SubscriptionOAuthUsageLimitFromResponseHeaders(windowNoReset, now)
+	require.NotNil(t, apiErr)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiErr.GetErrorCode())
+	require.Zero(t, apiErr.RetryAfter)
+
+	// A healthy response must not be misread as exhausted.
+	allowed := http.Header{}
+	allowed.Set("anthropic-ratelimit-unified-status", "allowed")
+	allowed.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+	require.Nil(t, SubscriptionOAuthUsageLimitFromResponseHeaders(allowed, now))
+	require.Nil(t, SubscriptionOAuthUsageLimitFromResponseHeaders(nil, now))
 }
 
 func TestRelayErrorHandlerPreservesUsageResetFromBody(t *testing.T) {

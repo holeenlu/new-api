@@ -119,6 +119,31 @@ func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncat
 	} else {
 		parts = append(parts, fmt.Sprintf("response_bytes: %d", responseBytes))
 	}
+	// On a 429, surface the upstream rate-limit reset metadata so an operator can
+	// tell a plan/usage-window exhaustion (unified-status rejected, reset hours
+	// out) from a short per-minute throughput limit (unified-status allowed,
+	// input-tokens reset seconds out) without reproducing the request. Only
+	// present headers are included, so non-Anthropic upstreams add at most
+	// retry-after.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var rateLimitParts []string
+		for _, headerName := range []string{
+			"retry-after",
+			"anthropic-ratelimit-unified-status",
+			"anthropic-ratelimit-unified-reset",
+			"anthropic-ratelimit-unified-5h-status",
+			"anthropic-ratelimit-unified-7d-status",
+			"anthropic-ratelimit-input-tokens-reset",
+			"anthropic-ratelimit-tokens-reset",
+		} {
+			if value := sanitizeUpstreamErrorMessage(resp.Header.Get(headerName)); value != "" {
+				rateLimitParts = append(rateLimitParts, headerName+"="+value)
+			}
+		}
+		if len(rateLimitParts) > 0 {
+			parts = append(parts, "ratelimit_headers: "+strings.Join(rateLimitParts, "; "))
+		}
+	}
 	for _, headerName := range []string{common.UpstreamRequestIdKey, "x-request-id", "request-id", "x-amzn-requestid"} {
 		if requestID := sanitizeUpstreamErrorMessage(resp.Header.Get(headerName)); requestID != "" {
 			parts = append(parts, "upstream_request_id: "+requestID)
@@ -232,6 +257,30 @@ func unifiedRateLimitExhausted(headers http.Header) bool {
 		}
 	}
 	return false
+}
+
+// SubscriptionOAuthUsageLimitFromResponseHeaders classifies a usage-window
+// exhaustion from a response's Anthropic rate-limit headers. A subscription
+// account can accept the connection and return HTTP 200 with an empty SSE
+// stream while its anthropic-ratelimit-unified-* headers already mark the
+// window rejected; detecting it from the headers lets the relay fail over and
+// return a usage-limit response immediately instead of idling until the
+// streaming timeout. Returns nil when the headers do not prove exhaustion. The
+// resulting error's code carries usage_limit semantics, so ApplyChannelErrorPolicy
+// keeps it classified as upstream_usage_limit even when no reset timestamp is
+// present (the cooldown then uses the one-hour fallback).
+func SubscriptionOAuthUsageLimitFromResponseHeaders(headers http.Header, now time.Time) *types.NewAPIError {
+	if headers == nil || !unifiedRateLimitExhausted(headers) {
+		return nil
+	}
+	apiErr := types.NewErrorWithStatusCode(
+		errors.New("subscription OAuth usage window is exhausted"),
+		types.ErrorCodeUpstreamUsageLimit,
+		http.StatusTooManyRequests,
+	)
+	apiErr.UpstreamStatusCode = http.StatusTooManyRequests
+	apiErr.RetryAfter = parseUnifiedUsageReset(headers, now)
+	return apiErr
 }
 
 func findUpstreamResetDelay(value any, now time.Time, absolute bool, depth int) time.Duration {

@@ -123,6 +123,19 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
   type and code fields. Unknown terminal failures become `502`, not a fabricated
   `429`; overload remains `503`, authorization remains `401/403`, and explicit
   rate/usage/model-capacity signals remain `429`.
+- A usage-exhausted subscription account can answer the Claude Code HTTP SSE
+  request with `200` and then emit no event at all, which the generic
+  streaming-idle timeout would only end after the full `STREAMING_TIMEOUT`
+  (minutes). Subscription-OAuth Claude streams therefore bound time-to-first
+  event (`CLAUDE_CODE_OAUTH_STREAM_FIRST_EVENT_TIMEOUT_MS`, default 30s, clamped
+  5s–120s): if no upstream event arrives within it and nothing has been written
+  downstream, the attempt fails over. When the silent stream's
+  `anthropic-ratelimit-unified-*` headers prove the window is exhausted, the
+  failover error is classified `upstream_usage_limit` with the parsed reset (so
+  the credential is cooled and the client learns the reset); otherwise it is a
+  retryable `502`. Once the first event arrives the normal idle timeout takes
+  over, so a legitimately slow first token is unaffected. This mirrors the
+  Responses SSE/WebSocket first-event preflight.
 - Capacity cycling is reserved for active process-local concurrency saturation.
   A credential already in rate-limit or usage-window cooldown is excluded
   immediately and cannot enter a capacity replay cycle. Model-capacity exclusion
@@ -133,6 +146,14 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
 - Anthropic responses retain a protocol-compatible `error.type` and expose the
   stable gateway classification in `error.code`, allowing clients and the UI to
   localize behavior without parsing provider prose.
+- On a `429`, `RelayErrorHandler` appends the upstream rate-limit reset headers
+  (`retry-after`, `anthropic-ratelimit-unified-status` / `-unified-reset` /
+  `-unified-5h-status` / `-unified-7d-status`, `-input-tokens-reset`,
+  `-tokens-reset`, when present) to the error summary as `ratelimit_headers: …`.
+  This lets an operator distinguish a plan/usage-window exhaustion (unified
+  status `rejected`, reset hours-to-days out) from a short per-minute throughput
+  limit (unified status `allowed`, input-tokens reset seconds out) from the logs
+  or the client error alone, without reproducing the request.
 - `CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED=false` is an operational pause switch
   for Claude Code's process-local concurrency, minimum request interval and
   cooldown gate. It does not disable upstream error classification, replay

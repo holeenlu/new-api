@@ -36,6 +36,19 @@ var (
 	ClaudeCodeOAuthLocalLimitsEnabled = true
 	ClaudeCodeOAuthMaxConcurrency     = 10
 	ClaudeCodeOAuthMinRequestInterval = 750 * time.Millisecond
+	// ClaudeCodeOAuthStreamFirstEventTimeout bounds how long a subscription-OAuth
+	// stream may stay silent before its first upstream event. A usage-exhausted
+	// account can accept the connection and return 200 with an empty SSE stream;
+	// without a first-event (TTFB) bound the relay would idle until the full
+	// streaming timeout instead of failing over. Once the first event arrives the
+	// normal idle-streaming timeout takes over, so a legitimately slow first token
+	// is unaffected beyond this bound.
+	ClaudeCodeOAuthStreamFirstEventTimeout = 30 * time.Second
+)
+
+const (
+	claudeCodeOAuthStreamFirstEventTimeoutMinMs = 5000
+	claudeCodeOAuthStreamFirstEventTimeoutMaxMs = 120000
 )
 
 func InitOAuthRuntimeSettings() {
@@ -44,6 +57,13 @@ func InitOAuthRuntimeSettings() {
 		rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10),
 		time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750))*time.Millisecond,
 	)
+	firstEventMs := rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_STREAM_FIRST_EVENT_TIMEOUT_MS", 30000)
+	if firstEventMs < claudeCodeOAuthStreamFirstEventTimeoutMinMs {
+		firstEventMs = claudeCodeOAuthStreamFirstEventTimeoutMinMs
+	} else if firstEventMs > claudeCodeOAuthStreamFirstEventTimeoutMaxMs {
+		firstEventMs = claudeCodeOAuthStreamFirstEventTimeoutMaxMs
+	}
+	ClaudeCodeOAuthStreamFirstEventTimeout = time.Duration(firstEventMs) * time.Millisecond
 }
 
 func acquireClaudeCodeOAuthCapacity(c *gin.Context, info *relaycommon.RelayInfo) (*service.SubscriptionOAuthLease, error) {

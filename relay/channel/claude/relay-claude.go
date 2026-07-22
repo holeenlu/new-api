@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -173,15 +175,58 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		ResponseText: strings.Builder{},
 		Usage:        &dto.Usage{},
 	}
+
+	subscriptionOAuth := relaycommon.IsSubscriptionOAuthChannel(info.ChannelType)
+
 	var err *types.NewAPIError
-	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+	var firstEventSeen atomic.Bool
+	handleData := func(data string, sr *helper.StreamResult) {
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
 			sr.Stop(err)
+			return
 		}
-	})
+		firstEventSeen.Store(true)
+	}
+
+	if subscriptionOAuth {
+		// Bound time-to-first-event so a usage-exhausted account that accepts the
+		// connection and emits nothing fails over quickly instead of idling for the
+		// full streaming timeout. Once the first event arrives the normal idle
+		// timeout takes over, so a legitimately slow first token is unaffected.
+		helper.StreamScannerHandlerWithPreflight(
+			c,
+			resp,
+			info,
+			ClaudeCodeOAuthStreamFirstEventTimeout,
+			firstEventSeen.Load,
+			handleData,
+		)
+	} else {
+		helper.StreamScannerHandler(c, resp, info, handleData)
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	// The stream produced no event within the first-event bound: treat the attempt
+	// as a silent upstream failure (e.g. a usage-exhausted account's empty 200
+	// stream) rather than a successful empty stream. Nothing was written downstream
+	// (preflight gates writes until the first event), so failover is safe. Prefer a
+	// usage-limit classification when the response's rate-limit headers prove the
+	// window is exhausted (cooling the credential and returning a usage-limit
+	// response); otherwise return a generic retryable error so routing fails over.
+	if subscriptionOAuth && !firstEventSeen.Load() &&
+		info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonTimeout {
+		helper.ClearEventStreamHeaders(c)
+		if usageErr := service.SubscriptionOAuthUsageLimitFromResponseHeaders(resp.Header, time.Now()); usageErr != nil {
+			return nil, usageErr
+		}
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("subscription OAuth stream produced no output within %s", ClaudeCodeOAuthStreamFirstEventTimeout),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusBadGateway,
+		)
 	}
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
