@@ -333,3 +333,22 @@ const (
 	MsgCustomOAuthBindingNotFound   = "custom_oauth.binding_not_found"
 	MsgCustomOAuthProviderIdInvalid = "custom_oauth.provider_id_field_invalid"
 )
+
+// Relay error messages surfaced to API clients. These localize the stable
+// gateway error codes into a concise, user-facing summary (the verbose upstream
+// diagnostic is kept in the backend logs). The *_no_reset / *_no_retry variants
+// are used when no reset time or retry delay is available.
+const (
+	MsgRelayErrUsageLimit              = "relay_error.upstream_usage_limit"
+	MsgRelayErrUsageLimitNoReset       = "relay_error.upstream_usage_limit_no_reset"
+	MsgRelayErrRateLimited             = "relay_error.upstream_rate_limited"
+	MsgRelayErrRateLimitedNoRetry      = "relay_error.upstream_rate_limited_no_retry"
+	MsgRelayErrQuotaExhausted          = "relay_error.upstream_quota_exhausted"
+	MsgRelayErrAccountDisabled         = "relay_error.upstream_account_disabled"
+	MsgRelayErrOAuthUnauthorized       = "relay_error.oauth_unauthorized"
+	MsgRelayErrOAuthForbidden          = "relay_error.oauth_forbidden"
+	MsgRelayErrModelAtCapacity         = "relay_error.model_at_capacity"
+	MsgRelayErrModelNotSupported       = "relay_error.model_not_supported"
+	MsgRelayErrConcurrencyLimit        = "relay_error.concurrency_limit"
+	MsgRelayErrConcurrencyLimitNoRetry = "relay_error.concurrency_limit_no_retry"
+)

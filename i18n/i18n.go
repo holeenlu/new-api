@@ -2,6 +2,7 @@ package i18n
 
 import (
 	"embed"
+	"os"
 	"strings"
 	"sync"
 
@@ -16,11 +17,18 @@ import (
 )
 
 const (
-	LangZhCN    = "zh-CN"
-	LangZhTW    = "zh-TW"
-	LangEn      = "en"
-	DefaultLang = LangEn // Fallback to English if language not supported
+	LangZhCN = "zh-CN"
+	LangZhTW = "zh-TW"
+	LangEn   = "en"
 )
+
+// DefaultLang is the fallback language used when a request specifies no
+// supported language (no user setting and no matching Accept-Language header).
+// It defaults to English and can be overridden by the DEFAULT_LANGUAGE
+// environment variable so a deployment can localize responses to clients (such
+// as CLIs / SDKs) that do not send Accept-Language. Accepts "en", "zh", "zh-CN",
+// or "zh-TW".
+var DefaultLang = LangEn
 
 //go:embed locales/*.yaml
 var localeFS embed.FS
@@ -36,6 +44,13 @@ var (
 func Init() error {
 	var initErr error
 	initOnce.Do(func() {
+		// Allow a deployment to set the fallback language for clients that send no
+		// (supported) Accept-Language, such as CLIs and SDKs. Explicit user
+		// settings and Accept-Language still take precedence.
+		if lang, ok := defaultLangFromEnv(os.Getenv("DEFAULT_LANGUAGE")); ok {
+			DefaultLang = lang
+		}
+
 		bundle = i18n.NewBundle(language.Chinese)
 		bundle.RegisterUnmarshalFunc("yaml", yaml.Unmarshal)
 
@@ -211,6 +226,25 @@ func normalizeLang(lang string) string {
 		return LangEn
 	default:
 		return DefaultLang
+	}
+}
+
+// defaultLangFromEnv resolves an explicit DEFAULT_LANGUAGE value to a supported
+// backend language. Unlike normalizeLang it returns ok=false for an empty or
+// unsupported value (rather than collapsing to the current default), so a
+// misconfigured value leaves the built-in default untouched.
+func defaultLangFromEnv(raw string) (string, bool) {
+	switch lang := strings.ToLower(strings.TrimSpace(raw)); {
+	case lang == "":
+		return "", false
+	case strings.HasPrefix(lang, "zh-tw"), strings.HasPrefix(lang, "zh-hant"):
+		return LangZhTW, true
+	case strings.HasPrefix(lang, "zh"):
+		return LangZhCN, true
+	case strings.HasPrefix(lang, "en"):
+		return LangEn, true
+	default:
+		return "", false
 	}
 }
 

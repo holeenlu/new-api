@@ -154,6 +154,16 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
   status `rejected`, reset hours-to-days out) from a short per-minute throughput
   limit (unified status `allowed`, input-tokens reset seconds out) from the logs
   or the client error alone, without reproducing the request.
+- The verbose upstream diagnostic stays in the logs, but the client-facing
+  `error.message` for a stable gateway code is replaced with a concise, localized
+  summary (`service.LocalizedRelayErrorMessage`, resolved through the shared
+  go-i18n bundle in `i18n/locales/{en,zh-CN,zh-TW}.yaml`). A usage-limit message
+  includes the parsed reset time; codes without a template keep their original
+  message. The message language follows the existing i18n resolution (user
+  setting → `Accept-Language` → default), and the default is configurable via
+  `DEFAULT_LANGUAGE` (`en` / `zh` / `zh-CN` / `zh-TW`) so a deployment can
+  localize responses for clients such as CLIs/SDKs that send no `Accept-Language`;
+  an explicit `Accept-Language` still wins. A restart is required after changing it.
 - `CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED=false` is an operational pause switch
   for Claude Code's process-local concurrency, minimum request interval and
   cooldown gate. It does not disable upstream error classification, replay

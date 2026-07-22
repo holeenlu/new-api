@@ -105,7 +105,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if relaycommon.IsResponsesStreamFailureEmitted(c) {
 				return
 			}
-			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			// Surface a concise, localized message to the client for stable gateway
+			// error codes; the verbose upstream diagnostic stays in the log above.
+			clientMessage := newAPIError.Error()
+			if localized, ok := service.LocalizedRelayErrorMessage(c, newAPIError); ok {
+				clientMessage = localized
+			}
+			newAPIError.SetMessage(common.MessageWithRequestId(clientMessage, requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
