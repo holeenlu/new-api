@@ -351,4 +351,5 @@ const (
 	MsgRelayErrModelNotSupported       = "relay_error.model_not_supported"
 	MsgRelayErrConcurrencyLimit        = "relay_error.concurrency_limit"
 	MsgRelayErrConcurrencyLimitNoRetry = "relay_error.concurrency_limit_no_retry"
+	MsgRelayErrUpstreamRequestFailed   = "relay_error.upstream_request_failed"
 )

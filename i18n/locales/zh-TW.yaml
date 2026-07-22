@@ -295,3 +295,4 @@ relay_error.model_at_capacity: "所選模型目前容量不足，請稍後重試
 relay_error.model_not_supported: "此帳號不支援所選模型，請更換模型。"
 relay_error.concurrency_limit: "並發請求已達上限，請在約 {{.RetrySeconds}} 秒後重試。"
 relay_error.concurrency_limit_no_retry: "並發請求已達上限，請稍後重試。"
+relay_error.upstream_request_failed: "請求上游位址失敗，請稍後重試。"

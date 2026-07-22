@@ -294,3 +294,4 @@ relay_error.model_at_capacity: "The selected model is at capacity; retry later o
 relay_error.model_not_supported: "This account cannot use the selected model; choose another model."
 relay_error.concurrency_limit: "Concurrency limit reached; retry in about {{.RetrySeconds}} seconds."
 relay_error.concurrency_limit_no_retry: "Concurrency limit reached; please retry shortly."
+relay_error.upstream_request_failed: "Failed to reach the upstream service; please retry later."

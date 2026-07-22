@@ -295,3 +295,4 @@ relay_error.model_at_capacity: "所选模型当前容量不足，请稍后重试
 relay_error.model_not_supported: "该账号不支持所选模型，请更换模型。"
 relay_error.concurrency_limit: "并发请求已达上限，请在约 {{.RetrySeconds}} 秒后重试。"
 relay_error.concurrency_limit_no_retry: "并发请求已达上限，请稍后重试。"
+relay_error.upstream_request_failed: "请求上游地址失败，请稍后重试。"
