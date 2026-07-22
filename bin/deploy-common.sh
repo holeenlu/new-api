@@ -320,20 +320,24 @@ deploy_prepare_env_file() {
   deploy_env_ensure "$env_file" SQL_DSN "postgresql://${postgres_user}:${postgres_password}@postgres:5432/${postgres_db}"
   deploy_env_ensure "$env_file" REDIS_CONN_STRING "redis://:${redis_password}@redis:6379"
 
-  # Subscription upstream timestamps and reset windows are expressed in UTC.
+  # Pin the container/display timezone for all targets. Subscription reset
+  # timestamps are parsed as absolute values (Unix epoch / RFC3339), so this
+  # only affects how local times are rendered in client messages and logs.
   timezone_env_file=$(mktemp "${env_file}.XXXXXX")
   awk '
     BEGIN { found = 0 }
     /^[[:space:]]*TZ=/ {
-      if (!found) print "TZ=UTC"
+      if (!found) print "TZ=Asia/Taipei"
       found = 1
       next
     }
     { print }
-    END { if (!found) print "TZ=UTC" }
+    END { if (!found) print "TZ=Asia/Taipei" }
   ' "$env_file" >"$timezone_env_file"
   chmod 600 "$timezone_env_file"
   mv "$timezone_env_file" "$env_file"
+
+  deploy_env_ensure "$env_file" DEFAULT_LANGUAGE zh-CN
 
   deploy_env_migrate_default "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5 10
   deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 750

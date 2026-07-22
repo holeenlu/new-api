@@ -29,7 +29,8 @@ services:
     environment:
       - SQL_DSN=postgresql://root:123456@postgres:5432/new-api
       - REDIS_CONN_STRING=redis://redis
-      - TZ=UTC
+      - TZ=Asia/Taipei
+      - DEFAULT_LANGUAGE=zh-CN
       - CHANNEL_MANAGEMENT_REQUEST_TIMEOUT=${CHANNEL_MANAGEMENT_REQUEST_TIMEOUT:-30}
       - CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED=${CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_ENABLED:-true}
       - BATCH_UPDATE_ENABLED=true
