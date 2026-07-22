@@ -73,17 +73,18 @@ type Driver interface {
 
 // Session owns one client WebSocket's upstream connection: a single channel,
 // model, and credential are pinned for its lifetime, and turns run sequentially.
+// Capacity leases are per-turn, not per-connection: an idle but still-open
+// connection holds no OAuth concurrency slot.
 type Session struct {
-	mu            sync.Mutex
-	conn          *websocket.Conn
-	connectedAt   time.Time
-	channelID     int
-	model         string
-	httpFallback  bool
-	lease         *service.SubscriptionOAuthLease
-	fallbackLease *service.SubscriptionOAuthLease
-	pendingID     int
-	pendingModel  string
+	mu              sync.Mutex
+	conn            *websocket.Conn
+	connectedAt     time.Time
+	channelID       int
+	model           string
+	httpFallback    bool
+	handshakeHeader http.Header
+	pendingID       int
+	pendingModel    string
 }
 
 // SetSession stores the session on the request context for the adaptor to pick up.
@@ -117,14 +118,8 @@ func (s *Session) Close() error {
 		err = s.conn.Close()
 		s.conn = nil
 	}
-	if s.lease != nil {
-		s.lease.Release()
-		s.lease = nil
-	}
-	if s.fallbackLease != nil {
-		s.fallbackLease.Release()
-		s.fallbackLease = nil
-	}
+	// Per-turn leases are released by the turn's response body (or its failure
+	// path), so there is no connection-scoped lease to release here.
 	return err
 }
 
@@ -211,8 +206,19 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		return nil, errors.New("responses websocket cannot switch models within one session")
 	}
 	if s.httpFallback {
-		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+		// Already degraded to HTTP for this session; the fallback reserves its own
+		// per-request capacity.
+		return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, nil)
 	}
+
+	// Reserve capacity for THIS turn only. The lease is released when the turn's
+	// response body closes (success) or on the failure paths below, so an idle but
+	// still-open upstream connection never pins an OAuth concurrency slot.
+	lease, err := driver.AcquireCapacity(c, info)
+	if err != nil {
+		return nil, err
+	}
+
 	if s.conn != nil && !s.connectedAt.IsZero() && time.Since(s.connectedAt) >= MaxConnectionLifetime {
 		// Proactively recycle the connection before the upstream's 60-minute cap
 		// so a long-lived session does not fail a turn when the upstream closes
@@ -224,9 +230,13 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	if s.conn == nil {
 		if err := s.connect(c, driver, info); err != nil {
 			if errors.Is(err, ErrUpgradeRequired) {
+				// Reuse this turn's lease for the HTTP fallback rather than reserving a
+				// second slot for the same turn.
 				s.httpFallback = true
-				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
 			}
+			written, responseStarted := info.UpstreamAttemptState()
+			lease.FinishFailedAttempt(written || responseStarted)
 			return nil, err
 		}
 		justConnected = true
@@ -235,10 +245,11 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		s.invalidateLocked(s.conn)
 		if justConnected {
 			// A brand-new connection that cannot accept the first write is not a
-			// usable WebSocket transport; degrade to HTTP for this session.
+			// usable WebSocket transport; degrade to HTTP for this session and reuse
+			// this turn's lease for the fallback.
 			s.httpFallback = true
 			logger.LogWarn(c, "responses websocket write failed on a new connection; falling back to HTTP: "+err.Error())
-			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
 		}
 		// A reused connection was silently dropped by the upstream (idle sockets can
 		// be closed well before the lifetime cap). Reconnect once and replay the
@@ -248,8 +259,10 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		if err := s.connect(c, driver, info); err != nil {
 			if errors.Is(err, ErrUpgradeRequired) {
 				s.httpFallback = true
-				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+				return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
 			}
+			written, responseStarted := info.UpstreamAttemptState()
+			lease.FinishFailedAttempt(written || responseStarted)
 			return nil, err
 		}
 		justConnected = true
@@ -257,7 +270,7 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 			s.invalidateLocked(s.conn)
 			s.httpFallback = true
 			logger.LogWarn(c, "responses websocket write failed after reconnect; falling back to HTTP: "+err.Error())
-			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody, lease)
 		}
 	}
 
@@ -273,10 +286,11 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	if justConnected {
 		// Probe a fresh connection for a first event. An upstream that accepts the
 		// handshake but never speaks the Responses WebSocket protocol would
-		// otherwise stall the client until the idle timeout; fall back to HTTP.
-		// Close the connection if the client disconnects mid-probe so the blocked
-		// read (and its capacity lease) is released promptly instead of held for the
-		// full FirstEventTimeout.
+		// otherwise stall the client until the idle timeout. Because the request
+		// frame is already on the wire, a failed probe fails the turn rather than
+		// replaying (see the probe-error branch below). Close the connection if the
+		// client disconnects mid-probe so the blocked read (and its capacity lease)
+		// is released promptly instead of held for the full FirstEventTimeout.
 		probeDone := make(chan struct{})
 		if reqCtx := c.Request.Context(); reqCtx != nil {
 			go func() {
@@ -291,21 +305,54 @@ func (s *Session) DoRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		close(probeDone)
 		if probeErr != nil {
 			s.invalidateLocked(conn)
-			s.httpFallback = true
-			logger.LogWarn(c, "responses websocket produced no initial event; falling back to HTTP: "+probeErr.Error())
-			return s.doHTTPFallbackLocked(c, driver, info, model, httpBody)
+			// The request frame was written, so this is a real failed attempt against
+			// the credential.
+			lease.FinishFailedAttempt(true)
+			// A silent stream is often a usage-exhausted account. If the handshake
+			// response headers prove the rate-limit window is exhausted, return a
+			// usage-limit classification (cooling this credential, giving the client a
+			// reset time, and letting routing fail over to another account) — a
+			// rate-limit rejection means the request was not actually executed, so
+			// this is safe. Mirrors the Claude silent-stream path.
+			if usageErr := service.SubscriptionOAuthUsageLimitFromResponseHeaders(s.handshakeHeader, time.Now()); usageErr != nil {
+				logger.LogWarn(c, "responses websocket silent after handshake; upstream headers indicate a usage limit: "+probeErr.Error())
+				return nil, usageErr
+			}
+			// Otherwise the response.create frame was already written to this
+			// connection, so the upstream may have received and begun executing it — a
+			// silent probe cannot prove otherwise. Do NOT replay the turn over HTTP,
+			// and do not let the relay resend it on another credential: a duplicate
+			// would re-execute non-idempotent work (tool calls, code edits) and
+			// double-consume the upstream account. Fail this turn instead (SkipRetry).
+			// HTTP fallback stays reserved for pre-write failures (upgrade declined,
+			// write error), where non-receipt is certain.
+			logger.LogWarn(c, "responses websocket produced no initial event after the request was sent; failing the turn without replay: "+probeErr.Error())
+			return nil, types.NewErrorWithStatusCode(
+				fmt.Errorf("responses websocket upstream produced no output within %s after the request was sent: %w", FirstEventTimeout, probeErr),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
 		firstPayload = payload
 	}
 
 	reader, writer := io.Pipe()
 	go s.streamAsSSE(c.Request.Context(), conn, writer, firstPayload)
+	var responseBody io.ReadCloser = reader
+	if lease != nil {
+		// Finalize the per-turn lease exactly like the HTTP path: the relay closes
+		// this body when the stream ends (releasing the slot) and marks the turn's
+		// success/failure (resolving the credential's health / recovery probe).
+		service.BindSubscriptionOAuthResponseLease(c, lease)
+		responseBody = service.NewSubscriptionOAuthResponseBody(reader, lease)
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header: http.Header{
 			"Content-Type": []string{"text/event-stream"},
 		},
-		Body: reader,
+		Body: responseBody,
 	}, nil
 }
 
@@ -315,12 +362,8 @@ func (s *Session) doHTTPFallbackLocked(
 	info *relaycommon.RelayInfo,
 	model string,
 	body []byte,
+	reuseLease *service.SubscriptionOAuthLease,
 ) (*http.Response, error) {
-	var reuseLease *service.SubscriptionOAuthLease
-	if s.fallbackLease != nil {
-		reuseLease = s.fallbackLease
-		s.fallbackLease = nil
-	}
 	response, err := driver.DoHTTPFallback(c, info, body, reuseLease)
 	if err != nil || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 		s.pendingID = 0
@@ -340,35 +383,16 @@ func (s *Session) invalidateLocked(conn *websocket.Conn) {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
-	if s.lease != nil {
-		s.lease.Release()
-		s.lease = nil
-	}
-	if s.fallbackLease != nil {
-		s.fallbackLease.Release()
-		s.fallbackLease = nil
-	}
 }
 
 func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.RelayInfo) error {
-	lease, err := driver.AcquireCapacity(c, info)
-	if err != nil {
-		return err
-	}
-
 	webSocketURL, headers, err := driver.DialUpstream(c, info)
 	if err != nil {
-		if lease != nil {
-			lease.Abandon()
-		}
 		return err
 	}
 
 	client, err := service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 	if err != nil {
-		if lease != nil {
-			lease.Abandon()
-		}
 		return err
 	}
 	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second, EnableCompression: true}
@@ -396,10 +420,9 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		if response != nil && response.StatusCode > 0 && response.StatusCode != http.StatusUpgradeRequired {
 			// A genuine upstream HTTP status reached us (e.g. 429 or 5xx). Surface it
 			// so the relay applies its normal retry/failover and Retry-After handling
-			// instead of masking a rate limit or outage behind an HTTP fallback.
-			if lease != nil {
-				lease.Release()
-			}
+			// instead of masking a rate limit or outage behind an HTTP fallback. The
+			// caller finalizes this turn's capacity lease (responseStarted is now set,
+			// so it counts as a real attempt against the credential).
 			info.MarkUpstreamResponseStarted()
 			info.MarkUpstreamFailureResponse()
 			if response.Body != nil {
@@ -422,7 +445,6 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 		// a TLS error, or a connection-level failure. In every one of these cases the
 		// endpoint does not speak the Responses WebSocket protocol, so serve this turn
 		// and the rest of the connection over HTTP rather than failing the turn hard.
-		s.fallbackLease = lease
 		return ErrUpgradeRequired
 	}
 	if response != nil && response.Body != nil {
@@ -437,13 +459,20 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	s.connectedAt = time.Now()
 	s.channelID = info.ChannelId
 	s.model = strings.TrimSpace(info.UpstreamModelName)
-	s.lease = lease
+	// Retain the handshake response headers so a subsequent silent-stream probe can
+	// classify an exhausted usage window from the upstream's rate-limit headers.
+	if response != nil {
+		s.handshakeHeader = response.Header
+	} else {
+		s.handshakeHeader = nil
+	}
 	driver.OnUpstreamConnected(c, info)
 	return nil
 }
 
-// invalidate closes and forgets the connection while releasing its lease. It
-// acquires the session lock; callers already holding it must use invalidateLocked.
+// invalidate closes and forgets the connection. It acquires the session lock;
+// callers already holding it must use invalidateLocked. The turn's capacity lease
+// is released separately by its response body, not here.
 func (s *Session) invalidate(conn *websocket.Conn) {
 	s.mu.Lock()
 	s.invalidateLocked(conn)
@@ -475,7 +504,8 @@ func readInitialEvent(conn *websocket.Conn) ([]byte, error) {
 // SSE stream, returning stop=true when the reader should exit. It invalidates the
 // connection and closes the writer with the error on a malformed payload, a
 // terminal failure event, or a downstream write failure; a successful
-// response.completed stops while keeping the connection for reuse.
+// response.completed or response.incomplete stops while keeping the connection
+// for reuse.
 func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWriter, payload []byte) bool {
 	payload = bytes.TrimSpace(payload)
 	if len(payload) == 0 {
@@ -513,10 +543,19 @@ func (s *Session) emitEventAndMaybeStop(conn *websocket.Conn, writer *io.PipeWri
 		s.invalidate(conn)
 		return true
 	}
-	if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.error" || event.Type == "error" {
-		if event.Type != "response.completed" {
-			s.invalidate(conn)
-		}
+	switch event.Type {
+	case "response.completed", "response.incomplete":
+		// Clean terminal states: the turn ended and the persistent upstream keeps
+		// the connection open for the next response.create, so stop reading but keep
+		// it for reuse. response.incomplete (e.g. max output tokens or a content
+		// filter) is as terminal as response.completed; omitting it here would leave
+		// the read loop blocked on the idle upstream until idleTimeout, hanging the
+		// turn and stalling the next one.
+		return true
+	case "response.failed", "response.error", "error":
+		// Terminal failure: the connection may carry residual upstream state, so drop
+		// it rather than risk bleeding events into a reused turn.
+		s.invalidate(conn)
 		return true
 	}
 	return false

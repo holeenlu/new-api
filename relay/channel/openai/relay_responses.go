@@ -38,7 +38,14 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		status := resp.StatusCode
+		if status >= 200 && status < 300 {
+			// The upstream wrapped an error in a success status; derive a routable
+			// status from the error content so the relay retries/fails over instead of
+			// treating it as success (shouldRetry returns false for 2xx).
+			status = responsesStreamErrorStatus(string(responseBody), oaiError)
+		}
+		return nil, types.WithOpenAIError(*oaiError, status)
 	}
 
 	if responsesResponse.HasImageGenerationCall() {
@@ -160,47 +167,57 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				}
 			}
 		}
-		if isSubscriptionOAuth {
-			streamError := streamResponse.GetOpenAIError()
-			terminalFailure := streamResponse.Type == "response.failed" ||
-				streamResponse.Type == "response.error" || streamResponse.Type == "error"
-			if terminalFailure && streamError == nil {
+		streamError := streamResponse.GetOpenAIError()
+		terminalFailure := streamResponse.Type == "response.failed" ||
+			streamResponse.Type == "response.error" || streamResponse.Type == "error"
+		if terminalFailure {
+			if streamError == nil {
 				streamError = &types.OpenAIError{Type: "unknown_error", Message: "upstream Responses stream failed without error details"}
 			}
-			if terminalFailure {
+			// Record the upstream failure for every channel so channel health and
+			// error logs stay observable even when the downstream is already committed
+			// and the turn cannot be safely retried.
+			info.MarkUpstreamFailureResponse()
+			if isSubscriptionOAuth {
 				upstreamStatus := responsesStreamErrorStatus(data, streamError)
 				candidate := types.WithOpenAIError(*streamError, upstreamStatus)
 				candidate.UpstreamStatusCode = upstreamStatus
 				candidate.RetryAfter = service.ParseUpstreamRetryDelay(http.Header{}, []byte(data), time.Now())
 				candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
-				info.MarkUpstreamFailureResponse()
 				if !downstreamCommitted.Load() {
-					if streamResponse.Type == "response.failed" {
-						relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
-					}
+					// Preflight stage: nothing committed downstream yet, so record any
+					// terminal failure (response.failed / response.error / error) — not
+					// just response.failed — so a client gets a structured terminal after
+					// retries, and fail over safely.
+					relaycommon.SetResponsesStreamPreflightFailureEvent(c, data)
 					preflightError = candidate
 					sr.Stop(candidate)
 					return
 				}
 				sr.Error(candidate)
+			} else {
+				// Non-subscription channels treat the downstream as committed from the
+				// first event, so the turn cannot be safely retried; log for visibility
+				// and forward the failure event to the client below.
+				logger.LogError(c, fmt.Sprintf("responses stream terminal failure on non-subscription channel: type=%s message=%s", streamResponse.Type, streamError.Message))
 			}
-			if !downstreamCommitted.Load() {
-				switch streamResponse.Type {
-				case "response.created", "response.in_progress", "response.queued":
-					pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
-					pendingBytes += len(data)
-					if pendingBytes <= maxResponsesStreamPreflightBytes {
-						return
-					}
-					commitPreflight()
-					return
-				case "response.completed", "response.done":
-					pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
-					commitPreflight()
+		}
+		if isSubscriptionOAuth && !downstreamCommitted.Load() {
+			switch streamResponse.Type {
+			case "response.created", "response.in_progress", "response.queued":
+				pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
+				pendingBytes += len(data)
+				if pendingBytes <= maxResponsesStreamPreflightBytes {
 					return
 				}
 				commitPreflight()
+				return
+			case "response.completed", "response.done":
+				pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
+				commitPreflight()
+				return
 			}
+			commitPreflight()
 		}
 		sendResponsesStreamData(c, streamResponse, data)
 	}

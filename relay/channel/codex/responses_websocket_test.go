@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -399,7 +400,11 @@ func TestResponsesWebSocketHandshakePreservesUsageResetMetadata(t *testing.T) {
 	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, classified.GetErrorCode())
 }
 
-func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {
+// A fresh WebSocket that accepts the handshake and the request frame but then
+// stays silent must FAIL the turn, not replay it over HTTP. The request was
+// already written upstream, so a silent probe cannot prove it was not received;
+// replaying would risk duplicate execution and double upstream consumption.
+func TestResponsesWebSocketFailsTurnWhenUpstreamSilentAfterWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalInterval := CodexOAuthMinRequestInterval
 	CodexOAuthMinRequestInterval = 0
@@ -413,8 +418,8 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {
 	var httpRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
-			// Accept the upgrade but never send a Responses event, simulating an
-			// upstream that does not actually speak the WebSocket protocol.
+			// Accept the upgrade and read the request frame, then stay silent past
+			// the first-event bound.
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				return
@@ -424,7 +429,7 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 			return
 		}
-		// HTTP fallback transport.
+		// HTTP fallback transport — must NOT be reached for a post-write silence.
 		httpRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -450,15 +455,16 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamSilent(t *testing.T) {
 	session := &responsesws.Session{}
 	defer session.Close()
 	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Contains(t, string(body), "event: response.completed")
-	// The silent WebSocket produced no event, so the response must have come from
-	// the HTTP fallback transport.
-	require.Equal(t, int32(1), httpRequests.Load())
+	require.Nil(t, resp)
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+	// Non-retryable: the relay must not resend the turn on another credential.
+	require.True(t, types.IsSkipRetryError(apiErr))
+	// No HTTP replay of an already-written request.
+	require.Zero(t, httpRequests.Load())
 }
 
 func TestResponsesWebSocketSessionUsesConfiguredRequestBodyLimit(t *testing.T) {
@@ -581,4 +587,133 @@ func TestResponsesWebSocketSessionRecyclesConnectionAtLifetime(t *testing.T) {
 
 	// The second turn must reconnect because the connection exceeded its lifetime.
 	require.Equal(t, int32(2), upgrades.Load())
+}
+
+// A completed turn must release its OAuth concurrency slot even though the
+// connection stays open for reuse. With concurrency capped at 1, a slot acquired
+// after the turn's body closes proves the lease is per-turn, not per-connection
+// (a per-connection lease would still hold the only slot for the open socket).
+func TestResponsesWebSocketSessionReleasesLeasePerTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	originalConcurrency := CodexOAuthMaxConcurrency
+	CodexOAuthMaxConcurrency = 1
+	t.Cleanup(func() { CodexOAuthMaxConcurrency = originalConcurrency })
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Persistent upstream: keep the connection open after completing the turn.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"usage":{"total_tokens":3}}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	makeInfo := func() *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{
+			IsStream:  true,
+			RelayMode: relayconstant.RelayModeResponses,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelId:         970050,
+				ChannelType:       constant.ChannelTypeCodex,
+				ChannelBaseUrl:    server.URL,
+				ApiKey:            `{"access_token":"access-token","account_id":"per-turn-account"}`,
+				UpstreamModelName: "gpt-5.6-sol",
+				ChannelSetting:    dto.ChannelSettings{},
+			},
+		}
+	}
+
+	session := &responsesws.Session{}
+	defer session.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	resp, err := session.DoRequest(c, &Adaptor{}, makeInfo(), strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), "event: response.completed")
+	require.NoError(t, resp.Body.Close())
+
+	// The upstream connection is still open (persistent), yet the slot must be free.
+	probe, _ := gin.CreateTestContext(httptest.NewRecorder())
+	probe.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	lease, err := acquireCodexOAuthCapacity(probe, makeInfo())
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	lease.Release()
+}
+
+// A silent stream whose handshake response headers prove the usage window is
+// exhausted must be classified as a usage limit (429, with a reset time) rather
+// than failed as a generic non-retryable turn — so the credential is cooled and
+// routing can fail over to another account. Mirrors the Claude silent-stream path.
+func TestResponsesWebSocketClassifiesUsageLimitFromHandshakeHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalInterval := CodexOAuthMinRequestInterval
+	CodexOAuthMinRequestInterval = 0
+	t.Cleanup(func() { CodexOAuthMinRequestInterval = originalInterval })
+	originalFirstEvent := responsesws.FirstEventTimeout
+	responsesws.FirstEventTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { responsesws.FirstEventTimeout = originalFirstEvent })
+	service.InitHttpClient()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		respHeader := http.Header{}
+		respHeader.Set("anthropic-ratelimit-unified-status", "rejected")
+		respHeader.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10))
+		conn, err := upgrader.Upgrade(w, r, respHeader)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Accept the request frame, then stay silent past the first-event bound.
+		_, _, _ = conn.ReadMessage()
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{
+		IsStream:  true,
+		RelayMode: relayconstant.RelayModeResponses,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         980030,
+			ChannelType:       constant.ChannelTypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"access-token","account_id":"usage-limited-account"}`,
+			UpstreamModelName: "gpt-5.6-sol",
+			ChannelSetting:    dto.ChannelSettings{},
+		},
+	}
+	session := &responsesws.Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	require.Nil(t, resp)
+	require.Error(t, err)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusTooManyRequests, apiErr.GetUpstreamStatusCode())
+	require.Greater(t, apiErr.RetryAfter, time.Duration(0))
+	// A usage limit must stay routable (cool + fail over), not a hard skip-retry.
+	require.False(t, types.IsSkipRetryError(apiErr))
 }

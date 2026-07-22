@@ -171,11 +171,16 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		originModelName := info.OriginModelName
 		originPriceData := info.PriceData
 
-		_, err := helper.ModelPriceHelper(c, info, info.GetEstimatePromptTokens(), &types.TokenCountMeta{})
-		if err != nil {
+		if _, err := helper.ModelPriceHelper(c, info, info.GetEstimatePromptTokens(), &types.TokenCountMeta{}); err != nil {
+			// The upstream already produced a billable response, so a compact-specific
+			// pricing failure must not drop the charge. Fall back to the request's
+			// original price data (set by the main relay flow) and still bill the
+			// consumed usage instead of returning an error after the body was sent.
 			info.OriginModelName = originModelName
 			info.PriceData = originPriceData
-			return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithStatusCode(http.StatusBadRequest))
+			logger.LogError(c, "compact price helper failed; billing with original price data: "+err.Error())
+			service.PostTextConsumeQuota(c, info, usageDto, nil)
+			return nil
 		}
 		service.PostTextConsumeQuota(c, info, usageDto, nil)
 

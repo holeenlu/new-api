@@ -242,3 +242,76 @@ func TestCodexResponsesStreamReturnsScannerErrorBeforeOutput(t *testing.T) {
 	require.Empty(t, recorder.Body.String())
 	require.Empty(t, recorder.Header().Get("Content-Type"))
 }
+
+// ② A non-stream Responses reply that wraps an error in a 200 must derive a
+// routable status from the error content, otherwise shouldRetry treats it as
+// success (2xx) and never retries or fails over.
+func TestOaiResponsesHandlerDerivesStatusFromWrapped200Error(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := `{"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded","message":"Rate limit reached"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusTooManyRequests, apiError.StatusCode)
+}
+
+// ③ A preflight-stage terminal failure of type response.error (not only
+// response.failed) must be stored so the client still gets a structured terminal
+// event after retries are exhausted.
+func TestCodexResponsesStreamStoresPreflightFailureEventForErrorType(t *testing.T) {
+	c, _, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.error","error":{"type":"server_error","code":"server_error","message":"boom"}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.True(t, info.HasUpstreamFailureResponse())
+	failureEvent, exists := relaycommon.GetResponsesStreamPreflightFailureEvent(c)
+	require.True(t, exists)
+	require.Contains(t, failureEvent, `"type":"response.error"`)
+}
+
+// ④ A non-subscription channel treats the downstream as committed from the first
+// event, so an in-stream terminal failure cannot be retried — but it must still be
+// marked as an upstream failure (observability) and forwarded to the client.
+func TestOaiResponsesStreamNonSubscriptionMarksUpstreamFailure(t *testing.T) {
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"type":"response.failed","response":{"error":{"type":"server_error","message":"boom"}}}` + "\n" +
+				`data: [DONE]` + "\n")),
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-test"},
+		IsStream:    true,
+		DisablePing: true,
+	}
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError) // already committed downstream: forwarded, not retried
+	require.NotNil(t, usage)
+	require.True(t, info.HasUpstreamFailureResponse())
+	require.Contains(t, recorder.Body.String(), "response.failed")
+}

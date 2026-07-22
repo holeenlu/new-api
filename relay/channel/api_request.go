@@ -661,9 +661,18 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	var pingerDone <-chan struct{}
 	if info.IsStream {
 		helper.SetEventStreamHeaders(c)
+		// Subscription OAuth Responses streams gate downstream writes until the first
+		// semantic event so an idle preflight can fail over safely. A header-wait
+		// keepalive ping would commit the downstream (c.Writer.Written()=true) before
+		// the upstream even responds, defeating that failover and appending a JSON
+		// error onto an already-committed SSE stream. Skip it here; the in-stream
+		// keepalive (stream_scanner, gated on preflight) still covers keepalive once
+		// output starts.
+		preflightGated := rootconstant.IsSubscriptionOAuthChannel(info.ChannelType) &&
+			info.RelayMode == constant.RelayModeResponses
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()
-		if generalSettings.PingIntervalEnabled && !info.DisablePing {
+		if generalSettings.PingIntervalEnabled && !info.DisablePing && !preflightGated {
 			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
 			stopPinger, pingerDone = startPingKeepAlive(c, pingInterval)
 			// 使用defer确保在任何情况下都能停止ping goroutine
