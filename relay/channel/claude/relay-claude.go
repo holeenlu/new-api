@@ -209,21 +209,25 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, err
 	}
 
-	// The stream produced no event within the first-event bound: treat the attempt
-	// as a silent upstream failure (e.g. a usage-exhausted account's empty 200
-	// stream) rather than a successful empty stream. Nothing was written downstream
-	// (preflight gates writes until the first event), so failover is safe. Prefer a
-	// usage-limit classification when the response's rate-limit headers prove the
-	// window is exhausted (cooling the credential and returning a usage-limit
-	// response); otherwise return a generic retryable error so routing fails over.
-	if subscriptionOAuth && !firstEventSeen.Load() &&
-		info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonTimeout {
+	// The stream produced no semantic event: treat the attempt as a silent
+	// upstream failure (e.g. a usage-exhausted account's empty 200 stream) rather
+	// than a successful empty stream. This covers both a stream that idled until
+	// the first-event bound (timeout) and one that closed immediately or sent only
+	// [DONE] with no event (eof/done) — the same failure class. Nothing was written
+	// downstream (preflight gates writes until the first event), so failover is
+	// safe. Client cancellation and error/panic ends are deliberately excluded:
+	// those are handled elsewhere and must not be reclassified as a usage limit.
+	// Prefer a usage-limit classification when the response's rate-limit headers
+	// prove the window is exhausted (cooling the credential and returning a
+	// usage-limit response); otherwise return a generic retryable error so routing
+	// fails over.
+	if subscriptionOAuth && !firstEventSeen.Load() && info.StreamStatus != nil && isSilentSubscriptionStreamEnd(info.StreamStatus.EndReason) {
 		helper.ClearEventStreamHeaders(c)
 		if usageErr := service.SubscriptionOAuthUsageLimitFromResponseHeaders(resp.Header, time.Now()); usageErr != nil {
 			return nil, usageErr
 		}
 		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("subscription OAuth stream produced no output within %s", ClaudeCodeOAuthStreamFirstEventTimeout),
+			fmt.Errorf("subscription OAuth stream produced no output (%s)", info.StreamStatus.EndReason),
 			types.ErrorCodeDoRequestFailed,
 			http.StatusBadGateway,
 		)
@@ -231,6 +235,23 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
 	return claudeInfo.Usage, nil
+}
+
+// isSilentSubscriptionStreamEnd reports whether a subscription-OAuth stream that
+// produced no semantic event ended in a way that should fail over. A natural
+// upstream end with zero output (timed out waiting for the first event, closed
+// at EOF, or sent only [DONE]) is a silent failure. Client cancellation and
+// error/panic ends are excluded: they are not the upstream withholding output
+// and must not be reclassified as a usage limit or retried as a silent stream.
+func isSilentSubscriptionStreamEnd(reason relaycommon.StreamEndReason) bool {
+	switch reason {
+	case relaycommon.StreamEndReasonTimeout,
+		relaycommon.StreamEndReasonEOF,
+		relaycommon.StreamEndReasonDone:
+		return true
+	default:
+		return false
+	}
 }
 
 func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {

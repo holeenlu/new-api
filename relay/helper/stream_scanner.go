@@ -267,11 +267,20 @@ func streamScannerHandler(
 			wg.Done()
 		}()
 		sr := newStreamResult(info.StreamStatus)
+		// On the preflight path the upstream SSE headers are withheld until the
+		// first event so an idle preflight can fail over without leaking upstream
+		// state; copy the passthrough (e.g. Codex) headers once here, just before
+		// the first downstream write, rather than skipping them entirely.
+		codexHeadersCopied := preflightComplete == nil
 		for data := range dataChan {
 			sr.reset()
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
+				if !codexHeadersCopied {
+					CopyCodexSSEHeaders(c, resp)
+					codexHeadersCopied = true
+				}
 				ExtendWriteDeadline(c)
 				dataHandler(data, sr)
 			}()

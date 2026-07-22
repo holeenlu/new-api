@@ -111,6 +111,42 @@ func TestClaudeSubscriptionStreamClassifiesUsageLimitFromHeadersOnSilentStream(t
 	require.Empty(t, recorder.Body.String())
 }
 
+// A subscription stream that closes immediately with no event (HTTP 200 then
+// EOF, rather than idling until the first-event bound) is the same silent
+// failure and must also fail over without committing downstream output.
+func TestClaudeSubscriptionStreamFailsOverOnImmediateEmptyStream(t *testing.T) {
+	body := io.NopCloser(strings.NewReader(""))
+	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, nil, body)
+
+	usage, apiError := ClaudeStreamHandler(c, resp, info)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiError.GetErrorCode())
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+	require.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("Content-Type"))
+}
+
+// A subscription stream that emits only [DONE] with no preceding event ends in
+// the "done" reason yet produced no output, so it is the same silent failure and
+// must fail over rather than be delivered as a successful empty stream.
+func TestClaudeSubscriptionStreamFailsOverOnDoneOnlyStream(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("data: [DONE]\n"))
+	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, nil, body)
+
+	usage, apiError := ClaudeStreamHandler(c, resp, info)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiError.GetErrorCode())
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+	require.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("Content-Type"))
+}
+
 // Once the first event arrives the first-event bound no longer applies: a stream
 // that produces output is delivered normally and is never aborted as silent.
 func TestClaudeSubscriptionStreamDeliversOutputAfterFirstEvent(t *testing.T) {
