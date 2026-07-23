@@ -105,11 +105,12 @@ feature description.
    HTTP stream handler, and the Responses→Chat conversion handlers. The target
    is one classifier returning metadata / turn event / clean terminal / failure
    terminal / invalid, consumed by all transports (ADR 0007).
-7. Convert the stream-scanner dual idle-bound tests
-   (`relay/helper/stream_scanner_test.go`, comment-only and comment-bridged
-   cases) from wall-clock sleeps to an injectable clock. The behavior they lock
-   is real, but the current form conflicts with the no-sleep test guideline and
-   costs ~3.5s per run.
+7. Upgrade the stream-scanner test doubles from per-timer fakes to an
+   advanceable clock/timer source. The current fakes are deterministic and
+   sleep-free, but the comment-bridging case asserts refresh-routing
+   interactions (reset counts) rather than advancing time past the idle
+   deadline and observing survival directly; a clock source would let tests
+   assert the time-domain behavior itself (ADR 0007).
 
 ## Change review protocol
 

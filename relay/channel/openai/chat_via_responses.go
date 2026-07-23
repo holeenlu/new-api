@@ -28,7 +28,7 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var responsesResp dto.OpenAIResponsesResponse
-	body, apiErr := readBoundedResponsesBody(resp.Body)
+	body, apiErr := readBoundedResponsesBody(c, resp.Body)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -38,7 +38,10 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+		// This handler only runs on upstream 200s, so a wrapped error must derive
+		// its real status (429 stays retryable), keep Retry-After, and mark the
+		// upstream failure — exactly what the native path does.
+		return nil, responsesWrappedError(info, resp, body, oaiError)
 	}
 	if responsesBodyMissingResult(&responsesResp) {
 		return nil, types.NewErrorWithStatusCode(
@@ -146,11 +149,13 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		case "response.failed", "response.error", "error":
 			// Top-level `error` is a terminal failure too; GetOpenAIError covers
 			// both the top-level error field and response.error.
+			info.MarkUpstreamFailureResponse()
 			if oaiErr := streamResp.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
 				streamErr = types.WithOpenAIError(*oaiErr, responsesStreamErrorStatus(data, oaiErr))
 			} else {
 				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusBadGateway)
 			}
+			streamErr.RetryAfter = service.ParseUpstreamRetryDelay(resp.Header, []byte(data), time.Now())
 		}
 		if streamErr != nil || finalResponse != nil {
 			break
@@ -293,6 +298,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	sawTerminal := false
+	hasAuthoritativeUsage := false
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if streamErr != nil {
 			sr.Stop(streamErr)
@@ -306,6 +312,21 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		// captureAuthoritativeUsage stores a terminal event's usage as the
+		// authoritative settlement record: the total is completed on the upstream
+		// copy BEFORE normalization so the snapshot (including the nested
+		// BillingUsage) carries one consistent set of numbers, and the flag stops
+		// the estimate fallback from overwriting it — an explicit zero stays zero.
+		captureAuthoritativeUsage := func(upstream *dto.Usage) {
+			upstreamUsage := *upstream
+			if upstreamUsage.TotalTokens == 0 {
+				upstreamUsage.TotalTokens = upstreamUsage.InputTokens + upstreamUsage.OutputTokens
+			}
+			authoritativeUsage := normalizeResponsesUsage(&upstreamUsage)
+			state.SetUsage(&authoritativeUsage)
+			hasAuthoritativeUsage = true
+		}
+
 		switch streamResp.Type {
 		case "response.completed", "response.done", "response.incomplete":
 			sawTerminal = true
@@ -313,6 +334,12 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			// Top-level `error` is terminal too; GetOpenAIError covers both the
 			// top-level error field and response.error.
 			sawTerminal = true
+			info.MarkUpstreamFailureResponse()
+			// A failure event never reaches the conversion chain, so capture its
+			// authoritative usage here, before stopping.
+			if streamResp.Response != nil && streamResp.Response.Usage != nil {
+				captureAuthoritativeUsage(streamResp.Response.Usage)
+			}
 			if oaiErr := streamResp.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
 				streamErr = types.WithOpenAIError(*oaiErr, responsesStreamErrorStatus(data, oaiErr))
 			} else {
@@ -331,6 +358,16 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			sr.Stop(streamErr)
 			return
 		}
+		// A clean terminal's authoritative usage is captured AFTER the conversion
+		// chain (which may store its own un-completed copy) but BEFORE the
+		// downstream writes: a client that disconnects right at the terminal must
+		// not turn an explicit zero consumption into a billed estimate.
+		switch streamResp.Type {
+		case "response.completed", "response.done", "response.incomplete":
+			if streamResp.Response != nil && streamResp.Response.Usage != nil {
+				captureAuthoritativeUsage(streamResp.Response.Usage)
+			}
+		}
 		for _, result := range results {
 			if !sendStreamResult(result) {
 				sr.Stop(streamErr)
@@ -340,7 +377,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	})
 
 	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
+	// Estimate ONLY when no authoritative usage exists. An authoritative record
+	// is trusted verbatim: explicit zero consumption must not be replaced by a
+	// billed prompt estimate, and a record without total_tokens (only
+	// input/output) must not be discarded because its total reads as zero.
+	if !hasAuthoritativeUsage && (usage == nil || usage.TotalTokens == 0) {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}
@@ -360,14 +401,10 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				_ = helper.FlushWriter(c)
 			}
 		case types.RelayFormatClaude:
-			claudeErrorType := openaiErr.Type
-			if strings.TrimSpace(claudeErrorType) == "" {
-				claudeErrorType = "api_error"
-			}
-			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: gin.H{
-				"type":    claudeErrorType,
-				"message": openaiErr.Message,
-			}})
+			// Map to the Claude protocol's own error taxonomy (api_error,
+			// rate_limit_error, overloaded_error, ...) — a raw gateway type like
+			// new_api_error is not a Claude-recognizable error type.
+			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError()})
 		}
 	}
 

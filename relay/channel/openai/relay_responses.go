@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,9 +36,19 @@ const responsesStreamPreflightTimeout = 30 * time.Second
 
 // readBoundedResponsesBody reads a non-stream upstream body under
 // maxResponsesBodyBytes, failing with 502 instead of buffering without bound.
-func readBoundedResponsesBody(body io.Reader) ([]byte, *types.NewAPIError) {
+// A client cancellation surfacing through the body read classifies as 499
+// (skip-retry), not as an upstream fault.
+func readBoundedResponsesBody(c *gin.Context, body io.Reader) ([]byte, *types.NewAPIError) {
 	data, err := io.ReadAll(io.LimitReader(body, maxResponsesBodyBytes+1))
 	if err != nil {
+		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, types.NewErrorWithStatusCode(
+				errors.New("client canceled while reading the upstream response"),
+				types.ErrorCodeDoRequestFailed,
+				499,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
 	if len(data) > maxResponsesBodyBytes {
@@ -48,12 +61,39 @@ func readBoundedResponsesBody(body io.Reader) ([]byte, *types.NewAPIError) {
 	return data, nil
 }
 
+// rawJSONFieldPresent reports whether a raw JSON field carries a real value by
+// JSON semantics (not byte comparison, so `[ ]` or a whitespace-only string
+// cannot slip through): absent, null, a blank string, and an empty array or
+// object do not count as present.
+func rawJSONFieldPresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	var value any
+	if common.Unmarshal(trimmed, &value) != nil {
+		// Unparsable bytes cannot prove a real value; treat as absent.
+		return false
+	}
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []any:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	}
+	return true
+}
+
 // responsesBodyMissingResult reports a "success" body with no status, output,
 // or usage — not a usable Responses result regardless of id; forwarding it
 // would fake success on zero usage. A body carrying usage settles billing and
 // is left to the client even when otherwise sparse.
 func responsesBodyMissingResult(r *dto.OpenAIResponsesResponse) bool {
-	return r == nil || (len(r.Status) == 0 && len(r.Output) == 0 && r.Usage == nil)
+	return r == nil || (!rawJSONFieldPresent(r.Status) && len(r.Output) == 0 && r.Usage == nil)
 }
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -61,7 +101,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 	// read response body
 	var responsesResponse dto.OpenAIResponsesResponse
-	responseBody, apiErr := readBoundedResponsesBody(resp.Body)
+	responseBody, apiErr := readBoundedResponsesBody(c, resp.Body)
 	if apiErr != nil {
 		return nil, apiErr
 	}

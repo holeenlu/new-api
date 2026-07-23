@@ -16,7 +16,7 @@ import (
 func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
-	responseBody, apiErr := readBoundedResponsesBody(resp.Body)
+	responseBody, apiErr := readBoundedResponsesBody(c, resp.Body)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -28,9 +28,10 @@ func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, 
 	if oaiError := compactResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, responsesWrappedError(info, resp, responseBody, oaiError)
 	}
-	if len(compactResp.Output) == 0 && compactResp.Usage == nil {
-		// A "success" body with neither output nor usage (e.g. `{}`) is not a
-		// compaction result; forwarding it would fake success on zero usage.
+	if !rawJSONFieldPresent(compactResp.Output) && compactResp.Usage == nil {
+		// A "success" body with neither real output nor usage (`{}`,
+		// `{"output":null}`, `{"output":[]}`) is not a compaction result;
+		// forwarding it would fake success on zero usage.
 		return nil, types.NewErrorWithStatusCode(
 			fmt.Errorf("upstream returned a compaction body without output or usage"),
 			types.ErrorCodeBadResponseBody,

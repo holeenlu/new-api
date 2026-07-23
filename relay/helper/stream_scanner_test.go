@@ -615,67 +615,98 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
 }
 
-// commentOnlyReader emits SSE comment lines forever with a small delay — an
-// upstream that keeps the line alive but never produces a data event.
-type commentOnlyReader struct {
-	interval time.Duration
+
+// fakeStreamIdleTimer lets the test drive an idle bound to expiry and observe
+// refreshes without wall-clock sleeps.
+type fakeStreamIdleTimer struct {
+	c      chan time.Time
+	resets atomic.Int32
 }
 
-func (r *commentOnlyReader) Read(p []byte) (int, error) {
-	time.Sleep(r.interval)
-	return copy(p, []byte(": keepalive\n")), nil
+// installFakeStreamIdleTimers replaces the scanner's two idle bounds with
+// manually-driven fakes, distinguished by requested duration (the valid-data
+// bound is defined as twice the per-line bound) rather than creation order.
+func installFakeStreamIdleTimers(t *testing.T) (idle, valid *fakeStreamIdleTimer) {
+	t.Helper()
+	idle = &fakeStreamIdleTimer{c: make(chan time.Time, 1)}
+	valid = &fakeStreamIdleTimer{c: make(chan time.Time, 1)}
+	perLine := time.Duration(constant.StreamingTimeout) * time.Second
+	original := newStreamIdleTimer
+	newStreamIdleTimer = func(d time.Duration) *streamIdleTimer {
+		fake := idle
+		if d > perLine {
+			fake = valid
+		}
+		return &streamIdleTimer{
+			C:     fake.c,
+			stop:  func() {},
+			reset: func(time.Duration) { fake.resets.Add(1) },
+		}
+	}
+	t.Cleanup(func() { newStreamIdleTimer = original })
+	return idle, valid
 }
 
 // A keepalive-only stream must not extend the request forever: comments refresh
-// the per-line idle window, but the longer valid-data window (2x) still expires
-// when no data event ever arrives.
+// only the per-line idle bound, so driving the valid-data bound to expiry ends
+// the stream with the keepalive-only diagnosis and zero delivered events.
 func TestStreamScannerHandler_CommentOnlyStreamEndsAtValidDataTimeout(t *testing.T) {
-	previous := constant.StreamingTimeout
-	constant.StreamingTimeout = 1
-	t.Cleanup(func() { constant.StreamingTimeout = previous })
-
-	c, resp, info := setupStreamTest(t, nil)
-	resp.Body = io.NopCloser(&commentOnlyReader{interval: 100 * time.Millisecond})
-	info.DisablePing = true
-
-	start := time.Now()
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
-	elapsed := time.Since(start)
-
-	require.GreaterOrEqual(t, elapsed, 1500*time.Millisecond, "must outlive the per-line idle window (comments are legitimate keepalive)")
-	require.Less(t, elapsed, 8*time.Second, "keepalive-only stream must end at the valid-data window")
-	require.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
-	require.ErrorContains(t, info.StreamStatus.EndError, "keepalive-only")
-}
-
-// Comment keepalive followed by late real data is the legitimate deep-reasoning
-// pattern: the per-line refresh must carry the stream across a data gap longer
-// than STREAMING_TIMEOUT without killing it.
-func TestStreamScannerHandler_CommentKeepaliveBridgesLongDataGap(t *testing.T) {
-	previous := constant.StreamingTimeout
-	constant.StreamingTimeout = 1
-	t.Cleanup(func() { constant.StreamingTimeout = previous })
+	_, valid := installFakeStreamIdleTimers(t)
 
 	reader, writer := io.Pipe()
 	go func() {
 		defer writer.Close()
-		// 1.5s of comment-only keepalive: longer than STREAMING_TIMEOUT (1s),
-		// shorter than the valid-data window (2s).
-		for i := 0; i < 5; i++ {
-			time.Sleep(300 * time.Millisecond)
-			_, _ = writer.Write([]byte(": processing\n"))
+		for i := 0; i < 3; i++ {
+			if _, err := writer.Write([]byte(": keepalive\n")); err != nil {
+				return
+			}
 		}
-		_, _ = writer.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n"))
-		_, _ = writer.Write([]byte("data: [DONE]\n"))
+		// No data event ever arrives, so the valid-data bound expires.
+		valid.c <- time.Time{}
+		// Keep the line "alive" until the handler closes the body.
+		for {
+			if _, err := writer.Write([]byte(": keepalive\n")); err != nil {
+				return
+			}
+		}
 	}()
 
 	c, resp, info := setupStreamTest(t, nil)
-	resp.Body = io.NopCloser(reader)
+	resp.Body = reader // PipeReader: Close unblocks the scanner goroutine
 	info.DisablePing = true
 
 	received := 0
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) { received++ })
+	StreamScannerHandler(c, resp, info, func(string, *StreamResult) { received++ })
 
-	require.Equal(t, 1, received, "the late data event must be delivered")
+	require.Zero(t, received)
+	require.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	require.ErrorContains(t, info.StreamStatus.EndError, "keepalive-only")
+}
+
+// Comment keepalive followed by real data is the legitimate deep-reasoning
+// pattern: every line refreshes the per-line idle bound, while only the
+// accepted data event refreshes the valid-data bound.
+func TestStreamScannerHandler_CommentKeepaliveBridgesDataGap(t *testing.T) {
+	idle, valid := installFakeStreamIdleTimers(t)
+
+	body := strings.Join([]string{
+		": processing",
+		": processing",
+		`data: {"choices":[{"delta":{"content":"late"}}]}`,
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+	info.DisablePing = true
+
+	received := 0
+	StreamScannerHandler(c, resp, info, func(string, *StreamResult) { received++ })
+
+	require.Equal(t, 1, received, "the data event must be delivered")
 	require.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	// Comments count toward the per-line refresh (keepalive is legitimate)...
+	require.GreaterOrEqual(t, idle.resets.Load(), int32(3))
+	// ...but only the accepted data event refreshes the valid-data bound.
+	require.Equal(t, int32(1), valid.resets.Load())
 }

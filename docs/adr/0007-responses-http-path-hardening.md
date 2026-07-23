@@ -1,6 +1,9 @@
 # ADR 0007: Responses HTTP path hardening
 
-Status: Implemented.
+Status: Implemented; review closed after iterative adversarial review
+(2026-07-24). Remaining items are tracked in `docs/architecture/health.md`
+(#6 classifier module, #7 advanceable clock for scanner test doubles) and are
+not release blockers.
 
 ## Context
 
@@ -18,15 +21,29 @@ names its owner so this does not become a second source of truth.
 `DoApiRequest` and `DoFormRequest` bind the upstream request to
 `c.Request.Context()`. A client that disconnects before upstream headers arrive
 (or during a non-stream read) cancels the upstream call instead of letting it
-generate — and bill — unobserved. Cancellation classifies as 499/SkipRetry via
-the existing transport-error classifiers. `DoTaskApiRequest` is intentionally
+generate — and bill — unobserved. Classification: a cancellation surfacing
+through `client.Do` classifies as 499/SkipRetry via the transport-error
+classifiers; one surfacing later, through a non-stream BODY read, is classified
+as 499 by `readBoundedResponsesBody`'s own request-context check (the transport
+classifier never sees body-read errors). `DoTaskApiRequest` is intentionally
 unchanged (short-lived task submission with its own reconciliation).
 
 **Terminal enforcement in Responses→Chat conversion (owner:
 `relay/channel/openai/chat_via_responses.go`).** Both conversion handlers treat
 top-level `error` as a terminal failure alongside `response.failed` /
-`response.error`, and preserve upstream classification (status derivation via
-`responsesStreamErrorStatus`, cooldown via `ParseUpstreamRetryDelay`).
+`response.error`, mark the upstream failure, derive the real status for
+200-wrapped errors (the non-stream handler reuses `responsesWrappedError`; the
+handlers only run on upstream 200s, so `resp.StatusCode` alone would produce an
+unretryable 200 "error"), and preserve the upstream cooldown via
+`ParseUpstreamRetryDelay`. Every terminal event that carries usage — clean
+completion or failure — is captured as the authoritative settlement record:
+after the conversion chain (so its snapshot is not overwritten) but BEFORE the
+downstream writes, so a client disconnecting right at the terminal cannot turn
+an explicit zero consumption into a billed estimate. Trusted verbatim: an
+explicit zero stays zero, and a record without total_tokens has its total
+completed on the upstream copy BEFORE normalization so the nested BillingUsage
+snapshot carries the same consistent numbers. The estimate fallback runs only
+when no authoritative record exists.
 
 - The buffered (non-stream) handler no longer fabricates a `completed` response
   when the stream ends without a terminal: it fails with 502 (nothing was
@@ -38,10 +55,13 @@ top-level `error` as a terminal failure alongside `response.failed` /
   truncated turn, and never receives a plain JSON error appended to live SSE.
   Instead the failure is emitted in the TARGET protocol's own terminal shape:
   OpenAI format gets the official mid-stream `data: {"error":...}` chunk;
-  Claude format gets the protocol's `event: error`. Formats without a standard
-  in-stream error shape (Gemini) end truncated — the missing normal termination
-  is the failure signal. Committed failures are recorded via
-  `MarkCommittedUpstreamError` and usage settles on received output.
+  Claude format gets the protocol's `event: error` with the error type mapped
+  through `ToClaudeError` (api_error / rate_limit_error / overloaded_error, …),
+  never a raw gateway type. Formats without a standard in-stream error shape
+  (Gemini) end truncated — the missing normal termination is the failure
+  signal. Committed failures are recorded via `MarkCommittedUpstreamError` and
+  usage settles on received output (or the failure event's authoritative
+  usage).
 
 **Preflight metadata classification (owner:
 `relay/channel/openai/relay_responses.go`, shared predicate in
@@ -76,9 +96,11 @@ after full generation).
 `relay/channel/openai/relay_responses.go`).** All three non-stream read sites
 (native, compaction, Responses→Chat) read through a 64 MiB bound (larger than
 the WebSocket per-event 16 MiB because a full response can carry several base64
-image outputs). A "success" body with no status, no output, and no usage (e.g.
-`{}`) is rejected as 502 rather than forwarded as a zero-usage success; a body
-carrying usage settles billing and passes.
+image outputs). A "success" body with no status, no output, and no usage is
+rejected as 502 rather than forwarded as a zero-usage success; the check is
+JSON-semantic — `null`, `""`, and empty containers do not count as present —
+so `{"status":null}` / `{"output":[]}` cannot slip through as raw non-empty
+bytes. A body carrying usage settles billing and passes.
 
 ## Explicitly not done
 
@@ -102,7 +124,10 @@ cancellation propagation at the real `DoApiRequest` layer, conversion-path
 terminal enforcement (both handlers, both failure kinds, OpenAI and Claude
 shapes), metadata-vs-commit preflight behavior including the oversized-buffer
 replay, dual idle bounds (comment-only termination and comment-bridged gaps),
-the scoped header timeout, and non-stream bounds/integrity. Known test debt:
-the dual-bound scanner tests use wall-clock sleeps, which conflicts with the
-project test guideline; converting the scanner to an injectable clock is listed
-follow-up.
+the scoped header timeout, and non-stream bounds/integrity (including the
+JSON-null bypass cases). The scanner's idle bounds are test-injectable
+(`newStreamIdleTimer`) with no wall-clock sleeps: the comment-only case drives
+expiry deterministically, while the comment-bridged case asserts the
+refresh-routing split (per-line vs valid-data reset interactions) rather than
+advancing time itself — upgrading the doubles to an advanceable clock source is
+follow-up #7 in `docs/architecture/health.md`.

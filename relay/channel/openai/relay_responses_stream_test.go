@@ -796,3 +796,58 @@ func TestCodexResponsesStreamOversizedMetadataCommitDoesNotDuplicate(t *testing.
 	// type field), so count the payload-only filler marker instead.
 	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"filler"`))
 }
+
+// JSON-semantic integrity for compaction: `"output":null` / `"output":[]` do
+// not count as real output.
+func TestOaiResponsesCompactionHandlerRejectsNullOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, body := range []string{`{"output":null}`, `{"output":[]}`, `{}`} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+		usage, apiError := OaiResponsesCompactionHandler(c, info, resp)
+		require.Nil(t, usage, body)
+		require.NotNil(t, apiError, body)
+		require.Equal(t, http.StatusBadGateway, apiError.StatusCode, body)
+	}
+}
+
+// rawJSONFieldPresent must judge by JSON semantics: whitespace variants of
+// empty values cannot slip through as raw non-empty bytes.
+func TestRawJSONFieldPresentJudgesSemantics(t *testing.T) {
+	for raw, want := range map[string]bool{
+		``: false, `null`: false, `""`: false, `"   "`: false,
+		`[]`: false, `[ ]`: false, `{}`: false, `{ }`: false,
+		`"completed"`: true, `[1]`: true, `[ 1 ]`: true, `{"a":1}`: true,
+		`0`: true, `false`: true,
+	} {
+		require.Equal(t, want, rawJSONFieldPresent([]byte(raw)), "raw=%q", raw)
+	}
+}
+
+// Compact integrity uses the semantic check: a whitespace-empty output array
+// with no usage is still rejected.
+func TestOaiResponsesCompactionHandlerRejectsWhitespaceEmptyOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"output":[ ]}`)),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesCompactionHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+}

@@ -74,6 +74,23 @@ func ExtendWriteDeadline(c *gin.Context) {
 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 }
 
+// streamIdleTimer abstracts the scanner's idle tickers behind a channel plus
+// stop/reset hooks so tests can drive expiry deterministically instead of
+// sleeping on wall-clock time.
+type streamIdleTimer struct {
+	C     <-chan time.Time
+	stop  func()
+	reset func(time.Duration)
+}
+
+// newStreamIdleTimer is replaced by scanner tests with a manually-driven fake.
+// The scanner creates exactly two per invocation: the per-line idle bound
+// first, the valid-data bound second.
+var newStreamIdleTimer = func(d time.Duration) *streamIdleTimer {
+	t := time.NewTicker(d)
+	return &streamIdleTimer{C: t.C, stop: t.Stop, reset: t.Reset}
+}
+
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
 	streamScannerHandler(c, resp, info, 0, nil, dataHandler)
 }
@@ -111,19 +128,19 @@ func streamScannerHandler(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
-	// Two idle bounds: `ticker` is refreshed by ANY upstream line — comments
+	// Two idle bounds: the first is refreshed by ANY upstream line — comments
 	// included, they are legitimate SSE keepalive (": OPENROUTER PROCESSING",
-	// deep-reasoning models can stay comment-only for minutes) — while
-	// `validDataTicker` is refreshed only by accepted data events. An upstream
-	// that emits nothing but comments can therefore extend the stream to at most
+	// deep-reasoning models can stay comment-only for minutes) — while the
+	// second is refreshed only by accepted data events. An upstream that emits
+	// nothing but comments can therefore extend the stream to at most
 	// validDataTimeout, instead of holding the request open forever.
 	validDataTimeout := 2 * streamingTimeout
 
 	var (
 		stopChan        = make(chan bool, 3) // 增加缓冲区避免阻塞
 		scanner         = NewStreamScanner(resp.Body)
-		ticker          = time.NewTicker(streamingTimeout)
-		validDataTicker = time.NewTicker(validDataTimeout)
+		ticker          = newStreamIdleTimer(streamingTimeout)
+		validDataTicker = newStreamIdleTimer(validDataTimeout)
 		pingTicker      *time.Ticker
 		writeMutex      sync.Mutex     // Mutex to protect concurrent writes
 		wg              sync.WaitGroup // 用于等待所有 goroutine 退出
@@ -162,8 +179,8 @@ func streamScannerHandler(
 				_ = resp.Body.Close()
 			}
 
-			ticker.Stop()
-			validDataTicker.Stop()
+			ticker.stop()
+			validDataTicker.stop()
 			if pingTicker != nil {
 				pingTicker.Stop()
 			}
@@ -314,7 +331,7 @@ func streamScannerHandler(
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
+			ticker.reset(streamingTimeout)
 			data := scanner.Text()
 			logger.LogDebug(c, "upstream SSE event content omitted from logs (%d bytes)", len(data))
 
@@ -332,7 +349,7 @@ func streamScannerHandler(
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
-				validDataTicker.Reset(validDataTimeout)
+				validDataTicker.reset(validDataTimeout)
 
 				select {
 				case dataChan <- data:
