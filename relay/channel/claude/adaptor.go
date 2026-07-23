@@ -34,8 +34,8 @@ const (
 
 var (
 	ClaudeCodeOAuthLocalLimitsEnabled = true
-	ClaudeCodeOAuthMaxConcurrency     = 10
-	ClaudeCodeOAuthMinRequestInterval = 750 * time.Millisecond
+	ClaudeCodeOAuthMaxConcurrency     = 5
+	ClaudeCodeOAuthMinRequestInterval = 50 * time.Millisecond
 	// ClaudeCodeOAuthStreamFirstEventTimeout bounds how long a subscription-OAuth
 	// stream may stay silent before its first upstream event. A usage-exhausted
 	// account can accept the connection and return 200 with an empty SSE stream;
@@ -54,8 +54,8 @@ const (
 func InitOAuthRuntimeSettings() {
 	ClaudeCodeOAuthLocalLimitsEnabled = rootcommon.GetEnvOrDefaultBool("CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED", true)
 	ClaudeCodeOAuthMaxConcurrency, ClaudeCodeOAuthMinRequestInterval = service.ClampSubscriptionOAuthCapacity(
-		rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 10),
-		time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 750))*time.Millisecond,
+		rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MAX_CONCURRENCY", 5),
+		time.Duration(rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS", 50))*time.Millisecond,
 	)
 	firstEventMs := rootcommon.GetEnvOrDefault("CLAUDE_CODE_OAUTH_STREAM_FIRST_EVENT_TIMEOUT_MS", 30000)
 	if firstEventMs < claudeCodeOAuthStreamFirstEventTimeoutMinMs {

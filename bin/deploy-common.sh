@@ -298,6 +298,25 @@ deploy_env_migrate_default() {
   deploy_log "Migrated $key from $old_default to $new_default"
 }
 
+deploy_env_set() {
+  local env_file=$1
+  local key=$2
+  local value=$3
+  local updated_file
+  updated_file=$(mktemp "${env_file}.XXXXXX")
+  awk -v key="$key" -v value="$value" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      if (!found) print key "=" value
+      found = 1
+      next
+    }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$env_file" >"$updated_file"
+  chmod 600 "$updated_file"
+  mv "$updated_file" "$env_file"
+}
+
 deploy_prepare_env_file() {
   local env_file=$1
   if [[ ! -f "$env_file" ]]; then
@@ -344,10 +363,11 @@ deploy_prepare_env_file() {
 
   deploy_env_ensure "$env_file" DEFAULT_LANGUAGE "$DEPLOY_PINNED_DEFAULT_LANGUAGE"
 
-  deploy_env_migrate_default "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5 10
-  deploy_env_ensure "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 750
-  deploy_env_migrate_default "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5 10
-  deploy_env_ensure "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 750
+  deploy_env_set "$env_file" CLAUDE_CODE_OAUTH_MAX_CONCURRENCY 5
+  deploy_env_set "$env_file" CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS 50
+  deploy_env_set "$env_file" CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED true
+  deploy_env_set "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5
+  deploy_env_set "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 50
   deploy_env_ensure "$env_file" MAX_REQUEST_BODY_MB 128
   deploy_env_migrate_default "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 120 30
   deploy_env_ensure "$env_file" CHANNEL_MANAGEMENT_REQUEST_TIMEOUT 30
@@ -463,30 +483,63 @@ deploy_server_main() {
   # an already-provisioned target would otherwise keep whatever TZ it was
   # initialized with (e.g. a stale TZ=UTC that silently overrides the compose
   # ${TZ:-...} default and renders reset times in UTC). Reconcile the pinned
-  # policy on every deploy: force TZ, ensure DEFAULT_LANGUAGE only when absent.
+  # policy on every deploy: force TZ and OAuth capacity settings, and ensure
+  # DEFAULT_LANGUAGE only when absent.
   # The rewrite is atomic (temp + mv) so a failure never truncates the live .env.
+  deploy_log "Synchronizing runtime policy on $DEPLOY_NAME"
   ssh_remote "$DEPLOY_TARGET" \
     "POLICY_TZ='$DEPLOY_PINNED_TZ' POLICY_LANG='$DEPLOY_PINNED_DEFAULT_LANGUAGE' REMOTE_DIR='$REMOTE_DIR' bash -s" \
-    <<'REMOTE_ENV_POLICY_EOF' || deploy_die "Failed to reconcile TZ/DEFAULT_LANGUAGE in $REMOTE_DIR/.env"
+    <<'REMOTE_ENV_POLICY_EOF' || deploy_die "Failed to reconcile deployment policy in $REMOTE_DIR/.env"
 set -Eeuo pipefail
 cd "$REMOTE_DIR"
 [ -f .env ] || exit 0
 reconciled=$(mktemp .env.policy.XXXXXX)
 trap 'rm -f "$reconciled"' EXIT
 awk -v tz="$POLICY_TZ" -v lang="$POLICY_LANG" '
-  BEGIN { have_lang = 0 }
+  BEGIN {
+    keys[1] = "CLAUDE_CODE_OAUTH_MAX_CONCURRENCY"
+    keys[2] = "CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS"
+    keys[3] = "CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED"
+    keys[4] = "CODEX_OAUTH_MAX_CONCURRENCY"
+    keys[5] = "CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS"
+    values[keys[1]] = "5"
+    values[keys[2]] = "50"
+    values[keys[3]] = "true"
+    values[keys[4]] = "5"
+    values[keys[5]] = "50"
+  }
   /^[[:space:]]*TZ=/ { next }
   /^[[:space:]]*DEFAULT_LANGUAGE=/ { have_lang = 1 }
-  { print }
+  {
+    for (i = 1; i <= 5; i++) {
+      key = keys[i]
+      if ($0 ~ "^[[:space:]]*" key "=") {
+        if (!seen[key]++) print key "=" values[key]
+        next
+      }
+    }
+    print
+  }
   END {
     print "TZ=" tz
     if (!have_lang) print "DEFAULT_LANGUAGE=" lang
+    for (i = 1; i <= 5; i++) {
+      key = keys[i]
+      if (!seen[key]) print key "=" values[key]
+    }
   }
 ' .env >"$reconciled"
 chmod 600 "$reconciled"
 mv "$reconciled" .env
 trap - EXIT
 REMOTE_ENV_POLICY_EOF
+  ssh_remote "$DEPLOY_TARGET" "cd '$REMOTE_DIR' && \
+    grep -qx 'CLAUDE_CODE_OAUTH_MAX_CONCURRENCY=5' .env && \
+    grep -qx 'CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS=50' .env && \
+    grep -qx 'CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED=true' .env && \
+    grep -qx 'CODEX_OAUTH_MAX_CONCURRENCY=5' .env && \
+    grep -qx 'CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS=50' .env" \
+    || deploy_die "Remote OAuth runtime policy verification failed in $REMOTE_DIR/.env"
   ssh_remote "$DEPLOY_TARGET" "mkdir '$remote_lock' 2>/dev/null || { find '$remote_lock' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$remote_lock' && mkdir '$remote_lock'; }" \
     || deploy_die "Another $DEPLOY_NAME deployment is active"
 

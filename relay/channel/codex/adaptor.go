@@ -148,14 +148,14 @@ func ensureCodexLiteInclude(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 var (
-	CodexOAuthMaxConcurrency     = 10
-	CodexOAuthMinRequestInterval = 750 * time.Millisecond
+	CodexOAuthMaxConcurrency     = 5
+	CodexOAuthMinRequestInterval = 50 * time.Millisecond
 )
 
 func InitOAuthRuntimeSettings() {
 	CodexOAuthMaxConcurrency, CodexOAuthMinRequestInterval = service.ClampSubscriptionOAuthCapacity(
-		common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 10),
-		time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 750))*time.Millisecond,
+		common.GetEnvOrDefault("CODEX_OAUTH_MAX_CONCURRENCY", 5),
+		time.Duration(common.GetEnvOrDefault("CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS", 50))*time.Millisecond,
 	)
 }
 
