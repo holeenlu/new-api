@@ -211,7 +211,13 @@ var RelayIdleConnTimeout int // unit is second
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 var SubscriptionOAuthResponseHeaderTimeout int // unit is second
-var ChannelManagementRequestTimeout int        // unit is second
+// StreamResponseHeaderTimeout bounds the wait for upstream response HEADERS on
+// ordinary streaming requests (a streaming upstream returns its headers
+// immediately; only a dead or stalled upstream does not). It never bounds the
+// stream body. Non-stream requests are exempt: their headers arrive only after
+// the full generation. 0 disables. Unit is second.
+var StreamResponseHeaderTimeout int
+var ChannelManagementRequestTimeout int // unit is second
 
 const (
 	UpstreamLocationModeStrip  = "strip"

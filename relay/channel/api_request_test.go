@@ -6,14 +6,25 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	common2 "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+// Parallel tests here previously each called gin.SetMode, racing on gin's mode
+// global under -race. Set it once for the package instead.
+func init() {
+	gin.SetMode(gin.TestMode)
+}
 
 type responseHeaderTimeoutError struct{}
 
@@ -103,7 +114,6 @@ func TestSensitiveLocationHeadersAreNeverPassedThrough(t *testing.T) {
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -126,7 +136,6 @@ func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 func TestProcessHeaderOverride_ChannelTestSkipsClientHeaderPlaceholder(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -150,7 +159,6 @@ func TestProcessHeaderOverride_ChannelTestSkipsClientHeaderPlaceholder(t *testin
 func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -173,7 +181,6 @@ func TestProcessHeaderOverride_NonTestKeepsClientHeaderPlaceholder(t *testing.T)
 func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -204,7 +211,6 @@ func TestProcessHeaderOverride_RuntimeOverrideIsFinalHeaderMap(t *testing.T) {
 func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -231,7 +237,6 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 func TestProcessHeaderOverride_PassthroughSkipsClientNetworkHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	ctx.Request.Header.Set("X-Trace-Id", "trace-123")
@@ -258,7 +263,6 @@ func TestProcessHeaderOverride_PassthroughSkipsClientNetworkHeaders(t *testing.T
 func TestProcessHeaderOverride_RejectsExplicitClientNetworkHeader(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
@@ -294,7 +298,6 @@ func TestStripSensitiveClientNetworkHeadersFinalOutboundGuard(t *testing.T) {
 func TestProcessHeaderOverride_ClaudeCodeRejectsProtectedHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 
@@ -315,7 +318,6 @@ func TestProcessHeaderOverride_ClaudeCodeRejectsProtectedHeaders(t *testing.T) {
 func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	ctx.Request.Header.Set("User-Agent", "untrusted-client")
@@ -343,7 +345,6 @@ func TestProcessHeaderOverride_ClaudeCodeWildcardSkipsProtectedHeaders(t *testin
 func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 
@@ -365,7 +366,6 @@ func TestProcessHeaderOverride_CodexRejectsProtectedHeaders(t *testing.T) {
 func TestProcessHeaderOverride_CodexRuntimeHeadersFilterProtectedIdentity(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 
@@ -395,7 +395,6 @@ func TestProcessHeaderOverride_CodexRuntimeHeadersFilterProtectedIdentity(t *tes
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {
 	t.Parallel()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -445,4 +444,104 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.Empty(t, upstreamReq.Header.Get("Originator"))
 	require.Empty(t, upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
+}
+
+// clientCancelAdaptor is the minimal Adaptor surface DoApiRequest touches; the
+// embedded interface panics on anything else, keeping the fixture honest.
+type clientCancelAdaptor struct {
+	Adaptor
+	url string
+}
+
+func (a *clientCancelAdaptor) GetRequestURL(_ *relaycommon.RelayInfo) (string, error) {
+	return a.url, nil
+}
+
+func (a *clientCancelAdaptor) SetupRequestHeader(_ *gin.Context, _ *http.Header, _ *relaycommon.RelayInfo) error {
+	return nil
+}
+
+// A client that disconnects while the upstream is still generating must cancel
+// the in-flight upstream request (billing/concurrency stop) and classify as 499
+// without retry — not block until the upstream finishes on its own schedule.
+func TestDoApiRequestCancelledByClientDisconnect(t *testing.T) {
+	service.InitHttpClient()
+	upstreamStarted := make(chan struct{})
+	upstreamReleased := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(upstreamStarted)
+		// Hold headers until the gateway cancels; a bound context must end this
+		// wait via r.Context, not leave the gateway blocked.
+		select {
+		case <-r.Context().Done():
+		case <-upstreamReleased:
+		}
+	}))
+	defer server.Close()
+	defer close(upstreamReleased)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	defer cancelClient()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`)).WithContext(clientCtx)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:    constant.ChannelTypeOpenAI,
+		ChannelBaseUrl: server.URL,
+	}}
+
+	go func() {
+		<-upstreamStarted
+		cancelClient()
+	}()
+
+	start := time.Now()
+	resp, err := DoApiRequest(&clientCancelAdaptor{url: server.URL}, c, info, strings.NewReader(`{}`))
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 5*time.Second, "client cancellation must propagate to the upstream request")
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, 499, apiErr.StatusCode)
+	require.True(t, types.IsSkipRetryError(apiErr))
+}
+
+// An ordinary (non-subscription) STREAMING request must not wait forever for
+// upstream response headers: with RELAY_TIMEOUT defaulting to 0, the dedicated
+// stream header timeout is the only bound on a connected-but-silent upstream.
+func TestDoApiRequestStreamHeaderTimeoutBoundsSilentUpstream(t *testing.T) {
+	service.InitHttpClient()
+	previous := common2.StreamResponseHeaderTimeout
+	common2.StreamResponseHeaderTimeout = 1
+	t.Cleanup(func() { common2.StreamResponseHeaderTimeout = previous })
+
+	released := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-released:
+		}
+	}))
+	defer server.Close()
+	defer close(released)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:    constant.ChannelTypeOpenAI,
+			ChannelBaseUrl: server.URL,
+		},
+		RelayMode:   relayconstant.RelayModeResponses,
+		IsStream:    true,
+		DisablePing: true,
+	}
+
+	start := time.Now()
+	resp, err := DoApiRequest(&clientCancelAdaptor{url: server.URL}, c, info, strings.NewReader(`{}`))
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 5*time.Second)
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
 }

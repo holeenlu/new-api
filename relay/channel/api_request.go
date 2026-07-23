@@ -655,6 +655,22 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		if err != nil {
 			return nil, fmt.Errorf("new response header timeout client failed: %w", err)
 		}
+	} else if info.IsStream && info.RelayMode == constant.RelayModeResponses &&
+		common2.StreamResponseHeaderTimeout > 0 {
+		// Scoped to streaming Responses requests — the hardening target with
+		// production evidence. Some chat upstreams delay response headers until the
+		// first token (long prefill can exceed any fixed bound), so widening this
+		// to every streaming relay mode needs per-protocol evaluation and an ADR
+		// first. A streaming Responses upstream returns headers immediately; only
+		// a dead or stalled one does not, and with RELAY_TIMEOUT defaulting to 0
+		// such a request would otherwise wait forever. Never bounds the body.
+		client, err = service.GetHttpClientWithResponseHeaderTimeout(
+			info.ChannelSetting.Proxy,
+			time.Duration(common2.StreamResponseHeaderTimeout)*time.Second,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("new stream response header timeout client failed: %w", err)
+		}
 	} else if info.ChannelSetting.Proxy != "" {
 		client, err = service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 		if err != nil {

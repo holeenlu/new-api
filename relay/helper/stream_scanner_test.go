@@ -614,3 +614,68 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
 }
+
+// commentOnlyReader emits SSE comment lines forever with a small delay — an
+// upstream that keeps the line alive but never produces a data event.
+type commentOnlyReader struct {
+	interval time.Duration
+}
+
+func (r *commentOnlyReader) Read(p []byte) (int, error) {
+	time.Sleep(r.interval)
+	return copy(p, []byte(": keepalive\n")), nil
+}
+
+// A keepalive-only stream must not extend the request forever: comments refresh
+// the per-line idle window, but the longer valid-data window (2x) still expires
+// when no data event ever arrives.
+func TestStreamScannerHandler_CommentOnlyStreamEndsAtValidDataTimeout(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+
+	c, resp, info := setupStreamTest(t, nil)
+	resp.Body = io.NopCloser(&commentOnlyReader{interval: 100 * time.Millisecond})
+	info.DisablePing = true
+
+	start := time.Now()
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	elapsed := time.Since(start)
+
+	require.GreaterOrEqual(t, elapsed, 1500*time.Millisecond, "must outlive the per-line idle window (comments are legitimate keepalive)")
+	require.Less(t, elapsed, 8*time.Second, "keepalive-only stream must end at the valid-data window")
+	require.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	require.ErrorContains(t, info.StreamStatus.EndError, "keepalive-only")
+}
+
+// Comment keepalive followed by late real data is the legitimate deep-reasoning
+// pattern: the per-line refresh must carry the stream across a data gap longer
+// than STREAMING_TIMEOUT without killing it.
+func TestStreamScannerHandler_CommentKeepaliveBridgesLongDataGap(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+
+	reader, writer := io.Pipe()
+	go func() {
+		defer writer.Close()
+		// 1.5s of comment-only keepalive: longer than STREAMING_TIMEOUT (1s),
+		// shorter than the valid-data window (2s).
+		for i := 0; i < 5; i++ {
+			time.Sleep(300 * time.Millisecond)
+			_, _ = writer.Write([]byte(": processing\n"))
+		}
+		_, _ = writer.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n"))
+		_, _ = writer.Write([]byte("data: [DONE]\n"))
+	}()
+
+	c, resp, info := setupStreamTest(t, nil)
+	resp.Body = io.NopCloser(reader)
+	info.DisablePing = true
+
+	received := 0
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) { received++ })
+
+	require.Equal(t, 1, received, "the late data event must be delivered")
+	require.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+}

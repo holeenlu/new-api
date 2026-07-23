@@ -98,6 +98,18 @@ feature description.
    design must define atomic state transitions for both ledger legs, tolerate
    worker retries, and preserve the current no-refund-after-settlement rule in an
    ADR before claiming crash-safe or exactly-once refunds.
+6. Move the Responses event-classification predicates into a transport-neutral
+   Responses protocol module. Today `IsConnectionScopedEventType` lives in
+   `relay/responsesws` (HTTP semantics owned by the WS package) and the
+   terminal-event lists are still duplicated across the WS session, the native
+   HTTP stream handler, and the Responses→Chat conversion handlers. The target
+   is one classifier returning metadata / turn event / clean terminal / failure
+   terminal / invalid, consumed by all transports (ADR 0007).
+7. Convert the stream-scanner dual idle-bound tests
+   (`relay/helper/stream_scanner_test.go`, comment-only and comment-bridged
+   cases) from wall-clock sleeps to an injectable clock. The behavior they lock
+   is real, but the current form conflicts with the no-sleep test guideline and
+   costs ~3.5s per run.
 
 ## Change review protocol
 

@@ -178,3 +178,145 @@ func requireOrderedSubstrings(t *testing.T, s string, parts ...string) {
 		offset += idx + len(part)
 	}
 }
+
+// A truncated upstream stream (EOF before any terminal event) must fail the
+// buffered conversion instead of fabricating a "completed" chat response that
+// hides the upstream failure and settles billing on partial output.
+func TestOaiResponsesToChatBufferedStreamHandlerFailsWithoutTerminal(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		``, // upstream dies here: no terminal, no [DONE]
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, false)
+
+	usage, err := OaiResponsesToChatBufferedStreamHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadGateway, err.StatusCode)
+	require.NotContains(t, recorder.Body.String(), `"chat.completion"`)
+}
+
+// A top-level `{"type":"error"}` event is a terminal failure for the buffered
+// conversion, carrying the upstream's classification.
+func TestOaiResponsesToChatBufferedStreamHandlerTreatsTopLevelErrorAsFailure(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	body := strings.Join([]string{
+		`data: {"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, _, resp, info := newResponsesChatTestContext(t, body, false)
+
+	usage, err := OaiResponsesToChatBufferedStreamHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.Error(t, err)
+	require.Equal(t, http.StatusTooManyRequests, err.StatusCode)
+	require.Contains(t, err.Error(), "slow down")
+}
+
+// A truncated upstream stream must not end with a fabricated normal chat
+// termination: no finalize chunk, no [DONE]; an in-stream error chunk tells the
+// OpenAI-format client the turn failed.
+func TestOaiResponsesToChatStreamHandlerFailsWithoutTerminal(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		``, // upstream dies here: no terminal, no [DONE]
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err) // committed stream: failure is recorded, usage settles on received output
+	require.NotNil(t, usage)
+
+	got := recorder.Body.String()
+	require.NotContains(t, got, `data: [DONE]`)
+	require.Contains(t, got, `"error"`)
+	require.Contains(t, got, "before a terminal event")
+	require.NotNil(t, info.CommittedUpstreamError())
+}
+
+// A top-level `{"type":"error"}` after the stream has committed must surface as
+// the protocol's in-stream error chunk and suppress the normal termination —
+// not as a JSON error appended to a live SSE stream.
+func TestOaiResponsesToChatStreamHandlerTreatsTopLevelErrorAsFailure(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		`data: {"type":"error","error":{"type":"server_error","code":"internal_error","message":"upstream exploded"}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	// Committed stream: the failure is surfaced in-stream and recorded; usage
+	// settles on received output.
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	require.NotNil(t, info.CommittedUpstreamError())
+
+	got := recorder.Body.String()
+	require.NotContains(t, got, `data: [DONE]`)
+	require.Contains(t, got, `"error"`)
+	require.Contains(t, got, "upstream exploded")
+}
+
+// A committed Claude-format conversion must terminate a truncated stream with
+// the Claude protocol's `event: error`, not a bare truncation.
+func TestOaiResponsesToChatStreamHandlerEmitsClaudeErrorEvent(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		``, // truncated: no terminal
+	}, "\n")
+
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	require.NotNil(t, info.CommittedUpstreamError())
+
+	got := recorder.Body.String()
+	require.Contains(t, got, "event: error")
+	require.Contains(t, got, `"type":"error"`)
+	require.Contains(t, got, "before a terminal event")
+}

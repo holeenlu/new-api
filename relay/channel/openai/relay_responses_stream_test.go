@@ -656,3 +656,143 @@ func TestOaiResponsesStreamNormalizesFailedResponseDoneBeforeAccounting(t *testi
 	require.Contains(t, recorder.Body.String(), `"type":"response.failed"`)
 	require.NotContains(t, recorder.Body.String(), `"type":"response.done"`)
 }
+
+// codex.rate_limits arrives FIRST on every Codex turn (production evidence from
+// the WebSocket protocol logs). It is connection-scoped metadata, not semantic
+// output, so it must NOT commit the preflight: an explicit capacity failure
+// right after it must still fail over to a backup credential with nothing
+// leaked downstream.
+func TestCodexResponsesStreamMetadataDoesNotCommitPreflight(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"codex.rate_limits","rate_limits":{"primary_used_percent":12}}`,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","code":"model_at_capacity","message":"Selected model is at capacity."}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeModelAtCapacity, apiError.GetErrorCode())
+	require.Empty(t, recorder.Body.String(), "metadata must not commit the downstream before failover")
+	require.Empty(t, recorder.Header().Get("X-Codex-Turn-State"))
+}
+
+// Buffered connection metadata is replayed to the client once real output
+// commits the preflight — buffering must not drop it.
+func TestCodexResponsesStreamReplaysBufferedMetadataAfterCommit(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"type":"codex.rate_limits","rate_limits":{"primary_used_percent":12}}`,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.output_text.delta","delta":"hi"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.NotNil(t, usage)
+	require.Equal(t, 3, usage.TotalTokens)
+	got := recorder.Body.String()
+	require.Contains(t, got, "codex.rate_limits")
+	require.Contains(t, got, "response.completed")
+}
+
+// A typeless stream event cannot be classified; before anything is committed it
+// fails the preflight so the relay can fail over safely.
+func TestCodexResponsesStreamTypelessEventFailsPreflight(t *testing.T) {
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		`data: {"foo":"bar"}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadGateway, apiError.GetUpstreamStatusCode())
+	require.Empty(t, recorder.Body.String())
+}
+
+// fillReader yields n bytes of filler — an oversized upstream body without
+// allocating the payload up front.
+type fillReader struct{ remaining int }
+
+func (r *fillReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'a'
+	}
+	r.remaining -= n
+	return n, nil
+}
+
+// An oversized non-stream "success" body must fail bounded instead of being
+// buffered into gateway memory without limit.
+func TestOaiResponsesHandlerRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(&fillReader{remaining: maxResponsesBodyBytes + 1}),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+	require.Contains(t, apiError.Error(), "exceeds")
+}
+
+// A 200 body with no identity, status, or output (e.g. `{}`) is not a Responses
+// result: forwarding it would fake success on zero usage.
+func TestOaiResponsesHandlerRejectsEmptySuccessObject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+	}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}}
+
+	usage, apiError := OaiResponsesHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, http.StatusBadGateway, apiError.StatusCode)
+	require.Empty(t, recorder.Body.String())
+}
+
+// When buffered metadata overflows the preflight limit, the commit replays the
+// buffer (the overflowing event included); the handler must not send that event
+// a second time through the common post-commit path.
+func TestCodexResponsesStreamOversizedMetadataCommitDoesNotDuplicate(t *testing.T) {
+	oversized := `{"type":"codex.rate_limits","filler":"` + strings.Repeat("x", maxResponsesStreamPreflightBytes) + `"}`
+	c, recorder, resp, info := newCodexResponsesStreamTest(t,
+		"data: "+oversized,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+		`data: [DONE]`,
+	)
+
+	usage, apiError := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiError)
+	require.NotNil(t, usage)
+	// One SSE emission produces "codex.rate_limits" twice (event: line + data
+	// type field), so count the payload-only filler marker instead.
+	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"filler"`))
+}

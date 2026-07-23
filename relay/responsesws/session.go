@@ -997,6 +997,20 @@ func (s *Session) deliverToTurn(conn *websocket.Conn, msg upstreamMessage) (bool
 	}
 }
 
+// IsConnectionScopedEventType reports whether a Responses event type names a
+// connection-scoped extension (e.g. codex.rate_limits) rather than a
+// turn-scoped response.* / top-level error event. Shared by the WebSocket
+// reader's event classification and the HTTP stream preflight so the two paths
+// cannot drift: the prefix rule deliberately avoids a fixed metadata whitelist
+// that would break when the upstream adds an extension event.
+func IsConnectionScopedEventType(eventType string) bool {
+	eventType = strings.TrimSpace(eventType)
+	if eventType == "" || eventType == "error" {
+		return false
+	}
+	return !strings.HasPrefix(eventType, "response.")
+}
+
 func classifyUpstreamEvent(payload []byte) (string, upstreamEventClass, bool) {
 	var event struct {
 		Type string `json:"type"`
@@ -1011,10 +1025,7 @@ func classifyUpstreamEvent(payload []byte) (string, upstreamEventClass, bool) {
 	if eventType == "error" {
 		return eventType, upstreamTurnEvent, true
 	}
-	if !strings.HasPrefix(eventType, "response.") {
-		// The Responses protocol may add connection-scoped extension events over
-		// time. Treat any valid, typed non-response event as connection metadata
-		// instead of maintaining a whitelist that would break on protocol growth.
+	if IsConnectionScopedEventType(eventType) {
 		return eventType, upstreamConnectionMetadata, false
 	}
 	switch eventType {

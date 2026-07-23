@@ -111,16 +111,24 @@ func streamScannerHandler(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	// Two idle bounds: `ticker` is refreshed by ANY upstream line — comments
+	// included, they are legitimate SSE keepalive (": OPENROUTER PROCESSING",
+	// deep-reasoning models can stay comment-only for minutes) — while
+	// `validDataTicker` is refreshed only by accepted data events. An upstream
+	// that emits nothing but comments can therefore extend the stream to at most
+	// validDataTimeout, instead of holding the request open forever.
+	validDataTimeout := 2 * streamingTimeout
 
 	var (
-		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner     = NewStreamScanner(resp.Body)
-		ticker      = time.NewTicker(streamingTimeout)
-		pingTicker  *time.Ticker
-		writeMutex  sync.Mutex     // Mutex to protect concurrent writes
-		wg          sync.WaitGroup // 用于等待所有 goroutine 退出
-		cleanupOnce sync.Once
-		stopOnce    sync.Once
+		stopChan        = make(chan bool, 3) // 增加缓冲区避免阻塞
+		scanner         = NewStreamScanner(resp.Body)
+		ticker          = time.NewTicker(streamingTimeout)
+		validDataTicker = time.NewTicker(validDataTimeout)
+		pingTicker      *time.Ticker
+		writeMutex      sync.Mutex     // Mutex to protect concurrent writes
+		wg              sync.WaitGroup // 用于等待所有 goroutine 退出
+		cleanupOnce     sync.Once
+		stopOnce        sync.Once
 	)
 
 	stop := func() {
@@ -155,6 +163,7 @@ func streamScannerHandler(
 			}
 
 			ticker.Stop()
+			validDataTicker.Stop()
 			if pingTicker != nil {
 				pingTicker.Stop()
 			}
@@ -323,6 +332,7 @@ func streamScannerHandler(
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
+				validDataTicker.Reset(validDataTimeout)
 
 				select {
 				case dataChan <- data:
@@ -351,6 +361,11 @@ func streamScannerHandler(
 	select {
 	case <-ticker.C:
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+	case <-validDataTicker.C:
+		// The upstream kept the line alive (comments/keepalive) but produced no
+		// accepted data event for the whole valid-data window.
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout,
+			fmt.Errorf("upstream produced no data event within %s (keepalive-only stream)", validDataTimeout))
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan
 	case <-c.Request.Context().Done():

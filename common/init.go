@@ -113,6 +113,7 @@ func InitEnv() {
 	RelayMaxIdleConns = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS", 500)
 	RelayMaxIdleConnsPerHost = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS_PER_HOST", 100)
 	SubscriptionOAuthResponseHeaderTimeout = GetEnvOrDefault("SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT", 30)
+	StreamResponseHeaderTimeout = GetEnvOrDefault("STREAM_RESPONSE_HEADER_TIMEOUT", 60)
 	ChannelManagementRequestTimeout = GetEnvOrDefault("CHANNEL_MANAGEMENT_REQUEST_TIMEOUT", 30)
 	if ChannelManagementRequestTimeout < 1 {
 		ChannelManagementRequestTimeout = 30

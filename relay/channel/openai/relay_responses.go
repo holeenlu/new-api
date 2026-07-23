@@ -23,23 +23,61 @@ import (
 
 const maxResponsesStreamPreflightBytes = 64 << 10
 
+// maxResponsesBodyBytes bounds a non-stream Responses body read into memory.
+// Larger than the WebSocket per-event bound (16 MiB) because a complete
+// response can carry multiple base64 image outputs; a body above this is
+// treated as an upstream fault rather than allowed to exhaust gateway memory.
+const maxResponsesBodyBytes = 64 << 20
+
 const responsesStreamPreflightTimeout = 30 * time.Second
+
+// readBoundedResponsesBody reads a non-stream upstream body under
+// maxResponsesBodyBytes, failing with 502 instead of buffering without bound.
+func readBoundedResponsesBody(body io.Reader) ([]byte, *types.NewAPIError) {
+	data, err := io.ReadAll(io.LimitReader(body, maxResponsesBodyBytes+1))
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	}
+	if len(data) > maxResponsesBodyBytes {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream response exceeds %d MB", maxResponsesBodyBytes>>20),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
+	}
+	return data, nil
+}
+
+// responsesBodyMissingResult reports a "success" body with no status, output,
+// or usage — not a usable Responses result regardless of id; forwarding it
+// would fake success on zero usage. A body carrying usage settles billing and
+// is left to the client even when otherwise sparse.
+func responsesBodyMissingResult(r *dto.OpenAIResponsesResponse) bool {
+	return r == nil || (len(r.Status) == 0 && len(r.Output) == 0 && r.Usage == nil)
+}
 
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
 	// read response body
 	var responsesResponse dto.OpenAIResponsesResponse
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	responseBody, apiErr := readBoundedResponsesBody(resp.Body)
+	if apiErr != nil {
+		return nil, apiErr
 	}
-	err = common.Unmarshal(responseBody, &responsesResponse)
+	err := common.Unmarshal(responseBody, &responsesResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, responsesWrappedError(info, resp, responseBody, oaiError)
+	}
+	if responsesBodyMissingResult(&responsesResponse) {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream returned a Responses body without status or output"),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
 	}
 
 	if responsesResponse.HasImageGenerationCall() {
@@ -231,6 +269,29 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					sr.Done()
 				}
 				return
+			default:
+				if strings.TrimSpace(streamResponse.Type) == "" {
+					// A typeless event cannot be classified; nothing is committed yet, so
+					// fail the preflight and let the relay fail over safely.
+					stopProtocolFailure(fmt.Errorf("Responses stream event has no type"), sr)
+					return
+				}
+				if responsesws.IsConnectionScopedEventType(streamResponse.Type) {
+					// Connection-scoped extensions (codex.rate_limits arrives FIRST on
+					// every Codex turn) are not semantic output: buffer them without
+					// committing, or an explicit capacity failure right after them could
+					// no longer fail over to a backup credential.
+					pendingEvents = append(pendingEvents, pendingStreamEvent{response: streamResponse, data: data})
+					pendingBytes += len(data)
+					if pendingBytes <= maxResponsesStreamPreflightBytes {
+						return
+					}
+					// Oversized buffer: commit replays every pending event, THIS one
+					// included — return so the common send below does not duplicate it.
+					commitPreflight()
+					return
+				}
+				// Any other response.* event is real output: commit and stream on.
 			}
 			commitPreflight()
 		}

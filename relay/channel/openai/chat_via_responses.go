@@ -3,12 +3,12 @@ package openai
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -28,9 +28,9 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var responsesResp dto.OpenAIResponsesResponse
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	body, apiErr := readBoundedResponsesBody(resp.Body)
+	if apiErr != nil {
+		return nil, apiErr
 	}
 
 	if err := common.Unmarshal(body, &responsesResp); err != nil {
@@ -39,6 +39,13 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	}
+	if responsesBodyMissingResult(&responsesResp) {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream returned a Responses body without status or output"),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
 	}
 
 	chatResult, err := relayconvert.ConvertResponse(c, info, types.RelayFormatOpenAI, &responsesResp)
@@ -87,9 +94,23 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	var finalResponse *dto.OpenAIResponsesResponse
 	var streamErr *types.NewAPIError
 
+	// This loop reads the upstream directly (no shared scanner), so it needs its
+	// own idle guard: any line (comments included, they are legitimate SSE
+	// keepalive) refreshes the idle window, and only valid data events refresh
+	// the longer valid-data window — an upstream emitting nothing but comments
+	// cannot hold the request open forever. Client cancellation propagates via
+	// the request context bound in DoApiRequest.
+	idleTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	validDataTimeout := 2 * idleTimeout
+	idleWatchdog := time.AfterFunc(idleTimeout, func() { _ = resp.Body.Close() })
+	defer idleWatchdog.Stop()
+	validWatchdog := time.AfterFunc(validDataTimeout, func() { _ = resp.Body.Close() })
+	defer validWatchdog.Stop()
+
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {
+		idleWatchdog.Reset(idleTimeout)
 		line := scanner.Text()
 		if len(line) < 6 || line[:5] != "data:" {
 			continue
@@ -102,6 +123,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 			}
 			continue
 		}
+		validWatchdog.Reset(validDataTimeout)
 
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
@@ -121,14 +143,14 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 					finalResponse.Status = []byte(`"incomplete"`)
 				}
 			}
-		case "response.failed", "response.error":
-			if streamResp.Response != nil {
-				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
-					break
-				}
+		case "response.failed", "response.error", "error":
+			// Top-level `error` is a terminal failure too; GetOpenAIError covers
+			// both the top-level error field and response.error.
+			if oaiErr := streamResp.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
+				streamErr = types.WithOpenAIError(*oaiErr, responsesStreamErrorStatus(data, oaiErr))
+			} else {
+				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusBadGateway)
 			}
-			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 		}
 		if streamErr != nil || finalResponse != nil {
 			break
@@ -141,12 +163,15 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	if finalResponse == nil {
-		finalResponse = &dto.OpenAIResponsesResponse{
-			ID:        helper.GetResponseID(c),
-			CreatedAt: int(time.Now().Unix()),
-			Model:     info.UpstreamModelName,
-			Status:    []byte(`"completed"`),
-		}
+		// The upstream ended (EOF / [DONE] / idle guard) without a terminal event.
+		// Nothing has been written downstream yet, so fail the request instead of
+		// fabricating a "completed" response that would hide the upstream failure
+		// and settle billing on truncated output.
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream Responses stream ended before a terminal event"),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
 	}
 	accumulator.SupplementResponseOutput(finalResponse)
 
@@ -267,6 +292,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 	}
 
+	sawTerminal := false
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if streamErr != nil {
 			sr.Stop(streamErr)
@@ -280,15 +306,21 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
-		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
-			if streamResp.Response != nil {
-				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
-					sr.Stop(streamErr)
-					return
-				}
+		switch streamResp.Type {
+		case "response.completed", "response.done", "response.incomplete":
+			sawTerminal = true
+		case "response.error", "response.failed", "error":
+			// Top-level `error` is terminal too; GetOpenAIError covers both the
+			// top-level error field and response.error.
+			sawTerminal = true
+			if oaiErr := streamResp.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
+				streamErr = types.WithOpenAIError(*oaiErr, responsesStreamErrorStatus(data, oaiErr))
+			} else {
+				streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusBadGateway)
 			}
-			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			// Preserve the upstream's cooldown signal alongside the status code so
+			// credential recovery does not degrade to a default window.
+			streamErr.RetryAfter = service.ParseUpstreamRetryDelay(resp.Header, []byte(data), time.Now())
 			sr.Stop(streamErr)
 			return
 		}
@@ -307,14 +339,77 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 	})
 
-	if streamErr != nil {
-		return nil, streamErr
-	}
-
 	usage := state.Usage()
 	if usage == nil || usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
+	}
+
+	// emitConvertedStreamFailure surfaces a committed-stream failure in the
+	// terminal shape the TARGET protocol defines: OpenAI clients get the
+	// `data: {"error":...}` chunk the official API uses mid-stream, Claude
+	// clients get the protocol's `event: error`. Formats without a standard
+	// in-stream error shape (e.g. Gemini) end truncated — the missing normal
+	// termination is itself the failure signal.
+	emitConvertedStreamFailure := func(apiErr *types.NewAPIError) {
+		openaiErr := apiErr.ToOpenAIError()
+		switch info.RelayFormat {
+		case types.RelayFormatOpenAI:
+			if payload, marshalErr := common.Marshal(gin.H{"error": openaiErr}); marshalErr == nil {
+				c.Render(-1, common.CustomEvent{Data: "data: " + string(payload)})
+				_ = helper.FlushWriter(c)
+			}
+		case types.RelayFormatClaude:
+			claudeErrorType := openaiErr.Type
+			if strings.TrimSpace(claudeErrorType) == "" {
+				claudeErrorType = "api_error"
+			}
+			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: gin.H{
+				"type":    claudeErrorType,
+				"message": openaiErr.Message,
+			}})
+		}
+	}
+
+	if streamErr != nil {
+		if !c.Writer.Written() {
+			// Nothing reached the client: fail through the normal error path (the
+			// written-request guard still governs whether the relay may retry).
+			return nil, streamErr
+		}
+		// Committed stream: appending a plain JSON error to a live SSE stream is
+		// not a legal event, so emit the protocol terminal failure instead, record
+		// the error for billing/health, and settle usage on received output.
+		info.MarkCommittedUpstreamError(streamErr)
+		emitConvertedStreamFailure(streamErr)
+		return usage, nil
+	}
+
+	if !sawTerminal && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason != relaycommon.StreamEndReasonClientGone {
+		// The upstream stream ended (EOF / timeout / scanner error) without a
+		// terminal Responses event. Do not fabricate a normal chat ending
+		// (finalize + [DONE]) over a truncated turn.
+		endErr := info.StreamStatus.EndError
+		if endErr == nil {
+			endErr = fmt.Errorf("upstream Responses stream ended with reason %q before a terminal event", info.StreamStatus.EndReason)
+		} else {
+			endErr = fmt.Errorf("upstream Responses stream ended before a terminal event: %w", endErr)
+		}
+		candidate := types.NewErrorWithStatusCode(endErr, types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+		candidate.UpstreamStatusCode = http.StatusBadGateway
+		candidate = service.ApplyChannelErrorPolicy(info.ChannelType, candidate)
+		if !c.Writer.Written() {
+			// Nothing reached the client yet: fail the request through the normal
+			// error path (retry-eligible for ordinary channels).
+			return nil, candidate
+		}
+		// Committed: record the failure, surface the protocol terminal failure,
+		// and end without a normal termination so no client mistakes the
+		// truncation for success. Usage settles on what was received.
+		info.MarkCommittedUpstreamError(candidate)
+		emitConvertedStreamFailure(candidate)
+		return usage, nil
 	}
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil {

@@ -1,7 +1,7 @@
 package openai
 
 import (
-	"io"
+	"fmt"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,9 +16,9 @@ import (
 func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+	responseBody, apiErr := readBoundedResponsesBody(resp.Body)
+	if apiErr != nil {
+		return nil, apiErr
 	}
 
 	var compactResp dto.OpenAIResponsesCompactionResponse
@@ -27,6 +27,15 @@ func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, 
 	}
 	if oaiError := compactResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, responsesWrappedError(info, resp, responseBody, oaiError)
+	}
+	if len(compactResp.Output) == 0 && compactResp.Usage == nil {
+		// A "success" body with neither output nor usage (e.g. `{}`) is not a
+		// compaction result; forwarding it would fake success on zero usage.
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("upstream returned a compaction body without output or usage"),
+			types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway,
+		)
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
