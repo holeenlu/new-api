@@ -181,8 +181,9 @@ GET /v1/responses  (WebSocket Upgrade)
   `prompt_cache_retention` 以及客户端 session/thread/turn/device/client metadata；客户端
   `id` 会替换为网关随机 ID，并作为该请求的 `X-Session-ID` 使用。客户端提供的会话 Header
   和 `X-OpenAI-Actor-Authorization` 均不会转发；
-- Responses WebSocket 会话固定同一 OAuth 渠道和模型，使用上游
-  `responses_websockets=2026-02-06` 协议；
+- Responses WebSocket 会话按连接代际固定同一 OAuth 渠道和凭证，使用上游
+  `responses_websockets=2026-02-06` 协议；自包含 turn 可切换模型并建立新连接，
+  continuation 仍固定到生成其 `previous_response_id` 的原连接和模型；
 - `/v1/models?client_version=...` 返回 Codex 客户端兼容目录，并仅为实际由 Codex
   渠道承载的模型声明 `prefer_websockets: true` 和搜索能力；各启用 OAuth 凭证从上游模型
   目录取得 context window，按渠道和可路由分组取共同最小值。Gemini 和 OpenAI 兼容上游目录若
@@ -199,8 +200,16 @@ GET /v1/responses  (WebSocket Upgrade)
   时自动回退 HTTP/SSE，不会因上游暂未开放 WebSocket 而中断请求。
 - 自包含 turn 的上游连接空闲超过 30 秒时，会在写入 `response.create` 前主动重连；
   带 `previous_response_id` 的 continuation 始终保留原连接，不能迁移到替代连接。
-  复用连接的首事件等待限制为 30 秒，超时后不重放已写入的请求，避免重复执行或重复扣费。
-  临时协议诊断只记录握手、事件类型、事件间隔、Ping/Pong 结果、终止状态及错误帧写回结果，
+  每条上游连接由唯一常驻 reader 处理业务帧和控制帧，空闲期仍会回复上游 Ping；terminal
+  写回完成前不会预读下一 turn；空闲期的 `response.*`/`error` 仍按 turn 事件失败关闭，
+  其他合法非空类型作为连接扩展仅记录类型和连接代际后丢弃，不使用容易过期的固定白名单。
+  continuation 最近活动超过 30 秒时，会在写入前使用一次带唯一关联值的 Ping/Pong 做 3 秒
+  存活确认；失败时关闭原连接并快速失败，
+  不写入、不迁移、不重放。被动保活依赖当前观测到的上游约 20 秒 Ping 周期；即使该行为变化，
+  写前探测仍保证不会向未经确认的连接写 continuation。连接在 55 分钟主动回收，早于上游
+  60 分钟硬上限；并发空闲连接数作为生产观察项，只有数据证明需要时才增加统一 LRU/总量上限。
+  首个 turn 业务事件等待限制为 30 秒，连接元数据不会延长该期限；超时后不重放已写入的请求，
+  避免重复执行或重复扣费。临时协议诊断只记录握手、事件类型、事件间隔、终止状态及错误帧写回结果，
   不记录请求正文、响应正文、SSE 内容或 WebSocket 控制帧载荷；生产行为确认后移除该诊断。
 - WebSocket 帧和转换后的请求体统一使用 `MAX_REQUEST_BODY_MB` 限制，默认 `128 MB`，
   不再单独使用固定的 `16 MB` 限制；超限返回 `413 Request Entity Too Large`，并标记为

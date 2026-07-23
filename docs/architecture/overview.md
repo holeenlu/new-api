@@ -50,10 +50,16 @@ client -> middleware -> controller -> relay/service -> channel adaptor -> upstre
   of id payload. Entry eviction fails closed; a per-id or cumulative-byte
   violation invalidates the socket and clears the registry. A continuation must
   match that set, so a replacement socket cannot inherit an old id.
-  Its mutex protects connection and affinity
-  state transitions but is released when the response body is returned. Early
-  body close or an ambiguous/truncated stream invalidates the connection before
-  another reader can start.
+  One connection-generation reader owns every upstream `ReadMessage`, including
+  idle control frames and connection metadata. A terminal event waits for its
+  consumer acknowledgement before the reader crosses the turn boundary;
+  non-`response.*` typed connection extensions are consumed without entering
+  the next turn, while malformed or turn-scoped idle frames fail closed. Any
+  reader error atomically invalidates that generation and its response ids before
+  notifying the active turn. Its mutex protects connection
+  and affinity state transitions but is released when the response body is
+  returned. Early body close or an ambiguous/truncated stream invalidates the
+  connection before another turn can reuse it.
 - The normal Relay lifecycle owns each turn's retry and billing state; no billing
   or retry ledger persists in the WebSocket session. A subscription-OAuth lease
   remains per-turn, while an ordinary API-key driver has no lease. The controller
@@ -73,6 +79,16 @@ fallback. Only the existing replay-safe retry boundary may call
 `ResetChannelForRetry`, discard the entire binding plus its response ids, and let
 the newly selected credential establish a fresh WebSocket; a written request or
 continuation can never use that escape hatch.
+
+The connection generation has an active 55-minute lifetime timer. A
+continuation with no upstream activity in the preceding 30 seconds must complete
+one nonce-correlated ping/pong round trip within 3 seconds before its application
+frame is written. Probe failure closes the owning generation; it never authorizes
+a reconnect, HTTP fallback, or credential switch for that continuation. Passive
+idle keepalive relies on the observed upstream ping cadence; the probe preserves
+write-before-liveness correctness if that cadence changes. Concurrent idle
+connections remain an operational metric, with an LRU/global cap deferred until
+production data demonstrates a need.
 
 ### Responses compact billing
 

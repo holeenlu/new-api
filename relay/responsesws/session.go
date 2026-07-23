@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -50,6 +51,14 @@ const (
 // timeout fails without replaying it over HTTP. It is a var so tests can shorten
 // it.
 var FirstEventTimeout = 30 * time.Second
+
+// ContinuationLivenessFreshness is the maximum age of observed upstream
+// activity that lets a continuation write without an extra round trip. Older
+// connections are ping-probed before response.create is written. Both vars are
+// mutable so protocol tests can shorten the bounds.
+var ContinuationLivenessFreshness = 30 * time.Second
+
+var ContinuationProbeTimeout = 3 * time.Second
 
 // MaxConnectionLifetime bounds how long one upstream connection is reused before
 // it is proactively recycled. OpenAI caps a Responses WebSocket connection at 60
@@ -118,7 +127,38 @@ type Session struct {
 	pendingKeyIndex       int
 	pendingFingerprint    string
 	pendingModel          string
+
+	// Connection-reader state. The permanent per-connection reader owns
+	// every ReadMessage; a turn registers turnEvents/turnDone to consume business
+	// frames and clears them when its stream ends. connStop and lifetime are owned
+	// by the same connection generation.
+	turnEvents chan upstreamMessage
+	turnDone   chan struct{}
+	connStop   chan struct{}
+	lifetime   *time.Timer
+	generation uint64
+
+	lastActivity  *atomic.Int64
+	probeMu       sync.Mutex
+	probeNonce    string
+	probeAck      chan struct{}
+	probeSequence uint64
 }
+
+// upstreamMessage is one business frame — or the terminating read error —
+// delivered by the connection's sole reader to the active turn's consumer.
+type upstreamMessage struct {
+	payload []byte
+	err     error
+	class   upstreamEventClass
+}
+
+type upstreamEventClass uint8
+
+const (
+	upstreamTurnEvent upstreamEventClass = iota
+	upstreamConnectionMetadata
+)
 
 // CredentialBinding identifies the credential that authenticated the upstream
 // connection. A persistent Responses connection is credential-local, so the
@@ -198,6 +238,15 @@ func (s *Session) Close() error {
 		err = s.conn.Close()
 		s.conn = nil
 	}
+	if s.connStop != nil {
+		close(s.connStop)
+		s.connStop = nil
+	}
+	if s.lifetime != nil {
+		s.lifetime.Stop()
+		s.lifetime = nil
+	}
+	s.lastActivity = nil
 	s.connectedAt = time.Time{}
 	s.resetResponseIDsLocked()
 	// Per-turn leases are released by the turn's response body (or its failure
@@ -455,7 +504,14 @@ func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	if continuation {
 		_, ownedByCurrentConnection := s.responseIDs[previousResponseID]
 		if s.conn != nil && !s.httpFallback && ownedByCurrentConnection {
-			// The exact response id was emitted by this connection generation.
+			// The exact response id was emitted by this connection generation. When
+			// recent upstream activity is stale, prove the same socket is still live
+			// before writing the connection-local continuation frame.
+			if err := s.probeContinuationLocked(c, s.conn); err != nil {
+				logger.LogWarn(c, "responses websocket continuation liveness probe failed: "+err.Error())
+				s.invalidateLocked(s.conn)
+				return nil, NewContinuationUnavailableError()
+			}
 		} else {
 			// previous_response_id identifies state owned by the live upstream
 			// WebSocket. It is unsafe to establish a replacement connection or send the
@@ -514,12 +570,29 @@ func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 		}
 		justConnected = true
 	}
+	// Register this turn as the reader's consumer BEFORE writing the request:
+	// the response can start arriving the moment the frame is on the wire, and an
+	// unregistered business frame would be treated as an idle-period protocol
+	// violation. First-event and idle timeouts are enforced on the consumer side
+	// (never as read deadlines).
+	turnEvents := make(chan upstreamMessage, 4)
+	turnDone := make(chan struct{})
+	s.turnEvents = turnEvents
+	s.turnDone = turnDone
+	clearTurn := func() {
+		if s.turnEvents == turnEvents {
+			s.turnEvents = nil
+			s.turnDone = nil
+		}
+		close(turnDone)
+	}
 	// A WebSocket write error is ambiguous: the peer may have received the full
 	// application frame even when the local write reports failure. Mark the
 	// attempt before writing and never reconnect or fall back after this point.
 	info.MarkUpstreamRequestWritten()
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := s.conn.WriteMessage(websocket.TextMessage, body); err != nil {
+		clearTurn()
 		s.invalidateLocked(s.conn)
 		if lease != nil {
 			lease.FinishFailedAttempt(true)
@@ -533,74 +606,22 @@ func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 
 	conn := s.conn
-	var firstPayload []byte
-	if justConnected {
-		// Probe a fresh connection for a first event. An upstream that accepts the
-		// handshake but never speaks the Responses WebSocket protocol would
-		// otherwise stall the client until the idle timeout. Because the request
-		// frame is already on the wire, a failed probe fails the turn rather than
-		// replaying (see the probe-error branch below). Close the connection if the
-		// client disconnects mid-probe so the blocked read (and its capacity lease)
-		// is released promptly instead of held for the full FirstEventTimeout.
-		probeDone := make(chan struct{})
-		if reqCtx := c.Request.Context(); reqCtx != nil {
-			go func() {
-				select {
-				case <-reqCtx.Done():
-					_ = conn.Close()
-				case <-probeDone:
-				}
-			}()
-		}
-		probeStart := time.Now()
-		payload, probeErr := readInitialEvent(conn)
-		close(probeDone)
-		if probeErr != nil {
-			s.invalidateLocked(conn)
-			// The request frame was written, so this is a real failed attempt against
-			// the credential.
-			if lease != nil {
-				lease.FinishFailedAttempt(true)
-			}
-			// Otherwise the response.create frame was already written to this
-			// connection, so the upstream may have received and begun executing it — a
-			// silent probe cannot prove otherwise. Do NOT replay the turn over HTTP,
-			// and do not let the relay resend it on another credential: a duplicate
-			// would re-execute non-idempotent work (tool calls, code edits) and
-			// double-consume the upstream account. Fail this turn instead (SkipRetry).
-			// HTTP fallback stays reserved for failures before the application frame is
-			// written (for example, an unsupported upgrade).
-			logger.LogWarn(c, "responses websocket produced no initial event after the request was sent; failing the turn without replay: "+probeErr.Error())
-			return nil, types.NewErrorWithStatusCode(
-				fmt.Errorf("responses websocket upstream produced no output within %s after the request was sent: %w", FirstEventTimeout, probeErr),
-				types.ErrorCodeDoRequestFailed,
-				http.StatusBadGateway,
-				types.ErrOptionWithSkipRetry(),
-			)
-		}
-		// TEMP diagnostic: first-event latency. Grep "responses websocket timing".
-		logger.LogInfo(c, fmt.Sprintf("responses websocket timing: first event %dms", time.Since(probeStart).Milliseconds()))
-		firstPayload = payload
-	}
 
-	// TEMP diagnostic: for a reused turn (no probe), capture context so streamAsSSE
-	// can log the write→first-event latency. A freshly connected turn already logs
-	// its handshake/first-event timing above.
-	var diag *reuseTurnDiag
+	// TEMP diagnostic: capture write timing for every turn and reuse context for
+	// an existing connection.
+	diag := &reuseTurnDiag{writeAt: time.Now()}
 	if !justConnected {
-		diag = &reuseTurnDiag{
-			writeAt: time.Now(),
-			connAge: time.Since(s.connectedAt),
-			idleGap: time.Since(s.lastUsedAt),
-		}
+		diag.reused = true
+		diag.connAge = time.Since(s.connectedAt)
+		diag.idleGap = time.Since(s.lastUsedAt)
 	}
 	// lastUsedAt is refreshed when this turn's stream ends (connection returns to
-	// idle), so a later turn's idle_gap / D threshold measure true idle time — not
+	// idle), so a later turn's idle_gap / recycle threshold measure true idle time — not
 	// including this turn's generation time.
 
 	reader, writer := io.Pipe()
 	streamDone := make(chan struct{})
-	go s.streamAsSSE(c.Request.Context(), conn, writer, firstPayload, streamDone, diag)
+	go s.streamAsSSE(c.Request.Context(), conn, writer, turnEvents, turnDone, streamDone, diag)
 	streamBody := &responseBody{
 		ReadCloser: reader,
 		session:    s,
@@ -661,6 +682,15 @@ func (s *Session) invalidateLocked(conn *websocket.Conn) {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
+	if s.connStop != nil {
+		close(s.connStop)
+		s.connStop = nil
+	}
+	if s.lifetime != nil {
+		s.lifetime.Stop()
+		s.lifetime = nil
+	}
+	s.lastActivity = nil
 	s.connectedAt = time.Time{}
 	s.resetResponseIDsLocked()
 }
@@ -737,18 +767,15 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	}
 	conn.EnableWriteCompression(false)
 	conn.SetReadLimit(maxUpstreamMessageBytes)
-	// TEMP diagnostic + explicit pong reply: mirror gorilla's default ping handler
-	// (answer with a pong carrying the same payload) while logging protocol
-	// metadata, to determine whether upstream "keepalive ping timeout" closes stem
-	// from our pong not being sent or from pings never reaching us. NOTE: this
-	// handler only runs while some goroutine is blocked in ReadMessage — between
-	// turns there is no reader, so idle-period pings are invisible by design; an
-	// absence of ping logs before an idle-death is itself evidence.
-	// Grep "responses websocket protocol".
+	activity := &atomic.Int64{}
+	activity.Store(time.Now().UnixNano())
+	// Mirror gorilla's default ping handler while recording activity. The
+	// permanent reader keeps this handler active between turns, so upstream
+	// keepalive pings are answered without a second periodic ping goroutine.
 	conn.SetPingHandler(func(message string) error {
 		err := conn.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(controlFrameWriteTimeout))
 		if err == nil {
-			logger.LogInfo(context.Background(), "responses websocket protocol: upstream_ping_received pong_sent")
+			activity.Store(time.Now().UnixNano())
 			return nil
 		}
 
@@ -773,10 +800,229 @@ func (s *Session) connect(c *gin.Context, driver Driver, info *relaycommon.Relay
 	)
 	s.model = model
 	s.resetResponseIDsLocked()
+	// Activity baseline and on-demand continuation-probe hook. Pong callbacks run
+	// inside the permanent reader and deliberately avoid s.mu: doRequest holds that
+	// lock while awaiting the probe acknowledgement.
+	s.lastActivity = activity
+	conn.SetPongHandler(func(message string) error {
+		activity.Store(time.Now().UnixNano())
+		s.probeMu.Lock()
+		if s.probeAck != nil && s.probeNonce == message {
+			ack := s.probeAck
+			s.probeAck = nil
+			s.probeNonce = ""
+			close(ack)
+		}
+		s.probeMu.Unlock()
+		return nil
+	})
+	stop := make(chan struct{})
+	s.connStop = stop
+	if MaxConnectionLifetime > 0 {
+		lifetime := MaxConnectionLifetime
+		s.lifetime = time.AfterFunc(lifetime, func() {
+			s.mu.Lock()
+			if s.conn == conn {
+				logger.LogInfo(context.Background(), "responses websocket connection reached its lifetime; closing upstream connection")
+				s.invalidateLocked(conn)
+			}
+			s.mu.Unlock()
+		})
+	}
+	s.generation++
+	generation := s.generation
+	go s.runConnectionReader(conn, stop, activity, generation)
 	driver.OnUpstreamConnected(c, info)
 	// TEMP diagnostic: handshake latency. Grep "responses websocket timing".
 	logger.LogInfo(c, fmt.Sprintf("responses websocket timing: handshake %dms", time.Since(dialStart).Milliseconds()))
 	return nil
+}
+
+func (s *Session) probeContinuationLocked(c *gin.Context, conn *websocket.Conn) error {
+	if s.lastActivity == nil {
+		return errors.New("upstream connection has no activity state")
+	}
+	lastActivity := s.lastActivity.Load()
+	if lastActivity > 0 && ContinuationLivenessFreshness > 0 &&
+		time.Since(time.Unix(0, lastActivity)) <= ContinuationLivenessFreshness {
+		return nil
+	}
+
+	s.probeSequence++
+	nonce := fmt.Sprintf("continuation-%d", s.probeSequence)
+	ack := make(chan struct{})
+	s.probeMu.Lock()
+	s.probeNonce = nonce
+	s.probeAck = ack
+	s.probeMu.Unlock()
+	clearProbe := func() {
+		s.probeMu.Lock()
+		if s.probeAck == ack {
+			s.probeAck = nil
+			s.probeNonce = ""
+		}
+		s.probeMu.Unlock()
+	}
+	if err := conn.WriteControl(websocket.PingMessage, []byte(nonce), time.Now().Add(controlFrameWriteTimeout)); err != nil {
+		clearProbe()
+		return fmt.Errorf("write liveness ping: %w", err)
+	}
+
+	timeout := ContinuationProbeTimeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var requestDone <-chan struct{}
+	if c != nil && c.Request != nil {
+		requestDone = c.Request.Context().Done()
+	}
+	select {
+	case <-ack:
+		return nil
+	case <-timer.C:
+		clearProbe()
+		return fmt.Errorf("liveness pong not received within %s", timeout)
+	case <-requestDone:
+		clearProbe()
+		return c.Request.Context().Err()
+	case <-s.connStop:
+		clearProbe()
+		return errors.New("upstream connection closed during liveness probe")
+	}
+}
+
+// runConnectionReader is the connection's sole reader: every ReadMessage for
+// this connection generation happens here, for the connection's whole lifetime.
+// While a turn is active it routes business frames to that turn's consumer;
+// while idle it consumes connection metadata and keeps gorilla processing
+// upstream ping/pong control frames. It NEVER sets a read deadline: a timeout
+// corrupts the connection, and with a shared reader that corruption would
+// outlive the turn that caused it. All turn-level timeouts live on the consumer
+// side.
+func (s *Session) runConnectionReader(conn *websocket.Conn, stop <-chan struct{}, activity *atomic.Int64, generation uint64) {
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			// A read error is terminal for this connection generation. Forget the
+			// socket and its response ids atomically before notifying the consumer: a
+			// full turn queue must never leave a dead connection visible as reusable.
+			s.mu.Lock()
+			if s.conn != conn {
+				s.mu.Unlock()
+				return
+			}
+			events, turnDone := s.turnEvents, s.turnDone
+			s.invalidateLocked(conn)
+			s.mu.Unlock()
+			if events != nil {
+				select {
+				case events <- upstreamMessage{err: err}:
+				case <-turnDone:
+				}
+			}
+			return
+		}
+		activity.Store(time.Now().UnixNano())
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		payload = bytes.TrimSpace(payload)
+		if len(payload) == 0 {
+			continue
+		}
+		eventType, class, terminal := classifyUpstreamEvent(payload)
+		delivered, turnDone := s.deliverToTurn(conn, upstreamMessage{payload: payload, class: class})
+		if !delivered {
+			s.mu.Lock()
+			current := s.conn == conn
+			s.mu.Unlock()
+			if !current {
+				return
+			}
+			if class == upstreamConnectionMetadata {
+				logger.LogInfo(context.Background(), fmt.Sprintf(
+					"responses websocket protocol: idle-period connection event type=%q generation=%d discarded",
+					eventType, generation,
+				))
+				continue
+			}
+			logger.LogWarn(context.Background(), fmt.Sprintf(
+				"responses websocket protocol: idle-period turn event type=%q generation=%d; invalidating connection",
+				eventType, generation,
+			))
+			s.invalidate(conn)
+			return
+		}
+		if terminal {
+			// Do not prefetch beyond the turn boundary. Wait until the consumer has
+			// forwarded the terminal and deregistered this turn; late connection-level
+			// metadata is then classified in the idle state instead of leaking into the
+			// next turn or being mistaken for a protocol violation.
+			select {
+			case <-turnDone:
+			case <-stop:
+				return
+			}
+		}
+	}
+}
+
+// deliverToTurn hands one message to the currently registered turn consumer,
+// returning its completion signal when delivered. A false result means no turn
+// is active (or this connection generation has already been replaced).
+// If the turn ends while the reader is blocked handing over a frame, the
+// turnDone close unblocks the send and the delivery re-evaluates against the
+// (possibly cleared) registration.
+func (s *Session) deliverToTurn(conn *websocket.Conn, msg upstreamMessage) (bool, <-chan struct{}) {
+	for {
+		s.mu.Lock()
+		current := s.conn == conn
+		events, done := s.turnEvents, s.turnDone
+		s.mu.Unlock()
+		if !current {
+			return false, nil
+		}
+		if events == nil {
+			return false, nil
+		}
+		select {
+		case events <- msg:
+			return true, done
+		case <-done:
+			// The turn ended mid-delivery; re-check the registration.
+			continue
+		}
+	}
+}
+
+func classifyUpstreamEvent(payload []byte) (string, upstreamEventClass, bool) {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := common.Unmarshal(payload, &event); err != nil {
+		return "", upstreamTurnEvent, false
+	}
+	eventType := strings.TrimSpace(event.Type)
+	if eventType == "" {
+		return "", upstreamTurnEvent, false
+	}
+	if eventType == "error" {
+		return eventType, upstreamTurnEvent, true
+	}
+	if !strings.HasPrefix(eventType, "response.") {
+		// The Responses protocol may add connection-scoped extension events over
+		// time. Treat any valid, typed non-response event as connection metadata
+		// instead of maintaining a whitelist that would break on protocol growth.
+		return eventType, upstreamConnectionMetadata, false
+	}
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed", "response.error", "response.done":
+		return eventType, upstreamTurnEvent, true
+	default:
+		return eventType, upstreamTurnEvent, false
+	}
 }
 
 // invalidate closes and forgets the connection. It acquires the session lock;
@@ -786,27 +1032,6 @@ func (s *Session) invalidate(conn *websocket.Conn) {
 	s.mu.Lock()
 	s.invalidateLocked(conn)
 	s.mu.Unlock()
-}
-
-// readInitialEvent reads the first non-empty text event from a freshly
-// established upstream connection within FirstEventTimeout. At this point the
-// request frame has already been written, so a timeout or read error must fail
-// without replaying the request on another transport.
-func readInitialEvent(conn *websocket.Conn) ([]byte, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(FirstEventTimeout))
-	for {
-		messageType, payload, err := conn.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		if messageType != websocket.TextMessage {
-			continue
-		}
-		if len(bytes.TrimSpace(payload)) == 0 {
-			continue
-		}
-		return payload, nil
-	}
 }
 
 // emitEventAndMaybeStop normalizes one upstream text payload and writes it to the
@@ -931,35 +1156,37 @@ func (s *Session) resetResponseIDsLocked() {
 	s.responseIDBytes = 0
 }
 
-// streamAsSSE relays upstream WebSocket events to the SSE pipe. firstPayload, if
-// non-nil, is a text event already read during the fresh-connection probe and is
-// emitted before the read loop continues.
-// reuseTurnDiag carries TEMP diagnostic context for a reused-connection turn so
-// streamAsSSE can log the write→first-event latency once the first upstream event
-// arrives (or the read fails). Nil for a freshly connected turn, which already
-// logs its handshake/first-event timing via the probe path.
+// streamAsSSE relays events from the permanent connection reader to the SSE
+// pipe. reuseTurnDiag carries temporary first-event timing diagnostics.
 type reuseTurnDiag struct {
 	writeAt time.Time
+	reused  bool
 	connAge time.Duration
 	idleGap time.Duration
 }
 
-func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter, firstPayload []byte, done chan struct{}, diag *reuseTurnDiag) {
+func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter, events chan upstreamMessage, turnDone chan struct{}, done chan struct{}, diag *reuseTurnDiag) {
 	defer writer.Close()
 	defer close(done)
 	defer func() {
-		// Refresh the idle baseline when the stream ends and the connection returns
-		// to the idle pool. Runs first (LIFO) so a follow-up turn — which only starts
-		// after the pipe reader hits EOF from writer.Close — reads the updated time.
+		// Deregister this turn and return the connection to the idle pool. Clearing
+		// the registration BEFORE closing turnDone lets a reader blocked mid-delivery
+		// re-evaluate against the cleared state. Runs first (LIFO) so a follow-up
+		// turn — which only starts after the pipe reader hits EOF from writer.Close —
+		// observes the refreshed idle baseline.
 		s.mu.Lock()
+		if s.turnEvents == events {
+			s.turnEvents = nil
+			s.turnDone = nil
+		}
 		s.lastUsedAt = time.Now()
 		s.mu.Unlock()
+		close(turnDone)
 	}()
 
-	// Unblock a stalled ReadMessage when the request is cancelled by closing the
-	// connection from a watcher goroutine; otherwise the reader (and its capacity
-	// lease) would stay blocked until the idle deadline fires, and a follow-up
-	// request could start a second concurrent reader on the same conn.
+	// Unblock a stalled turn when the request is cancelled: closing the connection
+	// makes the permanent reader fail and deliver the error here, releasing the
+	// capacity lease promptly.
 	if ctx != nil {
 		go func() {
 			select {
@@ -1001,53 +1228,65 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 		lastEventType = eventType
 	}
 
-	if firstPayload != nil {
-		eventType, stop, eventErr := s.emitEventAndMaybeStop(conn, writer, firstPayload)
-		noteEvent(eventType)
-		if eventErr != nil {
-			streamEndErr = eventErr
-		}
-		if stop {
-			return
-		}
-	}
-
-	firstReuseRead := diag != nil
+	waitingForTurnEvent := true
+	firstTurnEventDeadline := time.Now().Add(FirstEventTimeout)
 	for {
-		// Refresh the deadline per message so it acts as an idle timeout rather than
-		// a fixed cap on total stream duration. H: a reused turn has no probe, so its
-		// first event is bounded by FirstEventTimeout — a dead reused connection then
-		// fails in ~30s instead of blocking for the full idleTimeout.
-		deadline := idleTimeout
-		if firstReuseRead {
-			deadline = FirstEventTimeout
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(deadline))
-		messageType, payload, err := conn.ReadMessage()
-		if firstReuseRead {
-			// TEMP diagnostic: reused-connection write→first-event latency. A dead
-			// reused connection now shows FAILED after ~FirstEventTimeout (30s);
-			// conn_age/idle_gap tell us which connections die (to tune the reuse
-			// threshold). Grep "responses websocket timing".
-			firstReuseRead = false
-			if err != nil {
-				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: %s",
-					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds(), err.Error()))
-			} else {
-				logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event=%dms",
-					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
+		// Consumer-side timeouts (the permanent reader never sets read deadlines):
+		// the first turn-scoped event is bounded by one absolute FirstEventTimeout.
+		// Connection metadata may be forwarded but cannot extend that deadline.
+		timeout := idleTimeout
+		if waitingForTurnEvent {
+			timeout = time.Until(firstTurnEventDeadline)
+			if timeout <= 0 {
+				timeout = time.Nanosecond
 			}
 		}
-		if err != nil {
+		timer := time.NewTimer(timeout)
+		var msg upstreamMessage
+		var timedOut bool
+		select {
+		case msg = <-events:
+		case <-timer.C:
+			timedOut = true
+		}
+		timer.Stop()
+		if timedOut {
+			if diag != nil && diag.reused {
+				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: timeout",
+					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
+			}
+			bound := idleTimeout
+			if waitingForTurnEvent {
+				bound = FirstEventTimeout
+			}
+			err := fmt.Errorf("responses websocket upstream produced no event within %s", bound)
 			streamEndErr = err
 			s.invalidate(conn)
 			_ = writer.CloseWithError(err)
 			return
 		}
-		if messageType != websocket.TextMessage {
-			continue
+		if msg.err != nil {
+			if diag != nil && diag.reused && waitingForTurnEvent {
+				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: %s",
+					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds(), msg.err.Error()))
+			}
+			streamEndErr = msg.err
+			s.invalidate(conn)
+			_ = writer.CloseWithError(msg.err)
+			return
 		}
-		eventType, stop, eventErr := s.emitEventAndMaybeStop(conn, writer, payload)
+		if waitingForTurnEvent && msg.class == upstreamTurnEvent {
+			waitingForTurnEvent = false
+			if diag != nil {
+				if diag.reused {
+					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event=%dms",
+						diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
+				} else {
+					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: first event %dms", time.Since(diag.writeAt).Milliseconds()))
+				}
+			}
+		}
+		eventType, stop, eventErr := s.emitEventAndMaybeStop(conn, writer, msg.payload)
 		noteEvent(eventType)
 		if eventErr != nil {
 			streamEndErr = eventErr

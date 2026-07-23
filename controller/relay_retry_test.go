@@ -287,6 +287,27 @@ func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
 	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
 }
 
+func TestSubscriptionOAuthWebSocketFirstEventTimeoutDoesNotReplayWrittenRequest(t *testing.T) {
+	original := operation_setting.AutomaticRetryStatusCodeRanges
+	operation_setting.AutomaticRetryStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: http.StatusBadGateway, End: http.StatusBadGateway}}
+	t.Cleanup(func() { operation_setting.AutomaticRetryStatusCodeRanges = original })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("channel_type", constant.ChannelTypeCodex)
+	c.Set(responsesWebSocketInternalPinKey, true)
+	retryParam := &service.RetryParam{}
+	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+	info := &relaycommon.RelayInfo{}
+	info.MarkUpstreamRequestWritten()
+	apiError := types.NewOpenAIError(
+		errors.New("responses websocket upstream produced no event within 30s"),
+		types.ErrorCodeDoRequestFailed,
+		http.StatusBadGateway,
+	)
+
+	require.False(t, shouldContinueSubscriptionOAuthRetry(c, info, retryParam, apiError))
+}
+
 func TestRefreshCodexCredentialHonorsStatefulWebSocketRetryDisable(t *testing.T) {
 	tests := []struct {
 		name                 string

@@ -35,6 +35,17 @@ feature description.
   it validates the complete related setting set before any Option write.
 - A written subscription OAuth request now stops on ambiguous transport failure
   instead of being replayed to the current or a backup credential.
+- Responses WebSocket connection generations now have one permanent upstream
+  reader, terminal acknowledgement, post-terminal metadata classification,
+  connection-local liveness probes, and an active 55-minute lifetime. Long-idle
+  continuations therefore either use their verified original connection or fail
+  before writing; they never migrate to a replacement connection. Passive
+  availability currently benefits from the observed upstream ping cadence of
+  about 20 seconds; if that changes, the nonce probe preserves correctness but
+  continuation availability may degrade to full-context recovery.
+- Monitor concurrent idle Responses WebSocket connections under the 55-minute
+  lifetime. Add a single session-owner LRU/global cap only if production data
+  shows unbounded idle growth; do not introduce a second connection pool.
 - The Gin request state and retry tracker share one attempt object, so lease
   generation, recovery-probe, and response-scope metadata are no longer copied
   between independent records.

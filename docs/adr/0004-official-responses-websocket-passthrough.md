@@ -251,7 +251,7 @@ Pre-turn rejections (malformed frame, append-before-create, continuation
 admission) keep the plain error frame; they have not exhibited the hang and
 remain an observation item.
 
-**Idle-period connection ownership and continuation lease.** Production logs
+**Idle-period connection ownership and continuation lifetime.** Production logs
 proved that an upstream connection idle for 84-147s dies from "keepalive ping
 timeout": between turns nothing reads the connection, so gorilla never processes
 the upstream's ~20s pings and no pong is ever sent. The failure-terminal chain
@@ -271,33 +271,43 @@ connection must fail immediately — never wait, never migrate.
   with a shared loop that corruption would outlive the turn that caused it. All
   turn-level timeouts (`FirstEventTimeout`, `idleTimeout`) move to the consumer
   side as `select`+timer.
-- **Active health checking.** While idle the session pings the upstream every
-  20 seconds (matching the upstream's own cadence); a ping not answered by a
-  pong within 10 seconds marks the connection dead and closes it (which also
-  terminates the read loop). With a permanent read loop the pong handler is
-  reliable, which is what made ad-hoc probing unsafe before.
-- **Continuation idle lease: 10 minutes.** A live connection is retained for
-  continuations for at most 10 idle minutes, then proactively closed so
-  abandoned client sessions cannot pin upstream sockets and goroutines
-  indefinitely.
-- **Pre-write liveness check.** A continuation is admitted only when the lease
-  is unexpired and the connection is marked live; otherwise the gateway fails
-  the turn immediately with the associated `response.failed` — the frame is
-  never written upstream, never replayed, never migrated. This removes the
-  "request may already be executing" ambiguity for the common idle-death case;
-  a race where the upstream dies between health checks still falls back to the
-  existing write-failure/terminal-chain path.
+- **Turn boundary and connection metadata.** A terminal event is handed to the
+  consumer with an explicit completion signal; the reader does not prefetch the
+  next frame until that terminal has been forwarded. While idle, `response.*`
+  events and top-level `error` remain turn-scoped and fail closed. Any other
+  valid JSON frame with a non-empty type is treated as a connection extension,
+  recorded by type and generation, then discarded. Malformed JSON and a missing
+  or empty type fail closed because ownership cannot be classified safely. This
+  prefix rule avoids a fixed metadata whitelist that would break when the
+  upstream adds an extension event. Any `ReadMessage` error atomically
+  invalidates its connection generation and response ids before notifying the
+  active turn, even when the turn queue is full or a terminal was already queued.
+- **On-demand pre-write liveness.** The permanent reader answers the upstream's
+  own keepalive pings, so no second periodic client-ping goroutine is needed.
+  Upstream data and successful control exchanges update connection-local
+  activity. A continuation whose activity is older than 30 seconds sends one
+  nonce-bearing ping and waits up to 3 seconds for the matching pong through the
+  permanent reader. Failure closes the connection before `response.create` is
+  written; the continuation is never replayed or migrated. Passive keepalive
+  availability depends on the observed upstream behavior of sending a ping about
+  every 20 seconds. If that behavior stops, the pre-write probe still protects
+  correctness, but a continuation may fail and require full-context recovery.
+- **Connection lifetime: 55 minutes.** One generation has an active lifetime
+  timer and closes before the upstream's documented 60-minute cap. There is no
+  shorter continuation idle lease; closing the downstream session still
+  releases the upstream connection immediately. Production must monitor the
+  concurrent idle-connection count before adding an LRU or global connection
+  cap; no second pool or eviction owner is introduced speculatively.
 - **Unchanged.** Self-contained turns keep the existing 30s idle-reconnect
   policy (observation item: with keepalive working, D-triggered reconnects
-  become redundant ~300ms; revisit with production frequency data). Idle-period
-  business frames remain a protocol violation that invalidates the connection.
-  The HTTP fallback binding has no upstream WebSocket and is unaffected.
+  become redundant ~300ms; revisit with production frequency data). The HTTP
+  fallback binding has no upstream WebSocket and is unaffected.
   Connection, model, channel, and continuation state remain solely owned by
   `Session` — no second pool or state table.
 - **Rollback** is by server image rollback; no permanent dual implementation is
-  kept. Regression tests must cover idle ping/pong keepalive, lease expiry,
-  read-loop termination, active-turn routing, and the continuation
-  never-migrates invariant.
+  kept. Regression tests cover idle upstream ping/pong, post-terminal metadata,
+  reader failure, nonce probe success/failure, active lifetime expiry,
+  active-turn routing, and the continuation never-migrates invariant.
 
 ## Alternatives considered
 
@@ -314,16 +324,14 @@ connection must fail immediately — never wait, never migrate.
 - **A second source of truth for "supports WS" (env var or global setting).**
   Rejected: WebSocket support is an upstream property, so it belongs on the
   channel, not a global toggle.
-- **WebSocket ping/pong liveness probe before reusing a connection.** Rejected as
-  implemented: reading the pong requires a deadlined `ReadMessage`, and a
-  read-deadline timeout corrupts the gorilla connection, so an ad-hoc probe would
-  break the very live connection it checks. A dependable probe needs a single
-  long-lived read loop that demultiplexes control and data frames — a connection
-  state-machine change not warranted for this fix. The idle-recycle + first-event
-  bound above achieves the same protection without that rewrite. This does not
-  prevent observing inbound upstream pings during an active read: the connection
-  temporarily wraps Gorilla's default ping handler with identical one-second
-  pong and error semantics and records only whether that pong succeeded.
+- **Temporary read-deadline ping/pong probe.** Rejected: timing out a standalone
+  `ReadMessage` corrupts the gorilla connection. The adopted nonce probe is safe
+  because the permanent reader remains the only read owner and delivers pong
+  acknowledgements without changing the socket read deadline.
+- **Periodic gateway-to-upstream ping loop.** Rejected after the permanent reader
+  was introduced: upstream-originated pings already keep the connection active,
+  and a per-session ticker adds timers, writes, and logs without proving freshness
+  at the actual continuation admission point.
 
 ## Consequences
 

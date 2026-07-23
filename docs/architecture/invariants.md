@@ -40,6 +40,11 @@ These rules are release-blocking unless an explicit ADR changes them.
 - A Responses WebSocket continuation is admitted only when its exact
   `previous_response_id` was emitted by the current live upstream connection;
   replacement connections and HTTP fallback never inherit those ids.
+- Every upstream Responses WebSocket has one read owner for its complete
+  connection generation. A terminal cannot hand later turn events to the next
+  consumer, a reader error always invalidates that generation, and a stale
+  continuation must pass its pre-write liveness probe without replay or
+  migration.
 
 ## Billing and persistence
 

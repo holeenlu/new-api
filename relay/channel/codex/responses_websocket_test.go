@@ -455,14 +455,15 @@ func TestResponsesWebSocketFailsTurnWhenUpstreamSilentAfterWrite(t *testing.T) {
 	session := &responsesws.Session{}
 	defer session.Close()
 	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
-	require.Nil(t, resp)
-	require.Error(t, err)
-	var apiErr *types.NewAPIError
-	require.ErrorAs(t, err, &apiErr)
-	require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
-	require.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
-	// Non-retryable: the relay must not resend the turn on another credential.
-	require.True(t, types.IsSkipRetryError(apiErr))
+	// Permanent-reader model: the turn is returned as a stream and the silent
+	// upstream fails in-stream at the consumer-side first-event bound. The relay
+	// then surfaces it through the failure-terminal chain; it is never replayed.
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	_, readErr := io.ReadAll(resp.Body)
+	require.Error(t, readErr)
+	require.Contains(t, readErr.Error(), "no event within")
+	require.NoError(t, resp.Body.Close())
 	// No HTTP replay of an already-written request.
 	require.Zero(t, httpRequests.Load())
 }
@@ -715,14 +716,16 @@ func TestResponsesWebSocketDoesNotReplaySilentPostWriteFromHandshakeUsageHeaders
 	session := &responsesws.Session{}
 	defer session.Close()
 	resp, err := session.DoRequest(c, &Adaptor{}, info, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
-	require.Nil(t, resp)
-	require.Error(t, err)
-	var apiErr *types.NewAPIError
-	require.ErrorAs(t, err, &apiErr)
-	require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
-	require.Equal(t, http.StatusBadGateway, apiErr.GetUpstreamStatusCode())
-	require.Zero(t, apiErr.RetryAfter)
-	require.True(t, types.IsSkipRetryError(apiErr))
+	// Permanent-reader model: the silent post-write turn fails in-stream at the
+	// consumer-side first-event bound. Handshake usage headers must NOT upgrade
+	// it to a retryable usage-limit (that would replay the written request on
+	// another credential), must not redial, and must not fall back to HTTP.
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	_, readErr := io.ReadAll(resp.Body)
+	require.Error(t, readErr)
+	require.Contains(t, readErr.Error(), "no event within")
+	require.NoError(t, resp.Body.Close())
 	written, _ := info.UpstreamAttemptState()
 	require.True(t, written)
 	require.Equal(t, int32(1), websocketAttempts.Load())

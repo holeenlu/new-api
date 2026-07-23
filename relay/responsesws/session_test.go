@@ -948,7 +948,12 @@ func TestDoRequestRejectsResponseIDFromReplacedConnection(t *testing.T) {
 	assert.Equal(t, int32(3), requestCount.Load())
 }
 
-func TestDoRequestDoesNotReplayAfterWebSocketWriteFailure(t *testing.T) {
+// A connection that dies while idle is detected by the permanent reader and
+// invalidated, so the next self-contained turn reconnects before writing its
+// frame — the written-request replay invariant holds because nothing was
+// written to the dead socket. (Under the pre-reader model this scenario was a
+// post-write failure; the reader converts it into a replay-safe reconnect.)
+func TestDoRequestReconnectsSafelyAfterIdleConnectionDeath(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	requestCount := atomic.Int32{}
@@ -989,6 +994,14 @@ func TestDoRequestDoesNotReplayAfterWebSocketWriteFailure(t *testing.T) {
 	require.NoError(t, session.conn.Close())
 	session.mu.Unlock()
 
+	// Permanent-reader model: the reader observes the closed socket while idle and
+	// invalidates the binding, so the next self-contained turn reconnects BEFORE
+	// its frame is written — replay-safe by construction. Wait for that cleanup
+	// deterministically instead of racing it.
+	require.Eventually(t, func() bool {
+		return !session.HasLiveConnection()
+	}, 2*time.Second, 5*time.Millisecond, "reader did not invalidate the closed connection")
+
 	secondInfo := newSessionTestRelayInfo(103, 0, "credential-a")
 	response, err = session.DoRequest(
 		newSessionTestContext(),
@@ -996,18 +1009,13 @@ func TestDoRequestDoesNotReplayAfterWebSocketWriteFailure(t *testing.T) {
 		secondInfo,
 		strings.NewReader(`{"model":"gpt-test","input":"second"}`),
 	)
-	require.Nil(t, response)
-	require.Error(t, err)
-	var apiError *types.NewAPIError
-	require.ErrorAs(t, err, &apiError)
-	assert.Equal(t, http.StatusBadGateway, apiError.StatusCode)
-	assert.Equal(t, types.ErrorCodeDoRequestFailed, apiError.GetErrorCode())
-	assert.True(t, types.IsSkipRetryError(apiError))
-	written, _ := secondInfo.UpstreamAttemptState()
-	assert.True(t, written)
-	assert.Equal(t, int32(1), driver.dialCalls.Load())
+	require.NoError(t, err)
+	_, err = io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	assert.Equal(t, int32(2), driver.dialCalls.Load()) // pre-write reconnect, not a replay
 	assert.Zero(t, driver.fallbackCalls.Load())
-	assert.Equal(t, int32(1), requestCount.Load())
+	assert.Equal(t, int32(2), requestCount.Load())
 }
 
 func TestDoRequestRejectsConnectionLocalContinuationAfterLifetime(t *testing.T) {
@@ -1464,4 +1472,439 @@ func TestDoRequestCrossModelContinuationRejected(t *testing.T) {
 	// No reconnect, no fallback: the continuation was refused fail-closed.
 	assert.Equal(t, int32(1), driver.dialCalls.Load())
 	assert.Zero(t, driver.fallbackCalls.Load())
+}
+
+func TestIdleReaderAnswersUpstreamPingAndKeepsContinuation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	pongObserved := make(chan struct{}, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetPongHandler(func(message string) error {
+			if message == "idle-check" {
+				select {
+				case pongObserved <- struct{}{}:
+				default:
+				}
+			}
+			return nil
+		})
+		turn := 0
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn++
+			responseID := fmt.Sprintf("resp_%d", turn)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q}}`, responseID))); err != nil {
+				return
+			}
+			if turn == 1 {
+				if err := conn.WriteControl(websocket.PingMessage, []byte("idle-check"), time.Now().Add(time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(140, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+	select {
+	case <-pongObserved:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "idle reader did not answer upstream ping")
+	}
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(140, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp2.Body.Close())
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+	assert.Zero(t, driver.fallbackCalls.Load())
+}
+
+func TestPostTerminalConnectionExtensionsDoNotInvalidateConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	metadataConsumed := make(chan struct{}, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetPongHandler(func(message string) error {
+			if message == "metadata-drained" {
+				select {
+				case metadataConsumed <- struct{}{}:
+				default:
+				}
+			}
+			return nil
+		})
+		turn := 0
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn++
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d"}}`, turn))); err != nil {
+				return
+			}
+			if turn == 1 {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"responsesapi.websocket_timing","elapsed_ms":12}`)); err != nil {
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"vendor.future_connection_notice","sequence":1}`)); err != nil {
+					return
+				}
+				if err := conn.WriteControl(websocket.PingMessage, []byte("metadata-drained"), time.Now().Add(time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(141, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+	select {
+	case <-metadataConsumed:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "reader did not consume post-terminal metadata")
+	}
+	require.True(t, session.HasLiveConnection())
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(141, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp2.Body.Close())
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+}
+
+func TestPostTerminalTurnEventInvalidatesConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"late"}`))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(145, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Eventually(t, func() bool { return !session.HasLiveConnection() }, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestPostTerminalUnclassifiableFrameInvalidatesConnection(t *testing.T) {
+	testCases := []struct {
+		name    string
+		payload string
+	}{
+		{name: "malformed JSON", payload: `{"type":`},
+		{name: "missing type", payload: `{"sequence":1}`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+					return
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(testCase.payload))
+				_, _, _ = conn.ReadMessage()
+			}))
+			defer server.Close()
+
+			driver := &sessionTestDriver{upstreamURL: server.URL}
+			session := &Session{}
+			defer session.Close()
+			resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(149, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+			require.NoError(t, err)
+			_, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Eventually(t, func() bool { return !session.HasLiveConnection() }, 2*time.Second, 5*time.Millisecond)
+		})
+	}
+}
+
+func TestConnectionMetadataDoesNotSatisfyFirstTurnEventTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalFirstEvent := FirstEventTimeout
+	FirstEventTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { FirstEventTimeout = originalFirstEvent })
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"responsesapi.websocket_timing","elapsed_ms":5}`)); err != nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(147, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, readErr := io.ReadAll(resp.Body)
+	require.Error(t, readErr)
+	require.Contains(t, readErr.Error(), "no event within 50ms")
+	require.NoError(t, resp.Body.Close())
+}
+
+func TestStaleContinuationProbeSuccessKeepsOriginalConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalFreshness, originalTimeout := ContinuationLivenessFreshness, ContinuationProbeTimeout
+	ContinuationLivenessFreshness = time.Nanosecond
+	ContinuationProbeTimeout = time.Second
+	t.Cleanup(func() {
+		ContinuationLivenessFreshness, ContinuationProbeTimeout = originalFreshness, originalTimeout
+	})
+	applicationFrames := atomic.Int32{}
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			messageType, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if messageType != websocket.TextMessage {
+				continue
+			}
+			turn := applicationFrames.Add(1)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d"}}`, turn))); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(146, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+	require.NotNil(t, session.lastActivity)
+	session.lastActivity.Store(time.Now().Add(-time.Minute).UnixNano())
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(146, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp2.Body.Close())
+	assert.Equal(t, int32(2), applicationFrames.Load())
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+}
+
+func TestReadErrorAfterTerminalInvalidatesConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	applicationFrames := atomic.Int32{}
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		applicationFrames.Add(1)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`))
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(142, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+	require.Eventually(t, func() bool { return !session.HasLiveConnection() }, 2*time.Second, 5*time.Millisecond)
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(142, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.Nil(t, resp2)
+	require.Error(t, err)
+	assert.Equal(t, int32(1), applicationFrames.Load())
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+}
+
+func TestReadErrorInvalidatesConnectionBeforeBlockedTurnNotification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		for range 5 {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"chunk"}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(148, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	// Leave the downstream pipe unread so the stream consumer blocks and the
+	// four-slot turn queue fills. The reader must still clear the dead generation
+	// before it can block notifying that consumer about the read error.
+	require.Eventually(t, func() bool { return !session.HasLiveConnection() }, 2*time.Second, 5*time.Millisecond)
+	require.NoError(t, resp.Body.Close())
+}
+
+func TestStaleContinuationProbeFailureDoesNotWriteApplicationFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalFreshness, originalTimeout := ContinuationLivenessFreshness, ContinuationProbeTimeout
+	ContinuationLivenessFreshness = time.Nanosecond
+	ContinuationProbeTimeout = 80 * time.Millisecond
+	t.Cleanup(func() {
+		ContinuationLivenessFreshness, ContinuationProbeTimeout = originalFreshness, originalTimeout
+	})
+	applicationFrames := atomic.Int32{}
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetPingHandler(func(string) error { return nil })
+		for {
+			messageType, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if messageType != websocket.TextMessage {
+				continue
+			}
+			if applicationFrames.Add(1) == 1 {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(143, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+	require.NotNil(t, session.lastActivity)
+	session.lastActivity.Store(time.Now().Add(-time.Minute).UnixNano())
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(143, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.Nil(t, resp2)
+	require.Error(t, err)
+	assert.Equal(t, int32(1), applicationFrames.Load())
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+}
+
+func TestMaxConnectionLifetimeActivelyClosesIdleConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalLifetime := MaxConnectionLifetime
+	MaxConnectionLifetime = 100 * time.Millisecond
+	t.Cleanup(func() { MaxConnectionLifetime = originalLifetime })
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(144, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Eventually(t, func() bool { return !session.HasLiveConnection() }, 2*time.Second, 5*time.Millisecond)
 }
