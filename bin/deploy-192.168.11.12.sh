@@ -7,6 +7,7 @@ source "$ROOT_DIR/bin/deploy-common.sh"
 
 DEPLOY_NAME=192.168.11.12
 DEPLOY_SLUG=192
+DEPLOY_NODE_NAME=new-api-prod-192
 DEPLOY_TARGET=kdan@192.168.11.12
 DEPLOY_SSH_KEY=${DEPLOY_SSH_KEY:-$HOME/.ssh/new-api-192-deploy}
 REMOTE_DIR=/home/kdan/newapi-proxy

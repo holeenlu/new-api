@@ -42,7 +42,7 @@ services:
       - ERROR_LOG_ENABLED=true # 是否启用错误日志记录 (Whether to enable error log recording)
       - MAX_REQUEST_BODY_MB=${MAX_REQUEST_BODY_MB:-128}
       - BATCH_UPDATE_ENABLED=true  # 是否启用批量更新 (Whether to enable batch update)
-      - NODE_NAME=new-api-node-1  # 节点名称，用于审计日志中标识节点身份；多节点/容器部署时建议设置 (Node name used in audit logs; recommended when running multiple instances or in containers)
+      - NODE_NAME=${NODE_NAME:-new-api}  # 节点名称，用于审计日志中标识节点身份；多节点/容器部署时建议设置 (Node name used in audit logs; recommended when running multiple instances or in containers)
       - UPSTREAM_LOCATION_MODE=${UPSTREAM_LOCATION_MODE:-strip}  # strip removes client location; egress rewrites it with the VPN/proxy exit location; client explicitly allows it
       - UPSTREAM_SYSTEM_PROXY_ENABLED=${UPSTREAM_SYSTEM_PROXY_ENABLED:-false}
       - UPSTREAM_LOCATION_DISCOVERY_ENABLED=${UPSTREAM_LOCATION_DISCOVERY_ENABLED:-true}

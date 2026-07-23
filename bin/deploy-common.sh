@@ -368,6 +368,7 @@ deploy_prepare_env_file() {
   deploy_env_set "$env_file" CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED true
   deploy_env_set "$env_file" CODEX_OAUTH_MAX_CONCURRENCY 5
   deploy_env_set "$env_file" CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS 50
+  deploy_env_set "$env_file" NODE_NAME "${DEPLOY_NODE_NAME:-new-api}"
   deploy_env_ensure "$env_file" MAX_REQUEST_BODY_MB 128
   deploy_env_migrate_default "$env_file" SUBSCRIPTION_OAUTH_RESPONSE_HEADER_TIMEOUT 120 30
   deploy_env_ensure "$env_file" CHANNEL_MANAGEMENT_REQUEST_TIMEOUT 30
@@ -382,7 +383,7 @@ deploy_prepare_env_file() {
 }
 
 deploy_server_main() {
-  : "${DEPLOY_NAME:?}" "${DEPLOY_SLUG:?}" "${DEPLOY_TARGET:?}" "${REMOTE_DIR:?}"
+  : "${DEPLOY_NAME:?}" "${DEPLOY_SLUG:?}" "${DEPLOY_NODE_NAME:?}" "${DEPLOY_TARGET:?}" "${REMOTE_DIR:?}"
   : "${COMPOSE_FILE:?}" "${CADDY_FILE:?}" "${PROXY_SERVICE:?}" "${TARGET_IMAGE:?}"
   : "${ROLLBACK_IMAGE:?}" "${HEALTH_URL:?}" "${BUILD_IMAGE:?}"
 
@@ -483,35 +484,37 @@ deploy_server_main() {
   # an already-provisioned target would otherwise keep whatever TZ it was
   # initialized with (e.g. a stale TZ=UTC that silently overrides the compose
   # ${TZ:-...} default and renders reset times in UTC). Reconcile the pinned
-  # policy on every deploy: force TZ and OAuth capacity settings, and ensure
-  # DEFAULT_LANGUAGE only when absent.
+  # policy on every deploy: force TZ, NODE_NAME and OAuth capacity settings,
+  # and ensure DEFAULT_LANGUAGE only when absent.
   # The rewrite is atomic (temp + mv) so a failure never truncates the live .env.
   deploy_log "Synchronizing runtime policy on $DEPLOY_NAME"
   ssh_remote "$DEPLOY_TARGET" \
-    "POLICY_TZ='$DEPLOY_PINNED_TZ' POLICY_LANG='$DEPLOY_PINNED_DEFAULT_LANGUAGE' REMOTE_DIR='$REMOTE_DIR' bash -s" \
+    "POLICY_TZ='$DEPLOY_PINNED_TZ' POLICY_LANG='$DEPLOY_PINNED_DEFAULT_LANGUAGE' POLICY_NODE_NAME='$DEPLOY_NODE_NAME' REMOTE_DIR='$REMOTE_DIR' bash -s" \
     <<'REMOTE_ENV_POLICY_EOF' || deploy_die "Failed to reconcile deployment policy in $REMOTE_DIR/.env"
 set -Eeuo pipefail
 cd "$REMOTE_DIR"
 [ -f .env ] || exit 0
 reconciled=$(mktemp .env.policy.XXXXXX)
 trap 'rm -f "$reconciled"' EXIT
-awk -v tz="$POLICY_TZ" -v lang="$POLICY_LANG" '
+awk -v tz="$POLICY_TZ" -v lang="$POLICY_LANG" -v node_name="$POLICY_NODE_NAME" '
   BEGIN {
     keys[1] = "CLAUDE_CODE_OAUTH_MAX_CONCURRENCY"
     keys[2] = "CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS"
     keys[3] = "CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED"
     keys[4] = "CODEX_OAUTH_MAX_CONCURRENCY"
     keys[5] = "CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS"
+    keys[6] = "NODE_NAME"
     values[keys[1]] = "5"
     values[keys[2]] = "50"
     values[keys[3]] = "true"
     values[keys[4]] = "5"
     values[keys[5]] = "50"
+    values[keys[6]] = node_name
   }
   /^[[:space:]]*TZ=/ { next }
   /^[[:space:]]*DEFAULT_LANGUAGE=/ { have_lang = 1 }
   {
-    for (i = 1; i <= 5; i++) {
+    for (i = 1; i <= 6; i++) {
       key = keys[i]
       if ($0 ~ "^[[:space:]]*" key "=") {
         if (!seen[key]++) print key "=" values[key]
@@ -523,7 +526,7 @@ awk -v tz="$POLICY_TZ" -v lang="$POLICY_LANG" '
   END {
     print "TZ=" tz
     if (!have_lang) print "DEFAULT_LANGUAGE=" lang
-    for (i = 1; i <= 5; i++) {
+    for (i = 1; i <= 6; i++) {
       key = keys[i]
       if (!seen[key]) print key "=" values[key]
     }
@@ -538,7 +541,8 @@ REMOTE_ENV_POLICY_EOF
     grep -qx 'CLAUDE_CODE_OAUTH_MIN_REQUEST_INTERVAL_MS=50' .env && \
     grep -qx 'CLAUDE_CODE_OAUTH_LOCAL_LIMITS_ENABLED=true' .env && \
     grep -qx 'CODEX_OAUTH_MAX_CONCURRENCY=5' .env && \
-    grep -qx 'CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS=50' .env" \
+    grep -qx 'CODEX_OAUTH_MIN_REQUEST_INTERVAL_MS=50' .env && \
+    grep -qx 'NODE_NAME=$DEPLOY_NODE_NAME' .env" \
     || deploy_die "Remote OAuth runtime policy verification failed in $REMOTE_DIR/.env"
   ssh_remote "$DEPLOY_TARGET" "mkdir '$remote_lock' 2>/dev/null || { find '$remote_lock' -maxdepth 0 -mmin +60 -print -quit | grep -q . && rmdir '$remote_lock' && mkdir '$remote_lock'; }" \
     || deploy_die "Another $DEPLOY_NAME deployment is active"

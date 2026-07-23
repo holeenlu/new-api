@@ -7,6 +7,7 @@ source "$ROOT_DIR/bin/deploy-common.sh"
 
 DEPLOY_NAME="CC00-AI (192.168.172.80)"
 DEPLOY_SLUG=cc00-ai
+DEPLOY_NODE_NAME=new-api-cc00-ai
 DEPLOY_TARGET=kdanmobile@192.168.172.80
 DEPLOY_SSH_KEY=${DEPLOY_SSH_KEY:-$HOME/.ssh/new-api-cc00-ai-deploy}
 DEPLOY_INITIALIZE_ENV=true

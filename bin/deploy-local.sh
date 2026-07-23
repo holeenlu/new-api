@@ -7,6 +7,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT_DIR/bin/deploy-common.sh"
 
 ENV_FILE=${ENV_FILE:-$ROOT_DIR/.env}
+DEPLOY_NODE_NAME=${DEPLOY_NODE_NAME:-new-api-local}
 IMAGE=new-api:deploy-linux-amd64
 PLATFORM=linux/amd64
 APP_VERSION=$(deploy_build_version "$ROOT_DIR")

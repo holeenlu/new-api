@@ -27,6 +27,7 @@ services:
       SESSION_COOKIE_TRUSTED_URL: "${SESSION_COOKIE_TRUSTED_URL:-https://nextcode.buildtoconnect.com}"
       TZ: "${TZ:-Asia/Taipei}"
       DEFAULT_LANGUAGE: "${DEFAULT_LANGUAGE:-zh-CN}"
+      NODE_NAME: "${NODE_NAME:-new-api-prod-174}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,postgres,redis,new-api}"

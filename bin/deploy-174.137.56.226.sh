@@ -7,6 +7,7 @@ source "$ROOT_DIR/bin/deploy-common.sh"
 
 DEPLOY_NAME=174.137.56.226
 DEPLOY_SLUG=174
+DEPLOY_NODE_NAME=new-api-prod-174
 DEPLOY_TARGET=root@174.137.56.226
 REMOTE_DIR=/opt/newapi-proxy
 COMPOSE_FILE=docker-compose.server-174.137.56.226.yml
