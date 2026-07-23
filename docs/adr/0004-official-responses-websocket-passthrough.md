@@ -3,10 +3,12 @@
 Status: Implemented transport; targeted verification remains incomplete. Warm-up
 (`generate:false`) turns use the ordinary usage-based settlement path, so no
 warm-up-specific billing state was added. A live upstream WebSocket pins one
-channel, model, and credential. A turn that may have reached upstream is never
-transparently replayed. Dedicated WebSocket-vs-HTTP ledger-parity and warm-up
-billing tests remain release follow-up and are not inferred merely from shared
-code paths.
+channel and credential; the model binding may be replaced by a self-contained
+turn (which rebinds the whole session), while a continuation stays pinned to the
+connection that owns its `previous_response_id`. A turn that may have reached
+upstream is never transparently replayed. Dedicated WebSocket-vs-HTTP
+ledger-parity and warm-up billing tests remain release follow-up and are not
+inferred merely from shared code paths.
 
 ## Context
 
@@ -150,6 +152,17 @@ model, key index, and stable credential fingerprint that authenticated it.
 The model binding comes from the provider-ready outbound JSON itself (including
 raw-body passthrough), not from pre-conversion mapping metadata, and comparison
 is exact so two payload models cannot hide behind one mapped name.
+A **self-contained model switch is legal**: the official protocol scopes a
+connection to an account, not a model, and Codex clients switch models on one
+client connection. The controller detects the switch after frame normalization
+and — **before channel distribution** — clears its internal channel pin (an
+externally requested specific-channel pin is untouched) and resets the session
+binding via `ResetChannelForRetry`, so the new model re-enters ordinary channel
+selection and dials a fresh upstream connection. The session relaxes only the
+self-contained model check as a defense for switches the controller cannot see
+(e.g. a parameter-override-injected model); a cross-model **continuation stays
+fail-closed** (409) because its `previous_response_id` is owned by the old
+model's connection.
 Later turns restore that credential after normal middleware distribution and
 fail closed if the key is removed, disabled, or replaced by a different
 credential identity. Normal access-token refresh may preserve a provider-stable
@@ -178,6 +191,114 @@ terminal event cancels its sole upstream reader and invalidates the connection
 before releasing the lease. A later turn cannot start a second reader on the
 same socket.
 
+**Idle-connection recycling and reused-turn first-event bound.** A pooled
+upstream connection can be silently idle-closed by the upstream or an
+intermediary between sequential turns. The first turn on a fresh connection is
+protected by the handshake and a first-event probe, but a reused turn has
+neither: it writes `response.create` into a possibly half-open socket — where the
+write is buffered locally and appears to succeed — and then blocks its reader for
+the full idle timeout (minutes). Two bounds close this gap without a replay:
+(1) a **self-contained** turn whose connection is idle beyond
+`ReuseIdleReconnectThreshold` (default **30s**, measured from the previous turn's
+stream end; production protocol logs show the upstream pings every ~20s and
+closes after ~2-3 missed pings, so 30s recycles before the upstream declares the
+reader-less idle connection dead) recycles and re-dials **before** the
+application frame is written,
+which is replay-safe. A continuation is **never** recycled here: its
+`previous_response_id` is owned by this exact connection and must not move to a
+replacement socket, so it keeps the connection and — if that connection is
+already dead — is failed fast by bound (2). (2) A reused turn's first upstream
+event is bounded by `FirstEventTimeout` (**30s**) rather than the idle timeout, so
+a connection that dies within the idle window fails in ~30s — the request is
+already written and is therefore not replayed; the client resends full input
+context — instead of appearing to hang for minutes. Both bounds are `var`s so
+tests can shorten them.
+
+**Downstream keepalive.** The client↔gateway WebSocket has the mirror-image
+problem: between turns it carries no traffic, so an intermediary idle timeout
+(reverse proxies and NAT gateways commonly use ~60s) can silently kill it; the
+client's next message is then written into a dead socket and hangs until a
+transport-level timeout (observed as multi-minute "thinking" stalls with zero
+gateway activity). The controller therefore runs a keepalive pump per downstream
+connection: a server→client WebSocket ping every 25 seconds (below the common
+60s intermediary bound, with margin), written via `WriteControl` — documented
+concurrency-safe alongside the SSE writer — with the 1-second control-frame
+bound gorilla itself uses so a slow client cannot stall the pump. Clients answer
+pongs in the protocol stack; no client change is needed. A failed ping cancels
+the connection context so a dead client promptly releases the reader and any
+in-flight turn instead of holding session resources.
+
+**Turn-failure terminal shape.** A failed in-flight turn is surfaced to the
+client as the protocol's standard terminal event chain, not as a bare
+`{"type":"error"}` frame. Production evidence: Codex clients ignore the generic
+error frame and wait indefinitely for a response-associated terminal (observed
+hangs after a gateway 409 and 502 that were resolved only by the user sending
+another message). Two cases, both carrying the classified error object (type,
+code, retry_after):
+- **Stream ended without a terminal** (partial output already forwarded): the
+  writer tracks the response id observed in forwarded events and emits a single
+  `response.failed` with that **real id**, so the terminal matches the in-flight
+  response the client has already registered.
+- **Relay HTTP error with zero streamed events**: no response lifecycle exists
+  on the client yet, so the gateway synthesizes a matching pair —
+  `response.created` (`status:"in_progress"`) followed by `response.failed` —
+  under one id (the observed id when available, else the fixed
+  `resp_gateway_failed`), satisfying clients that only match terminals against a
+  registered response lifecycle.
+A single `response.failed` with an unrelated synthetic id was considered and
+rejected: a client matching terminals by id would discard it and hang again.
+Pre-turn rejections (malformed frame, append-before-create, continuation
+admission) keep the plain error frame; they have not exhibited the hang and
+remain an observation item.
+
+**Idle-period connection ownership and continuation lease.** Production logs
+proved that an upstream connection idle for 84-147s dies from "keepalive ping
+timeout": between turns nothing reads the connection, so gorilla never processes
+the upstream's ~20s pings and no pong is ever sent. The failure-terminal chain
+above resolves the *client* hang, but a continuation arriving after such an idle
+period still burns a turn (fast-failure + full-context resend). The goal is
+stronger than "keep the connection alive": a continuation must find the
+connection **provably live before its frame is written**, and a dead or expired
+connection must fail immediately — never wait, never migrate.
+
+- **Single reader per connection.** `responsesws.Session` is the sole owner of
+  connection state. Every established upstream connection runs one long-lived
+  read loop that performs ALL `ReadMessage` calls for the connection's lifetime.
+  During an active turn it routes business events to that turn's consumer;
+  while idle it keeps processing control frames (answering upstream pings), so
+  the connection no longer dies from reader absence. The read loop NEVER sets a
+  read deadline — a read-deadline timeout corrupts a gorilla connection, and
+  with a shared loop that corruption would outlive the turn that caused it. All
+  turn-level timeouts (`FirstEventTimeout`, `idleTimeout`) move to the consumer
+  side as `select`+timer.
+- **Active health checking.** While idle the session pings the upstream every
+  20 seconds (matching the upstream's own cadence); a ping not answered by a
+  pong within 10 seconds marks the connection dead and closes it (which also
+  terminates the read loop). With a permanent read loop the pong handler is
+  reliable, which is what made ad-hoc probing unsafe before.
+- **Continuation idle lease: 10 minutes.** A live connection is retained for
+  continuations for at most 10 idle minutes, then proactively closed so
+  abandoned client sessions cannot pin upstream sockets and goroutines
+  indefinitely.
+- **Pre-write liveness check.** A continuation is admitted only when the lease
+  is unexpired and the connection is marked live; otherwise the gateway fails
+  the turn immediately with the associated `response.failed` — the frame is
+  never written upstream, never replayed, never migrated. This removes the
+  "request may already be executing" ambiguity for the common idle-death case;
+  a race where the upstream dies between health checks still falls back to the
+  existing write-failure/terminal-chain path.
+- **Unchanged.** Self-contained turns keep the existing 30s idle-reconnect
+  policy (observation item: with keepalive working, D-triggered reconnects
+  become redundant ~300ms; revisit with production frequency data). Idle-period
+  business frames remain a protocol violation that invalidates the connection.
+  The HTTP fallback binding has no upstream WebSocket and is unaffected.
+  Connection, model, channel, and continuation state remain solely owned by
+  `Session` — no second pool or state table.
+- **Rollback** is by server image rollback; no permanent dual implementation is
+  kept. Regression tests must cover idle ping/pong keepalive, lease expiry,
+  read-loop termination, active-turn routing, and the continuation
+  never-migrates invariant.
+
 ## Alternatives considered
 
 - **Level A — client WebSocket, HTTP upstream only.** Terminate the client WS at
@@ -193,6 +314,16 @@ same socket.
 - **A second source of truth for "supports WS" (env var or global setting).**
   Rejected: WebSocket support is an upstream property, so it belongs on the
   channel, not a global toggle.
+- **WebSocket ping/pong liveness probe before reusing a connection.** Rejected as
+  implemented: reading the pong requires a deadlined `ReadMessage`, and a
+  read-deadline timeout corrupts the gorilla connection, so an ad-hoc probe would
+  break the very live connection it checks. A dependable probe needs a single
+  long-lived read loop that demultiplexes control and data frames — a connection
+  state-machine change not warranted for this fix. The idle-recycle + first-event
+  bound above achieves the same protection without that rewrite. This does not
+  prevent observing inbound upstream pings during an active read: the connection
+  temporarily wraps Gorilla's default ping handler with identical one-second
+  pong and error semantics and records only whether that pong succeeded.
 
 ## Consequences
 
@@ -217,7 +348,9 @@ Current focused automated coverage proves:
 
 - WebSocket payloads remove `stream`, `stream_options`, and `background`, while
   the untouched HTTP fallback body retains those transport fields.
-- A persistent session rejects channel, credential, and model changes; focused
+- A persistent session rejects channel and credential changes; a self-contained
+  model change rebinds (new channel selection, fresh upstream connection) while a
+  cross-model continuation is rejected fail-closed; focused
   controller tests distinguish self-contained turns from continuations when
   applying the retry/channel pin.
 - A write failure and a silent fresh connection after `response.create` do not
@@ -304,7 +437,24 @@ outstanding billing, lifecycle, race, or repository-wide gates have passed.
   new billing state. When a live connection remains available,
   `previous_response_not_found` is upstream-driven and relayed to the client.
   When the gateway has invalidated that connection, a later continuation fails
-  locally and is never submitted to a replacement socket.
+  locally and is never submitted to a replacement socket. Reused connections are
+  additionally guarded against silent idle-close: a **self-contained** turn whose
+  connection is idle beyond `ReuseIdleReconnectThreshold` (default 30s, tuned
+  from observed ~20s upstream ping cadence) recycles
+  and re-dials before the application frame is written (replay-safe), while a
+  continuation is never recycled (its `previous_response_id` is connection-owned)
+  and instead relies on the fail-fast bound; a reused turn's first upstream event
+  is bounded by `FirstEventTimeout` (30s) rather than the multi-minute idle
+  timeout, so a connection that dies within the idle window fails fast instead of
+  hanging. Both are covered by targeted reconnect / continuation-kept / fail-fast
+  tests. A temporary `responses websocket timing` diagnostic (handshake,
+  first-event, reused conn_age/idle_gap/write→first-event) is in place to confirm
+  these bounds in production and to tune the 30s threshold. Temporary protocol
+  diagnostics additionally record inbound-ping/pong outcomes, first/last event
+  types, terminal presence, stream-end errors, and whether the downstream error
+  frame was written. They never record request, response, SSE, or control-frame
+  payloads. All temporary diagnostics are to be removed once production behavior
+  is verified.
 
 The shared session removes `stream`, `stream_options`, and `background` before
 writing an upstream WebSocket frame. It binds the exact credential and uses one

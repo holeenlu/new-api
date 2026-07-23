@@ -321,10 +321,9 @@ func TestDoRequestModelAffinityUsesExactOutboundPayload(t *testing.T) {
 		"standard-api-key",
 	)
 	tests := []struct {
-		name       string
-		bodyModel  string
-		wantDial   bool
-		wantStatus int
+		name      string
+		bodyModel string
+		wantDial  bool
 	}{
 		{
 			name:      "raw passthrough model matches despite mapped relay model",
@@ -332,19 +331,22 @@ func TestDoRequestModelAffinityUsesExactOutboundPayload(t *testing.T) {
 			wantDial:  true,
 		},
 		{
-			name:       "different raw model cannot hide behind same mapped model",
-			bodyModel:  "raw-model-b",
-			wantStatus: http.StatusConflict,
+			// The exact-comparison contract survives the self-contained rebind rule:
+			// a differing raw model must never silently reuse the old binding — it
+			// rebinds (re-dials) instead.
+			name:      "different raw model rebinds instead of reusing the binding",
+			bodyModel: "raw-model-b",
+			wantDial:  true,
 		},
 		{
-			name:       "model affinity comparison is exact",
-			bodyModel:  "RAW-MODEL-A",
-			wantStatus: http.StatusConflict,
+			name:      "model affinity comparison is exact so case difference rebinds",
+			bodyModel: "RAW-MODEL-A",
+			wantDial:  true,
 		},
 		{
-			name:       "model affinity preserves outbound whitespace",
-			bodyModel:  " raw-model-a ",
-			wantStatus: http.StatusConflict,
+			name:      "model affinity preserves outbound whitespace so it rebinds",
+			bodyModel: " raw-model-a ",
+			wantDial:  true,
 		},
 	}
 
@@ -368,17 +370,8 @@ func TestDoRequestModelAffinityUsesExactOutboundPayload(t *testing.T) {
 			)
 
 			require.Nil(t, response)
-			if test.wantDial {
-				require.ErrorIs(t, err, dialErr)
-				assert.Equal(t, int32(1), driver.dialCalls.Load())
-				return
-			}
-			var apiError *types.NewAPIError
-			require.ErrorAs(t, err, &apiError)
-			assert.Equal(t, test.wantStatus, apiError.StatusCode)
-			assert.Equal(t, types.ErrorCodeInvalidRequest, apiError.GetErrorCode())
-			assert.True(t, types.IsSkipRetryError(apiError))
-			assert.Zero(t, driver.dialCalls.Load())
+			require.ErrorIs(t, err, dialErr)
+			assert.Equal(t, int32(1), driver.dialCalls.Load())
 		})
 	}
 }
@@ -735,12 +728,6 @@ func TestDoRequestRejectsCredentialSwitchOnPersistentConnection(t *testing.T) {
 }
 
 func TestDoRequestReturnsConflictForSessionAffinitySwitch(t *testing.T) {
-	fingerprint := service.SubscriptionOAuthCredentialFingerprint(
-		constant.ChannelTypeOpenAI,
-		107,
-		0,
-		"credential-a",
-	)
 	tests := []struct {
 		name    string
 		session *Session
@@ -750,15 +737,6 @@ func TestDoRequestReturnsConflictForSessionAffinitySwitch(t *testing.T) {
 			name:    "channel",
 			session: &Session{channelID: 107},
 			info:    newSessionTestRelayInfo(108, 0, "credential-a"),
-		},
-		{
-			name: "model",
-			session: &Session{
-				channelID:             107,
-				credentialFingerprint: fingerprint,
-				model:                 "gpt-other",
-			},
-			info: newSessionTestRelayInfo(107, 0, "credential-a"),
 		},
 	}
 
@@ -1163,4 +1141,327 @@ func TestClosingResponseBodyStopsUpstreamReaderBeforeNextTurn(t *testing.T) {
 	require.NoError(t, response.Body.Close())
 	assert.Contains(t, string(body), "event: response.completed")
 	assert.Equal(t, int32(2), connectionCount.Load())
+}
+
+// D: a connection idle beyond ReuseIdleReconnectThreshold is recycled — the next
+// turn reconnects (a fresh handshake) rather than reusing a possibly-dead socket.
+func TestDoRequestReconnectsAfterIdleThreshold(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	original := ReuseIdleReconnectThreshold
+	ReuseIdleReconnectThreshold = 20 * time.Millisecond
+	defer func() { ReuseIdleReconnectThreshold = original }()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+
+	// Turn 1: self-contained; establishes the connection.
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(110, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+
+	// Drive the idle baseline into the past instead of sleeping, so the threshold
+	// fires deterministically without depending on scheduler timing.
+	session.mu.Lock()
+	session.lastUsedAt = time.Now().Add(-time.Minute)
+	session.mu.Unlock()
+
+	// Turn 2: self-contained; idle beyond the threshold recycles and re-dials.
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(110, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"two"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp2.Body.Close())
+
+	// The second turn recycled the idle connection and re-dialed.
+	assert.Equal(t, int32(2), driver.dialCalls.Load())
+}
+
+// H: within the idle threshold a reused connection can still be silently dead.
+// The turn's request is already written (no replay), but it must fail in
+// ~FirstEventTimeout, not block for the full idleTimeout (minutes).
+func TestDoRequestReusedTurnFailsFastOnSilentConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalFirstEvent := FirstEventTimeout
+	FirstEventTimeout = 100 * time.Millisecond
+	defer func() { FirstEventTimeout = originalFirstEvent }()
+	originalThreshold := ReuseIdleReconnectThreshold
+	ReuseIdleReconnectThreshold = time.Hour // keep D from firing so we exercise H
+	defer func() { ReuseIdleReconnectThreshold = originalThreshold }()
+
+	release := make(chan struct{})
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+			return
+		}
+		// Second turn: stay silent (never read or reply) while keeping the socket
+		// open — a half-open / idle-dead connection.
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(111, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+
+	start := time.Now()
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(111, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"two"}`))
+	require.NoError(t, err)
+	_, readErr := io.ReadAll(resp2.Body)
+	elapsed := time.Since(start)
+	_ = resp2.Body.Close()
+
+	require.Error(t, readErr) // first-event timeout surfaces as a stream read error
+	assert.Less(t, elapsed, 2*time.Second, "reused dead connection must fail fast, not block idleTimeout")
+	assert.Equal(t, int32(1), driver.dialCalls.Load()) // reused (D did not fire), then failed fast
+}
+
+// D must NOT recycle a continuation: previous_response_id is owned by this exact
+// connection, so an idle-over-threshold continuation keeps its socket (no second
+// handshake) rather than moving to a replacement. A dead connection would be
+// failed fast by H instead, never reconnected-and-resubmitted.
+func TestDoRequestKeepsContinuationOnIdleConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+
+	// Turn 1: self-contained; emits response id resp_1 owned by this connection.
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(112, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+
+	// Idle far beyond the threshold.
+	session.mu.Lock()
+	session.lastUsedAt = time.Now().Add(-time.Minute)
+	session.mu.Unlock()
+
+	// Turn 2: continuation on resp_1. Must reuse the same connection despite the
+	// idle gap — never a second handshake, never a fallback.
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(112, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","previous_response_id":"resp_1","input":"two"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp2.Body.Close())
+
+	assert.Equal(t, int32(1), driver.dialCalls.Load()) // continuation kept its connection
+	assert.Zero(t, driver.fallbackCalls.Load())
+}
+
+func TestDoRequestRepliesToUpstreamPing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	pongObserved := make(chan string, 1)
+	serverErr := make(chan error, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			serverErr <- err
+			return
+		}
+		conn.SetPongHandler(func(message string) error {
+			pongObserved <- message
+			return nil
+		})
+		if err := conn.WriteControl(websocket.PingMessage, []byte("keepalive-check"), time.Now().Add(time.Second)); err != nil {
+			serverErr <- err
+			return
+		}
+		go func() {
+			select {
+			case message := <-pongObserved:
+				if message != "keepalive-check" {
+					serverErr <- fmt.Errorf("unexpected pong payload %q", message)
+					return
+				}
+				serverErr <- conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+			case <-time.After(2 * time.Second):
+				serverErr <- errors.New("timed out waiting for upstream pong")
+			}
+		}()
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(
+		newSessionTestContext(),
+		driver,
+		newSessionTestRelayInfo(113, 0, "credential-a"),
+		strings.NewReader(`{"model":"gpt-test","input":"ping"}`),
+	)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Contains(t, string(body), "response.completed")
+	require.NoError(t, <-serverErr)
+}
+
+func TestEmitEventAndMaybeStopReturnsProtocolAndPipeErrors(t *testing.T) {
+	session := &Session{}
+
+	reader, writer := io.Pipe()
+	_, stop, err := session.emitEventAndMaybeStop(nil, writer, []byte(`{"type":`))
+	require.True(t, stop)
+	require.Error(t, err)
+	_ = reader.Close()
+
+	reader, writer = io.Pipe()
+	require.NoError(t, reader.Close())
+	eventType, stop, err := session.emitEventAndMaybeStop(nil, writer, []byte(`{"type":"response.created"}`))
+	require.Equal(t, "response.created", eventType)
+	require.True(t, stop)
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+}
+
+// A self-contained turn may switch models within one downstream session: the
+// old binding (connection, model, response ids) is dropped and the new model
+// establishes a fresh upstream connection instead of failing with 409.
+func TestDoRequestSelfContainedModelSwitchReconnects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+
+	for i, body := range []string{
+		`{"model":"gpt-model-a","input":"one"}`,
+		`{"model":"gpt-model-b","input":"two"}`,
+	} {
+		resp, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(130, 0, "credential-a"), strings.NewReader(body))
+		require.NoError(t, err, "turn %d", i)
+		_, err = io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+	}
+
+	// The model switch dropped the old connection and re-dialed for the new model.
+	assert.Equal(t, int32(2), driver.dialCalls.Load())
+	assert.Zero(t, driver.fallbackCalls.Load())
+}
+
+// A continuation must never follow a model switch: previous_response_id is owned
+// by the old model's connection, so a cross-model continuation stays fail-closed
+// (409) without reconnecting or moving to another channel.
+func TestDoRequestCrossModelContinuationRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+
+	resp1, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(131, 0, "credential-a"), strings.NewReader(`{"model":"gpt-model-a","input":"one"}`))
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp1.Body.Close())
+
+	resp2, err := session.DoRequest(newSessionTestContext(), driver, newSessionTestRelayInfo(131, 0, "credential-a"), strings.NewReader(`{"model":"gpt-model-b","previous_response_id":"resp_1","input":"two"}`))
+	require.Nil(t, resp2)
+	require.Error(t, err)
+	var apiError *types.NewAPIError
+	require.ErrorAs(t, err, &apiError)
+	assert.Equal(t, http.StatusConflict, apiError.StatusCode)
+	assert.True(t, types.IsSkipRetryError(apiError))
+	// No reconnect, no fallback: the continuation was refused fail-closed.
+	assert.Equal(t, int32(1), driver.dialCalls.Load())
+	assert.Zero(t, driver.fallbackCalls.Load())
 }

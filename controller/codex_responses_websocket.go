@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/responsesws"
@@ -35,6 +36,17 @@ const maxResponsesWebSocketPendingBytes = (16 << 20) + (64 << 10)
 const (
 	maxResponsesWebSocketQueuedFrames = 1
 	responsesWebSocketWriteTimeout    = 30 * time.Second
+	// responsesWebSocketControlWriteTimeout bounds a keepalive control-frame
+	// write, mirroring the 1s bound gorilla uses for control frames so a slow
+	// client cannot stall the keepalive pump.
+	responsesWebSocketControlWriteTimeout = time.Second
+	// responsesWebSocketKeepaliveInterval paces server→client pings so
+	// intermediaries (reverse proxies, NAT gateways — commonly 60s idle limits)
+	// keep the idle downstream connection open between turns, and a dead client
+	// is detected instead of holding session resources. Kept below the common
+	// 60s intermediary timeout with margin; clients answer pings in the protocol
+	// stack automatically, so no client change is needed.
+	responsesWebSocketKeepaliveInterval = 25 * time.Second
 )
 
 const responsesWebSocketInternalPinKey = "responses_websocket_internal_pin"
@@ -75,7 +87,14 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	defer cancelConnection()
 	clientFrames := make(chan responsesWebSocketClientFrame, maxResponsesWebSocketQueuedFrames)
 	go readResponsesWebSocketClientFrames(connectionContext, cancelConnection, conn, clientFrames)
+	go runResponsesWebSocketKeepalive(connectionContext, cancelConnection, conn, responsesWebSocketKeepaliveInterval)
 	pinnedChannelID := 0
+	// pinnedModel is the client-level model bound to the session's current
+	// channel affinity. A self-contained turn that requests a different model
+	// releases the internal pin and the session binding BEFORE distribution, so
+	// the new model re-enters ordinary channel selection instead of being routed
+	// to (and rejected by) the old model's channel.
+	pinnedModel := ""
 	// turnReferencesPriorResponse marks a turn that chains onto a prior response's
 	// server-side state (previous_response_id). Such a turn must stay on the account
 	// that produced that response; switching credentials would make the reference
@@ -162,6 +181,16 @@ func CodexResponsesWebSocket(c *gin.Context) {
 			}
 			continue
 		}
+		requestModel := strings.TrimSpace(stringValue(frame["model"]))
+		if shouldRebindResponsesWebSocketModel(pinnedModel, requestModel, turnReferencesPriorResponse) {
+			// Self-contained model switch: release the controller-owned pin and the
+			// session's connection/channel/response-id binding before distribution.
+			// An externally requested specific-channel pin is re-installed by
+			// TokenAuth on every turn and is deliberately not touched here.
+			pinnedChannelID = 0
+			pinnedModel = ""
+			session.ResetChannelForRetry()
+		}
 		body, err := common.Marshal(frame)
 		if err != nil {
 			if writeResponsesWebSocketError(conn, http.StatusBadRequest, err.Error(), "") != nil {
@@ -180,9 +209,14 @@ func CodexResponsesWebSocket(c *gin.Context) {
 		request.Header.Set("Accept", "text/event-stream")
 		request.RemoteAddr = c.Request.RemoteAddr
 
-		writer := newResponsesWebSocketSSEWriter(conn)
+		writer := newResponsesWebSocketSSEWriter(request.Context(), conn)
 		bindingFailure = false
 		engine.ServeHTTP(writer, request)
+		if pinnedChannelID != 0 {
+			pinnedModel = requestModel
+		} else {
+			pinnedModel = ""
+		}
 		if err := writer.Finish(); err != nil {
 			return
 		}
@@ -199,6 +233,32 @@ func CodexResponsesWebSocket(c *gin.Context) {
 	}
 }
 
+// runResponsesWebSocketKeepalive is the downstream connection's keepalive pump.
+// Between turns the client WebSocket carries no traffic, so an intermediary idle
+// timeout can silently kill it; the client's next message is then written into a
+// dead socket and hangs until a transport-level timeout. Periodic server→client
+// pings keep the connection visibly active (clients answer pongs in the protocol
+// stack). WriteControl is documented safe to call concurrently with other
+// connection writes, so this needs no coordination with the SSE writer. A failed
+// ping means the client is gone: cancel the connection so the reader and any
+// in-flight turn are released promptly.
+func runResponsesWebSocketKeepalive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			deadline := time.Now().Add(responsesWebSocketControlWriteTimeout)
+			if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
 // responsesWebSocketContinuationError enforces the controller-owned admission
 // boundary before authentication, channel distribution, parameter overrides or
 // billing can run for a connection-local continuation.
@@ -210,6 +270,18 @@ func responsesWebSocketContinuationError(previousResponseID string, session *res
 		return nil
 	}
 	return responsesws.NewContinuationUnavailableError()
+}
+
+// shouldRebindResponsesWebSocketModel reports whether a turn is a self-contained
+// model switch: the session is bound to one model, the new turn requests a
+// different one, and it carries no previous_response_id. The official protocol
+// scopes a connection to an account rather than a model, so such a turn rebinds
+// (new channel selection, new upstream connection) instead of failing with 409.
+// A continuation never rebinds: its previous_response_id is owned by the old
+// model's connection and stays fail-closed.
+func shouldRebindResponsesWebSocketModel(pinnedModel, requestModel string, referencesPriorResponse bool) bool {
+	return pinnedModel != "" && requestModel != "" &&
+		!strings.EqualFold(requestModel, pinnedModel) && !referencesPriorResponse
 }
 
 func applyResponsesWebSocketTurnPin(turn *gin.Context, pinnedChannelID int, referencesPriorResponse bool) {
@@ -407,19 +479,24 @@ func responsesWebSocketFrameReferencesPriorResponse(frame map[string]any) bool {
 
 type responsesWebSocketSSEWriter struct {
 	mu               sync.Mutex
+	ctx              context.Context
 	conn             *websocket.Conn
 	header           http.Header
 	status           int
 	pending          []byte
 	raw              []byte
 	sent             int
+	responseID       string
 	sawTerminal      bool
 	sawCleanTerminal bool
 	err              error
 }
 
-func newResponsesWebSocketSSEWriter(conn *websocket.Conn) *responsesWebSocketSSEWriter {
-	return &responsesWebSocketSSEWriter{conn: conn, header: make(http.Header)}
+func newResponsesWebSocketSSEWriter(ctx context.Context, conn *websocket.Conn) *responsesWebSocketSSEWriter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &responsesWebSocketSSEWriter{ctx: ctx, conn: conn, header: make(http.Header)}
 }
 
 func (w *responsesWebSocketSSEWriter) Header() http.Header {
@@ -488,10 +565,14 @@ func (w *responsesWebSocketSSEWriter) Finish() error {
 	if w.sent > 0 {
 		if !w.sawTerminal {
 			// The relay streamed partial output then ended without a terminal event
-			// (e.g. the upstream dropped mid-stream). Emit a synthetic error frame so
-			// a strict Responses-WebSocket client does not hang awaiting
-			// response.completed.
-			return writeResponsesWebSocketError(w.conn, http.StatusBadGateway, "upstream stream ended before completion", "")
+			// (e.g. the upstream dropped mid-stream). Emit a synthetic response.failed
+			// terminal so a strict Responses-WebSocket client resolves the in-flight
+			// turn instead of hanging on "thinking".
+			writeErr := writeResponsesWebSocketFailureTerminal(w.conn, http.StatusBadGateway, gin.H{
+				"message": "upstream stream ended before completion",
+			}, "", w.responseID, false)
+			w.logErrorFrameResult("missing_terminal", http.StatusBadGateway, http.StatusBadGateway, writeErr)
+			return writeErr
 		}
 		return nil
 	}
@@ -512,11 +593,25 @@ func (w *responsesWebSocketSSEWriter) Finish() error {
 		message = http.StatusText(w.status)
 	}
 	if upstreamError, ok := responsesWebSocketHTTPError(w.raw); ok {
-		return writeResponsesWebSocketErrorObject(w.conn, w.status, upstreamError, w.header.Get("Retry-After"))
+		writeErr := writeResponsesWebSocketFailureTerminal(w.conn, w.status, upstreamError, w.header.Get("Retry-After"), w.responseID, true)
+		w.logErrorFrameResult("http_error", w.status, upstreamError["code"], writeErr)
+		return writeErr
 	}
 	// Carry the retry timing the relay resolved (Retry-After was written to this
 	// writer's header map) so the client learns when the credential recovers.
-	return writeResponsesWebSocketError(w.conn, w.status, message, w.header.Get("Retry-After"))
+	writeErr := writeResponsesWebSocketFailureTerminal(w.conn, w.status, gin.H{
+		"message": message,
+	}, w.header.Get("Retry-After"), w.responseID, true)
+	w.logErrorFrameResult("http_error", w.status, w.status, writeErr)
+	return writeErr
+}
+
+func (w *responsesWebSocketSSEWriter) logErrorFrameResult(source string, status int, code any, writeErr error) {
+	if writeErr != nil {
+		logger.LogWarn(w.ctx, fmt.Sprintf("responses websocket protocol: downstream_error_frame_write_failed source=%s status=%d code=%v err=%s", source, status, code, writeErr.Error()))
+		return
+	}
+	logger.LogInfo(w.ctx, fmt.Sprintf("responses websocket protocol: downstream_error_frame_sent source=%s status=%d code=%v", source, status, code))
 }
 
 func (w *responsesWebSocketSSEWriter) drainSSEFrames(flushRemainder bool) {
@@ -582,6 +677,9 @@ func (w *responsesWebSocketSSEWriter) writeSSEBlock(block []byte) {
 	if responsesWebSocketEventIsCleanTerminal(eventType) {
 		w.sawCleanTerminal = true
 	}
+	if responseID := responsesWebSocketPayloadResponseID(payload); responseID != "" {
+		w.responseID = responseID
+	}
 	w.err = writeResponsesWebSocketMessage(w.conn, []byte(payload))
 	if w.err == nil {
 		w.sent++
@@ -609,6 +707,18 @@ func responsesWebSocketPayloadType(payload string) string {
 		return ""
 	}
 	return event.Type
+}
+
+func responsesWebSocketPayloadResponseID(payload string) string {
+	var event struct {
+		Response struct {
+			ID string `json:"id"`
+		} `json:"response"`
+	}
+	if err := common.Unmarshal([]byte(payload), &event); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(event.Response.ID)
 }
 
 // responsesWebSocketEventIsTerminal reports whether a forwarded event is a
@@ -701,10 +811,27 @@ func writeResponsesWebSocketErrorObject(conn *websocket.Conn, status int, errorO
 	if conn == nil {
 		return errors.New("responses websocket connection is nil")
 	}
+	payload, err := common.Marshal(gin.H{
+		"type":  "error",
+		"error": normalizeResponsesWebSocketErrorObject(status, errorObject, retryAfter),
+	})
+	if err != nil {
+		return err
+	}
+	return writeResponsesWebSocketMessage(conn, payload)
+}
+
+// normalizeResponsesWebSocketErrorObject fills the defaulted error fields shared
+// by every downstream error shape: error type derived from the HTTP status, the
+// status as fallback code, and the relay-resolved Retry-After as numeric
+// retry_after.
+func normalizeResponsesWebSocketErrorObject(status int, errorObject gin.H, retryAfter string) gin.H {
 	if errorObject == nil {
 		errorObject = gin.H{}
 	}
-	if strings.TrimSpace(fmt.Sprint(errorObject["type"])) == "" {
+	// A type assertion (not fmt.Sprint) so an absent key — Sprint(nil) is "<nil>",
+	// not "" — still receives the status-derived default.
+	if typeValue, ok := errorObject["type"].(string); !ok || strings.TrimSpace(typeValue) == "" {
 		errorObject["type"] = responsesWebSocketErrorType(status)
 	}
 	if errorObject["code"] == nil || strings.TrimSpace(fmt.Sprint(errorObject["code"])) == "" {
@@ -713,9 +840,47 @@ func writeResponsesWebSocketErrorObject(conn *websocket.Conn, status int, errorO
 	if seconds, convErr := strconv.Atoi(strings.TrimSpace(retryAfter)); convErr == nil && seconds > 0 {
 		errorObject["retry_after"] = seconds
 	}
+	return errorObject
+}
+
+// writeResponsesWebSocketFailureTerminal emits a gateway-owned terminal chain for
+// a turn that entered relay handling but could not reach a normal upstream
+// terminal. Before any upstream event arrived, synthesize response.created first
+// because Codex clients associate the terminal with a response lifecycle rather
+// than a bare error frame. When the stream already exposed a response id, reuse
+// it so the synthetic failure matches the in-flight response the client knows.
+func writeResponsesWebSocketFailureTerminal(conn *websocket.Conn, status int, errorObject gin.H, retryAfter string, responseID string, includeCreated bool) error {
+	if conn == nil {
+		return errors.New("responses websocket connection is nil")
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		responseID = "resp_gateway_failed"
+	}
+	if includeCreated {
+		createdPayload, err := common.Marshal(gin.H{
+			"type": "response.created",
+			"response": gin.H{
+				"id":     responseID,
+				"object": "response",
+				"status": "in_progress",
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if err := writeResponsesWebSocketMessage(conn, createdPayload); err != nil {
+			return err
+		}
+	}
 	payload, err := common.Marshal(gin.H{
-		"type":  "error",
-		"error": errorObject,
+		"type": "response.failed",
+		"response": gin.H{
+			"id":     responseID,
+			"object": "response",
+			"status": "failed",
+			"error":  normalizeResponsesWebSocketErrorObject(status, errorObject, retryAfter),
+		},
 	})
 	if err != nil {
 		return err

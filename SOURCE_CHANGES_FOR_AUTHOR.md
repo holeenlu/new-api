@@ -197,6 +197,11 @@ GET /v1/responses  (WebSocket Upgrade)
   错误处理链；同一会话固定渠道，避免 OAuth 身份在会话中途漂移；
 - 上游 WebSocket 事件按客户端协议实时返回；上游明确返回 `426 Upgrade Required`
   时自动回退 HTTP/SSE，不会因上游暂未开放 WebSocket 而中断请求。
+- 自包含 turn 的上游连接空闲超过 30 秒时，会在写入 `response.create` 前主动重连；
+  带 `previous_response_id` 的 continuation 始终保留原连接，不能迁移到替代连接。
+  复用连接的首事件等待限制为 30 秒，超时后不重放已写入的请求，避免重复执行或重复扣费。
+  临时协议诊断只记录握手、事件类型、事件间隔、Ping/Pong 结果、终止状态及错误帧写回结果，
+  不记录请求正文、响应正文、SSE 内容或 WebSocket 控制帧载荷；生产行为确认后移除该诊断。
 - WebSocket 帧和转换后的请求体统一使用 `MAX_REQUEST_BODY_MB` 限制，默认 `128 MB`，
   不再单独使用固定的 `16 MB` 限制；超限返回 `413 Request Entity Too Large`，并标记为
   不可重试，避免大请求被重复发送到备用渠道。每轮结束只保留后续 append 所需的模型和配置字段，

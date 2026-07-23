@@ -32,7 +32,7 @@ func TestResponsesWebSocketSSEWriterForwardsJSONEvents(t *testing.T) {
 		}
 		defer conn.Close()
 
-		writer := newResponsesWebSocketSSEWriter(conn)
+		writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 		_, err = writer.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hel"))
 		if err != nil {
 			serverErr <- err
@@ -150,7 +150,7 @@ func TestResponsesWebSocketErrorFrameCarriesClassificationAndRetryAfter(t *testi
 			return
 		}
 		defer conn.Close()
-		writer := newResponsesWebSocketSSEWriter(conn)
+		writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 		// Mirror the relay setting a status and Retry-After before any output.
 		writer.Header().Set("Retry-After", "30")
 		writer.WriteHeader(http.StatusTooManyRequests)
@@ -163,10 +163,16 @@ func TestResponsesWebSocketErrorFrameCarriesClassificationAndRetryAfter(t *testi
 	require.NoError(t, err)
 	defer conn.Close()
 
+	_, createdFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.created","response":{"id":"resp_gateway_failed","object":"response","status":"in_progress"}}`,
+		string(createdFrame),
+	)
 	_, frame, err := conn.ReadMessage()
 	require.NoError(t, err)
 	require.JSONEq(t,
-		`{"type":"error","error":{"message":"Too Many Requests","type":"rate_limit_error","code":429,"retry_after":30}}`,
+		`{"type":"response.failed","response":{"id":"resp_gateway_failed","object":"response","status":"failed","error":{"message":"Too Many Requests","type":"rate_limit_error","code":429,"retry_after":30}}}`,
 		string(frame),
 	)
 	require.NoError(t, <-serverErr)
@@ -241,7 +247,7 @@ func TestResponsesWebSocketSSEWriterMarksSuccessOnlyOnCleanTerminal(t *testing.T
 					return
 				}
 				defer conn.Close()
-				writer := newResponsesWebSocketSSEWriter(conn)
+				writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 				_, _ = writer.Write([]byte("data: " + tc.event + "\n\n"))
 				_ = writer.Finish()
 				got <- writer.SucceededTurn()
@@ -340,7 +346,7 @@ func TestResponsesWebSocketSSEWriterNormalizesResponseDone(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				writer := newResponsesWebSocketSSEWriter(conn)
+				writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 				_, err = writer.Write([]byte("data: " + test.payload + "\n\n"))
 				if err == nil {
 					err = writer.Finish()
@@ -380,7 +386,7 @@ func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				writer := newResponsesWebSocketSSEWriter(conn)
+				writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 				writer.WriteHeader(status)
 				serverErr <- writer.Finish()
 			}))
@@ -390,10 +396,16 @@ func TestResponsesWebSocketSSEWriterMapsEmptySuccessToBadGateway(t *testing.T) {
 			conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 			require.NoError(t, err)
 			defer conn.Close()
+			_, createdFrame, err := conn.ReadMessage()
+			require.NoError(t, err)
+			require.JSONEq(t,
+				`{"type":"response.created","response":{"id":"resp_gateway_failed","object":"response","status":"in_progress"}}`,
+				string(createdFrame),
+			)
 			_, frame, err := conn.ReadMessage()
 			require.NoError(t, err)
 			require.JSONEq(t,
-				`{"type":"error","error":{"message":"upstream returned an empty response stream","type":"server_error","code":502}}`,
+				`{"type":"response.failed","response":{"id":"resp_gateway_failed","object":"response","status":"failed","error":{"message":"upstream returned an empty response stream","type":"server_error","code":502}}}`,
 				string(frame),
 			)
 			require.NoError(t, <-serverErr)
@@ -410,7 +422,7 @@ func TestResponsesWebSocketSSEWriterPreservesStructuredHTTPError(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		writer := newResponsesWebSocketSSEWriter(conn)
+		writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
 		writer.WriteHeader(http.StatusConflict)
 		_, err = writer.Write([]byte(
 			`{"error":{"message":"credential binding changed","type":"new_api_error","code":"channel:invalid_key"}}`,
@@ -428,11 +440,65 @@ func TestResponsesWebSocketSSEWriterPreservesStructuredHTTPError(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
+	_, createdFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.created","response":{"id":"resp_gateway_failed","object":"response","status":"in_progress"}}`,
+		string(createdFrame),
+	)
 	_, frame, err := conn.ReadMessage()
 	require.NoError(t, err)
 	require.JSONEq(t,
-		`{"type":"error","error":{"message":"credential binding changed","type":"new_api_error","code":"channel:invalid_key"}}`,
+		`{"type":"response.failed","response":{"id":"resp_gateway_failed","object":"response","status":"failed","error":{"message":"credential binding changed","type":"new_api_error","code":"channel:invalid_key"}}}`,
 		string(frame),
+	)
+	require.NoError(t, <-serverErr)
+}
+
+func TestResponsesWebSocketSSEWriterMissingTerminalReusesObservedResponseID(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		writer := newResponsesWebSocketSSEWriter(context.Background(), conn)
+		_, err = writer.Write([]byte(
+			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"status\":\"in_progress\"}}\n\n" +
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+		))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- writer.Finish()
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, firstFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.created","response":{"id":"resp_partial","status":"in_progress"}}`,
+		string(firstFrame),
+	)
+	_, secondFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.output_text.delta","delta":"hi"}`,
+		string(secondFrame),
+	)
+	_, failureFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.failed","response":{"id":"resp_partial","object":"response","status":"failed","error":{"message":"upstream stream ended before completion","type":"server_error","code":502}}}`,
+		string(failureFrame),
 	)
 	require.NoError(t, <-serverErr)
 }
@@ -593,7 +659,7 @@ func TestResponsesWebSocketTurnPinKeepsStatefulCredentialFixed(t *testing.T) {
 // An upstream that streams data without an SSE frame boundary must not grow the
 // pending buffer without bound: past the cap Write returns an error and stops.
 func TestResponsesWebSocketSSEWriterBoundsPendingBuffer(t *testing.T) {
-	w := newResponsesWebSocketSSEWriter(nil)
+	w := newResponsesWebSocketSSEWriter(context.Background(), nil)
 	w.pending = []byte(strings.Repeat("a", maxResponsesWebSocketPendingBytes))
 	pendingBefore := len(w.pending)
 	_, writeErr := w.Write([]byte("b"))
@@ -622,4 +688,106 @@ func TestResponsesWebSocketSSEBoundarySupportsLFAndCRLFWithoutRewriting(t *testi
 			assert.Equal(t, test.wantWidth, width)
 		})
 	}
+}
+
+// A self-contained turn that changes model releases the internal channel pin and
+// rebinds; a continuation or an unbound session never triggers the rebind.
+func TestShouldRebindResponsesWebSocketModel(t *testing.T) {
+	tests := []struct {
+		name            string
+		pinnedModel     string
+		requestModel    string
+		referencesPrior bool
+		want            bool
+	}{
+		{"self-contained switch", "gpt-a", "gpt-b", false, true},
+		{"same model", "gpt-a", "gpt-a", false, false},
+		{"case-insensitive same model", "gpt-a", "GPT-A", false, false},
+		{"continuation never rebinds", "gpt-a", "gpt-b", true, false},
+		{"no prior binding", "", "gpt-b", false, false},
+		{"missing request model", "gpt-a", "", false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, shouldRebindResponsesWebSocketModel(tc.pinnedModel, tc.requestModel, tc.referencesPrior))
+		})
+	}
+}
+
+// The downstream keepalive pump must ping an idle client so intermediaries see
+// traffic between turns, and a failed ping must cancel the connection context so
+// a dead client releases the session's resources.
+func TestResponsesWebSocketKeepalive(t *testing.T) {
+	const testKeepaliveInterval = 20 * time.Millisecond
+
+	t.Run("idle client receives pings", func(t *testing.T) {
+		pings := make(chan struct{}, 4)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go runResponsesWebSocketKeepalive(ctx, cancel, conn, testKeepaliveInterval)
+			// Keep the server-side reader alive for the duration of the test.
+			_, _, _ = conn.ReadMessage()
+		}))
+		defer server.Close()
+
+		url := "ws" + strings.TrimPrefix(server.URL, "http")
+		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		conn.SetPingHandler(func(string) error {
+			select {
+			case pings <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		// The client must be reading for its ping handler to run.
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+
+		select {
+		case <-pings:
+		case <-time.After(2 * time.Second):
+			t.Fatal("idle client received no keepalive ping")
+		}
+	})
+
+	t.Run("failed ping cancels the connection", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// Close the raw connection under the pump: the next ping write fails and
+			// must cancel the context.
+			_ = conn.Close()
+			go runResponsesWebSocketKeepalive(ctx, cancel, conn, testKeepaliveInterval)
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+				t.Error("failed keepalive ping did not cancel the connection context")
+			}
+		}))
+		defer server.Close()
+
+		url := "ws" + strings.TrimPrefix(server.URL, "http")
+		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		// Wait for the server handler to finish its assertions.
+		_, _, _ = conn.ReadMessage()
+	})
 }
