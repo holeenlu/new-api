@@ -290,6 +290,11 @@ connection must fail immediately — never wait, never migrate.
   upstream adds an extension event. Any `ReadMessage` error atomically
   invalidates its connection generation and response ids before notifying the
   active turn, even when the turn queue is full or a terminal was already queued.
+  The consumer always drains already-queued turn events before observing that
+  generation's stop signal, so a `response.completed` already accepted by the
+  reader is forwarded as success rather than being replaced by a generic
+  connection-closed failure. A cancelled downstream context takes precedence
+  over queued events and closes the upstream promptly.
 - **On-demand pre-write liveness.** The permanent reader answers the upstream's
   own keepalive pings, so no second periodic client-ping goroutine is needed.
   Upstream data and successful control exchanges update connection-local

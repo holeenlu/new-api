@@ -126,7 +126,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	return nil
 }
 
-func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+// FinalizeClaudeStreamUsage captures the billable output before either a normal
+// stream completion or a committed terminal error is written downstream.
+func FinalizeClaudeStreamUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
@@ -151,6 +153,10 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	if claudeInfo.Usage != nil && claudeInfo.Usage.BillingUsage == nil {
 		claudeInfo.Usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(buildMessageDeltaPatchUsage(nil, claudeInfo))
 	}
+}
+
+func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+	FinalizeClaudeStreamUsage(c, info, claudeInfo)
 
 	if info.RelayFormat == types.RelayFormatClaude {
 		//
@@ -177,6 +183,17 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 
 	subscriptionOAuth := relaycommon.IsSubscriptionOAuthChannel(info.ChannelType)
+	if subscriptionOAuth {
+		if usageErr := service.SubscriptionOAuthUsageLimitFromResponseHeaders(resp.Header, time.Now()); usageErr != nil {
+			// A rejected usage window is already a terminal inference result. Do
+			// not wait for the first-event timeout when the provider has confirmed
+			// that this credential cannot produce output; close the body so the
+			// lease is released and routing can immediately select a backup.
+			helper.ClearEventStreamHeaders(c)
+			service.CloseResponseBodyGracefully(resp)
+			return nil, usageErr
+		}
+	}
 
 	var err *types.NewAPIError
 	var firstEventSeen atomic.Bool
@@ -206,6 +223,24 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		helper.StreamScannerHandler(c, resp, info, handleData)
 	}
 	if err != nil {
+		if c.Writer.Written() {
+			// Once a Claude SSE event has reached the client, an HTTP JSON error is
+			// no longer a valid terminal response. Preserve the typed failure for
+			// channel health and billing, then end this committed stream with the
+			// protocol's event:error frame.
+			FinalizeClaudeStreamUsage(c, info, claudeInfo)
+			err = service.ApplyChannelErrorPolicy(info.ChannelType, err)
+			info.MarkCommittedUpstreamError(err)
+			switch info.RelayFormat {
+			case types.RelayFormatClaude:
+				_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: err.ToClaudeError()})
+			case types.RelayFormatOpenAI:
+				if payload, marshalErr := common.Marshal(gin.H{"error": err.ToOpenAIError()}); marshalErr == nil {
+					_ = helper.StringData(c, string(payload))
+				}
+			}
+			return claudeInfo.Usage, nil
+		}
 		return nil, err
 	}
 

@@ -55,7 +55,7 @@ func TestLocalizedRelayErrorMessage(t *testing.T) {
 			code:        types.ErrorCodeUpstreamUsageLimit,
 			retryAfter:  0,
 			wantOK:      true,
-			wantContain: []string{"额度重置后自动恢复"},
+			wantContain: []string{"上游未提供恢复时间", "额度重置后会自动恢复"},
 		},
 		{
 			name:        "rate limited zh-CN with retry seconds",

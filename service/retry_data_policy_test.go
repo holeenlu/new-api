@@ -302,9 +302,9 @@ func TestCapacityFailureDoesNotConsumeCredentialAttemptBudget(t *testing.T) {
 	fingerprint := SubscriptionOAuthCredentialFingerprint(channel.Type, channel.Id, 0, channel.Key)
 	retryParam := &RetryParam{Boundary: boundary}
 
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
+	require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
 	retryParam.handleSubscriptionOAuthCapacityFailure()
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
+	require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(channel.Id, 0, fingerprint))
 }
 
 func TestRetryBoundaryExcludesDuplicateChannelsUsingFailedCredential(t *testing.T) {
@@ -342,7 +342,7 @@ func TestSubscriptionOAuthFiveFailuresSwitchWithinFrozenGroup(t *testing.T) {
 	boundary := NewRetryBoundary(initial, "default")
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &RetryParam{Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	for attempt := 1; attempt < 5; attempt++ {
 		assert.Equal(
 			t,
@@ -375,9 +375,9 @@ func TestSubscriptionOAuthAttemptGuardExcludesCredentialAfterConfiguredLimit(t *
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &RetryParam{Boundary: boundary}
 	for range 5 {
-		require.True(t, retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
+		require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
 	}
-	require.False(t, retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
+	require.Equal(t, SubscriptionOAuthAttemptCredentialExhausted, retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
 	require.False(t, boundary.Allows(initial))
 	require.True(t, boundary.Allows(backup))
 }
@@ -394,7 +394,7 @@ func TestSubscriptionOAuthAccountUnavailableSwitchesAndCoolsCredential(t *testin
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
 	retryParam := &RetryParam{Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	retryParam.handleSubscriptionOAuthAccountUnavailable()
 
 	require.False(t, boundary.Allows(initial))
@@ -415,7 +415,7 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithoutCoolingAccount(t *testi
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
 	retryParam := &RetryParam{Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	retryParam.handleSubscriptionOAuthModelUnavailable()
 
 	require.False(t, boundary.Allows(initial))
@@ -435,7 +435,7 @@ func TestSubscriptionOAuthModelCapacitySwitchesWithoutCoolingAccount(t *testing.
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	replaceSubscriptionOAuthStateForTest(t, fingerprint)
 	retryParam := &RetryParam{Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	retryParam.handleSubscriptionOAuthModelCapacity()
 
 	require.False(t, boundary.Allows(initial))

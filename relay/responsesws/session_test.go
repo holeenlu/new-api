@@ -135,13 +135,9 @@ func TestCancelledTurnExitsAfterConnectionGenerationIsCleared(t *testing.T) {
 		readDone <- readErr
 	}()
 
-	// Reproduce the production ordering: the downstream context is cancelled,
-	// then Session.Close clears the connection generation before the permanent
-	// reader can relay its close error to the turn consumer.
-	session.mu.Lock()
+	// Cancellation must end the pipe directly. The permanent reader is allowed to
+	// lose the connection race and never publish a read error to this turn.
 	cancelRequest()
-	session.invalidateLocked(session.conn)
-	session.mu.Unlock()
 
 	select {
 	case readErr := <-readDone:
@@ -154,6 +150,62 @@ func TestCancelledTurnExitsAfterConnectionGenerationIsCleared(t *testing.T) {
 	case <-upstreamClosed:
 	case <-time.After(time.Second):
 		t.Fatal("cancelled turn did not close the upstream connection")
+	}
+}
+
+func TestConnectionStopEndsTurnWithoutWaitingForReaderError(t *testing.T) {
+	stream := &Session{}
+	reader, writer := io.Pipe()
+	events := make(chan upstreamMessage)
+	turnDone := make(chan struct{})
+	done := make(chan struct{})
+	connStop := make(chan struct{})
+	stream.turnEvents = events
+	stream.turnDone = turnDone
+
+	go stream.streamAsSSE(context.Background(), nil, connStop, writer, events, turnDone, done, nil)
+	close(connStop)
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(reader)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		require.ErrorContains(t, err, "upstream connection closed")
+	case <-time.After(time.Second):
+		t.Fatal("connection stop waited for the stream idle timeout")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("connection stop did not finish the turn")
+	}
+}
+
+func TestConnectionStopPreservesQueuedTerminalEvent(t *testing.T) {
+	stream := &Session{}
+	reader, writer := io.Pipe()
+	events := make(chan upstreamMessage, 1)
+	turnDone := make(chan struct{})
+	done := make(chan struct{})
+	connStop := make(chan struct{})
+	stream.turnEvents = events
+	stream.turnDone = turnDone
+	events <- upstreamMessage{payload: []byte(`{"type":"response.completed","response":{"id":"resp_queued"}}`), class: upstreamTurnEvent}
+	close(connStop)
+
+	go stream.streamAsSSE(context.Background(), nil, connStop, writer, events, turnDone, done, nil)
+	body, err := io.ReadAll(reader)
+
+	require.NoError(t, err)
+	require.Contains(t, string(body), "event: response.completed")
+	require.Contains(t, string(body), `"id":"resp_queued"`)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("queued terminal event did not complete the turn")
 	}
 }
 

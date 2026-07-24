@@ -40,6 +40,24 @@ func (b *blockingStreamBody) Close() error {
 	return nil
 }
 
+type closeTrackingStreamBody struct {
+	io.Reader
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newCloseTrackingStreamBody(data string) *closeTrackingStreamBody {
+	return &closeTrackingStreamBody{
+		Reader: strings.NewReader(data),
+		done:   make(chan struct{}),
+	}
+}
+
+func (b *closeTrackingStreamBody) Close() error {
+	b.closeOnce.Do(func() { close(b.done) })
+	return nil
+}
+
 func newClaudeSubscriptionStreamTest(
 	t *testing.T,
 	header http.Header,
@@ -95,11 +113,12 @@ func TestClaudeSubscriptionStreamFailsOverOnSilentStream(t *testing.T) {
 // When the silent stream's rate-limit headers prove the window is exhausted, the
 // failover error carries the usage-limit classification and the parsed reset so
 // the credential is cooled and the client learns when it recovers.
-func TestClaudeSubscriptionStreamClassifiesUsageLimitFromHeadersOnSilentStream(t *testing.T) {
+func TestClaudeSubscriptionStreamFailsFastOnUsageLimitHeaders(t *testing.T) {
 	header := http.Header{}
 	header.Set("anthropic-ratelimit-unified-status", "rejected")
 	header.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(time.Now().Add(3*time.Hour).Unix(), 10))
-	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, header, newBlockingStreamBody())
+	body := newBlockingStreamBody()
+	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, header, body)
 
 	usage, apiError := ClaudeStreamHandler(c, resp, info)
 
@@ -109,6 +128,58 @@ func TestClaudeSubscriptionStreamClassifiesUsageLimitFromHeadersOnSilentStream(t
 	require.Equal(t, http.StatusTooManyRequests, apiError.GetUpstreamStatusCode())
 	require.InDelta(t, (3 * time.Hour).Seconds(), apiError.RetryAfter.Seconds(), 5)
 	require.Empty(t, recorder.Body.String())
+	select {
+	case <-body.done:
+	default:
+		require.FailNow(t, "usage-limit response body was not closed")
+	}
+}
+
+func TestClaudeSubscriptionStreamFailsFastOnWindowHeaderWithoutReset(t *testing.T) {
+	header := http.Header{}
+	header.Set("anthropic-ratelimit-unified-5h-status", "rejected")
+	body := newBlockingStreamBody()
+	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, header, body)
+
+	usage, apiError := ClaudeStreamHandler(c, resp, info)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiError)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, apiError.GetErrorCode())
+	require.True(t, apiError.UsageWindows.FiveHourExhausted)
+	require.Zero(t, apiError.RetryAfter)
+	require.Empty(t, recorder.Body.String())
+	select {
+	case <-body.done:
+	default:
+		require.FailNow(t, "usage-limit response body was not closed")
+	}
+}
+
+func TestClaudeSubscriptionStreamEmitsTerminalSSEErrorAfterCommittedUsageLimit(t *testing.T) {
+	body := newCloseTrackingStreamBody(strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_usage_limit","model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"error","error":{"type":"rate_limit_error","code":"usage_limit_reached","message":"subscription usage limit reached"}}`,
+	}, "\n"))
+	c, recorder, resp, info := newClaudeSubscriptionStreamTest(t, nil, body)
+
+	usage, apiError := ClaudeStreamHandler(c, resp, info)
+
+	require.NotNil(t, usage)
+	require.Nil(t, apiError)
+	committed := info.CommittedUpstreamError()
+	require.NotNil(t, committed)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, committed.GetErrorCode())
+	require.Equal(t, "anthropic", usage.UsageSemantic)
+	require.NotNil(t, usage.BillingUsage)
+	require.Contains(t, recorder.Body.String(), "event: message_start")
+	require.Contains(t, recorder.Body.String(), "event: error")
+	require.Contains(t, recorder.Body.String(), `"code":"upstream_usage_limit"`)
+	select {
+	case <-body.done:
+	default:
+		require.FailNow(t, "committed usage-limit stream body was not closed")
+	}
 }
 
 // A subscription stream that closes immediately with no event (HTTP 200 then

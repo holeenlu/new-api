@@ -114,7 +114,18 @@ func CodexAlphaSearch(c *gin.Context) {
 			}
 		}
 
-		if !trackRetryAttempt(c, retryParam, channel) {
+		attemptReservation := trackRetryAttempt(c, retryParam, channel)
+		if attemptReservation == service.SubscriptionOAuthAttemptRequestExhausted {
+			if lastError == nil {
+				lastError = types.NewErrorWithStatusCode(
+					errors.New("subscription OAuth relay attempt budget exhausted"),
+					types.ErrorCodeDoRequestFailed,
+					http.StatusServiceUnavailable,
+				)
+			}
+			break
+		}
+		if attemptReservation == service.SubscriptionOAuthAttemptCredentialExhausted {
 			continue
 		}
 		retryParam.RecordAttempt()
@@ -202,6 +213,10 @@ func CodexAlphaSearch(c *gin.Context) {
 		} else if !errors.As(requestErr, &apiError) {
 			apiError = types.NewErrorWithStatusCode(requestErr, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
 		}
+		// Credential refresh retries before the usual channel-error bookkeeping.
+		// Preserve the observed upstream rejection for the request-wide attempt
+		// guard, which otherwise could exit with no terminal client error.
+		lastError = apiError
 		if refreshErr, retry := refreshCodexCredentialForRetry(c, info, retryParam, channel, apiError); retry {
 			continue
 		} else if refreshErr != nil {

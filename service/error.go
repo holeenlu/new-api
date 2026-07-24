@@ -133,17 +133,21 @@ func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncat
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *types.NewAPIError) {
-	// Header-only fallback for the rare body-read-failure path below, capped at the
-	// ordinary transient bound. The success path overwrites this with
-	// ParseUpstreamRetryDelay, which alone may reach the longer usage-limit bound
-	// from structured reset metadata; a bare Retry-After header must not widen the
-	// cooldown to days on a read error.
+	headerObservedAt := time.Now()
+	usageWindows := subscriptionOAuthUsageWindowsFromHeaders(resp.Header, headerObservedAt)
+	// A bare Retry-After remains capped at the ordinary transient bound when the
+	// body cannot be read. Exhausted unified headers are stronger evidence, so
+	// preserve their exact reset before reading the body as well.
 	retryAfter := parseRetryAfterValue(
 		resp.Header.Get("Retry-After"),
-		time.Now(),
+		headerObservedAt,
 		maximumSubscriptionOAuthRetryAfter,
 	)
-	var usageWindows types.SubscriptionOAuthUsageWindows
+	if usageWindows.IsExhausted() {
+		if delay := parseUnifiedUsageReset(resp.Header, headerObservedAt); delay > 0 {
+			retryAfter = delay
+		}
+	}
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.RetryAfter = retryAfter
@@ -254,6 +258,7 @@ func subscriptionOAuthUsageWindowsFromHeaders(headers http.Header, now time.Time
 		return types.SubscriptionOAuthUsageWindows{}
 	}
 	windows := types.SubscriptionOAuthUsageWindows{
+		UnifiedExhausted:  strings.EqualFold(strings.TrimSpace(headers.Get("anthropic-ratelimit-unified-status")), "rejected"),
 		FiveHourExhausted: unifiedRateLimitWindowExhausted(headers.Get("anthropic-ratelimit-unified-5h-status")),
 		SevenDayExhausted: unifiedRateLimitWindowExhausted(headers.Get("anthropic-ratelimit-unified-7d-status")),
 	}

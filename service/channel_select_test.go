@@ -30,7 +30,7 @@ func TestRetryParamCapacityFailureDoesNotConsumeUpstreamRetry(t *testing.T) {
 
 func TestSubscriptionOAuthRequestAttemptBudgetStopsAmplification(t *testing.T) {
 	retryParam := &RetryParam{}
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+	require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a"))
 	for range maximumSubscriptionOAuthRequestAttempts {
 		retryParam.RecordAttempt()
 	}
@@ -47,12 +47,12 @@ func TestSubscriptionOAuthRequestAttemptBudgetStopsAmplification(t *testing.T) {
 	})
 
 	require.Equal(t, SubscriptionOAuthRetryStop, decision)
-	require.False(t, retryParam.SetSubscriptionOAuthAttempt(2, 0, "credential-b"))
+	require.Equal(t, SubscriptionOAuthAttemptRequestExhausted, retryParam.ReserveSubscriptionOAuthAttempt(2, 0, "credential-b"))
 }
 
 func TestSubscriptionOAuthCredentialRefreshIsClaimedOncePerRequest(t *testing.T) {
 	retryParam := &RetryParam{}
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+	require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a"))
 
 	require.True(t, retryParam.ClaimSubscriptionOAuthCredentialRefresh())
 	require.False(t, retryParam.ClaimSubscriptionOAuthCredentialRefresh())
@@ -108,7 +108,7 @@ func TestSubscriptionOAuthRetrySwitchesAfterFiveCredentialFailures(t *testing.T)
 	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
 
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a")
 	for attempt := 1; attempt < 5; attempt++ {
 		require.Equal(
 			t,
@@ -126,7 +126,7 @@ func TestSubscriptionOAuthRetrySwitchesAfterFiveCredentialFailures(t *testing.T)
 
 func TestSubscriptionOAuthRetryStopsAmbiguousPostWriteFailure(t *testing.T) {
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a")
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
@@ -140,7 +140,7 @@ func TestSubscriptionOAuthWrittenRequestStopsBeforeFailureBudget(t *testing.T) {
 	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
 
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-budget")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-budget")
 	for range 3 {
 		require.Equal(
 			t,
@@ -158,7 +158,7 @@ func TestSubscriptionOAuthRetryZeroDisablesAmbiguousRetry(t *testing.T) {
 	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
 
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-no-retry")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-no-retry")
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
@@ -179,7 +179,7 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 
 	common.SubscriptionOAuthRetry429 = false
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, fingerprint)
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,
@@ -196,7 +196,7 @@ func TestSubscriptionOAuth429AlwaysCoolsCredentialAndSwitchesOnlyWhenEnabled(t *
 	state.cooldownUntil = time.Time{}
 	state.mu.Unlock()
 	common.SubscriptionOAuthRetry429 = true
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, fingerprint)
 	require.Equal(
 		t,
 		SubscriptionOAuthSwitchCredential,
@@ -226,7 +226,7 @@ func TestSubscriptionOAuthUsageLimitAlwaysSwitchesToBackupCredential(t *testing.
 		Key: `{"account_id":"usage-available-account"}`, Group: "default",
 	}
 	retryParam := &RetryParam{Boundary: NewRetryBoundary(initial, "default")}
-	retryParam.SetSubscriptionOAuthAttempt(7, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(7, 0, fingerprint)
 	err := types.NewErrorWithStatusCode(
 		errors.New("You've reached your usage limit"),
 		types.ErrorCodeUpstreamUsageLimit,
@@ -261,7 +261,7 @@ func TestSubscriptionOAuthUsageLimitDoesNotReplayUnsafeRequests(t *testing.T) {
 		{SpecificChannel: true},
 	} {
 		retryParam := &RetryParam{}
-		retryParam.SetSubscriptionOAuthAttempt(8, 0, "usage-limited-pinned")
+		retryParam.ReserveSubscriptionOAuthAttempt(8, 0, "usage-limited-pinned")
 		err := types.NewErrorWithStatusCode(
 			errors.New("usage_limit_reached"),
 			types.ErrorCodeUpstreamUsageLimit,
@@ -290,7 +290,7 @@ func TestSubscriptionOAuthRateLimitCooldownSwitchesCredential(t *testing.T) {
 	}
 	fingerprint := SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &RetryParam{Boundary: NewRetryBoundary(initial, "default")}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	apiError := types.NewErrorWithStatusCode(
 		&subscriptionOAuthCapacityError{
 			cause:          errSubscriptionOAuthCredentialCool,
@@ -326,7 +326,7 @@ func TestSubscriptionOAuthCapacityReplayPreservesCredentialOrder(t *testing.T) {
 	require.NotNil(t, boundary)
 	retryParam := &RetryParam{Boundary: boundary}
 	for index, fingerprint := range []string{"credential-a", "credential-b", "credential-c"} {
-		retryParam.SetSubscriptionOAuthAttempt(index+1, 0, fingerprint)
+		retryParam.ReserveSubscriptionOAuthAttempt(index+1, 0, fingerprint)
 		retryParam.handleSubscriptionOAuthCapacityFailure()
 	}
 
@@ -359,7 +359,7 @@ func TestSubscriptionOAuthFailedRecoveryProbeSwitchesImmediately(t *testing.T) {
 	require.True(t, lease.IsRecoveryProbe())
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	retryParam := NewRetryParam(c, "default", "gpt-test", "/v1/responses")
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, fingerprint)
 	BindSubscriptionOAuthLease(c, lease)
 	retryParam.CaptureSubscriptionOAuthAttemptMetadata(c)
 	lease.Release()
@@ -377,7 +377,7 @@ func TestSubscriptionOAuthRetry429CannotBypassStartedResponse(t *testing.T) {
 	t.Cleanup(func() { common.SubscriptionOAuthRetry429 = originalRetry429 })
 
 	retryParam := &RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-429")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-429")
 	require.Equal(
 		t,
 		SubscriptionOAuthRetryStop,

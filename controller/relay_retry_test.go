@@ -12,11 +12,13 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/responsesws"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -266,7 +268,7 @@ func TestParamOverrideContinuationCannotUseInternalWebSocketRetryPin(t *testing.
 		http.StatusServiceUnavailable,
 	)
 	retryParam := &service.RetryParam{}
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(41, 0, "credential-a"))
+	require.Equal(t, service.SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(41, 0, "credential-a"))
 
 	require.False(t, hasReplaySafeResponsesWebSocketInternalPin(c))
 	require.False(t, shouldContinueSubscriptionOAuthRetry(c, &relaycommon.RelayInfo{}, retryParam, apiError))
@@ -277,7 +279,7 @@ func TestBoundSubscriptionOAuthWebSocketStopsTransientRetry(t *testing.T) {
 	c.Set("channel_type", constant.ChannelTypeCodex)
 	service.DisableSubscriptionOAuthRetry(c)
 	retryParam := &service.RetryParam{}
-	retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a")
+	retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a")
 	apiError := types.NewOpenAIError(
 		errors.New("upstream websocket closed"),
 		types.ErrorCodeDoRequestFailed,
@@ -296,7 +298,7 @@ func TestSubscriptionOAuthWebSocketFirstEventTimeoutDoesNotReplayWrittenRequest(
 	c.Set("channel_type", constant.ChannelTypeCodex)
 	c.Set(responsesWebSocketInternalPinKey, true)
 	retryParam := &service.RetryParam{}
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(1, 0, "credential-a"))
+	require.Equal(t, service.SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(1, 0, "credential-a"))
 	info := &relaycommon.RelayInfo{}
 	info.MarkUpstreamRequestWritten()
 	apiError := types.NewOpenAIError(
@@ -334,7 +336,7 @@ func TestRefreshCodexCredentialHonorsStatefulWebSocketRetryDisable(t *testing.T)
 			}
 
 			retryParam := &service.RetryParam{}
-			require.True(t, retryParam.SetSubscriptionOAuthAttempt(41, 0, "credential-a"))
+			require.Equal(t, service.SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(41, 0, "credential-a"))
 			apiError := types.NewErrorWithStatusCode(
 				errors.New("access token expired"),
 				types.ErrorCodeOAuthUnauthorized,
@@ -382,7 +384,7 @@ func TestBoundSubscriptionOAuthWebSocketSwitchesOnUsageLimitBeforeOutput(t *test
 
 	retryParam := &service.RetryParam{Boundary: service.NewRetryBoundary(initial, "default")}
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
-	require.True(t, retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
+	require.Equal(t, service.SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint))
 	apiError := types.NewErrorWithStatusCode(
 		errors.New("You've reached your usage limit"),
 		types.ErrorCodeUpstreamUsageLimit,
@@ -520,7 +522,7 @@ func TestCodexCapacityFailoverExcludesOnlySaturatedCredential(t *testing.T) {
 	)
 
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(
+	retryParam.ReserveSubscriptionOAuthAttempt(
 		initial.Id,
 		0,
 		service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, "key-1"),
@@ -561,7 +563,7 @@ func TestSubscriptionOAuthModelUnavailableSwitchesWithinRetryBoundary(t *testing
 	boundary := service.NewRetryBoundary(initial, "default")
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	apiError := service.ApplyChannelErrorPolicy(
 		initial.Type,
 		types.NewOpenAIError(errors.New("model gpt-missing is not supported"), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest),
@@ -587,7 +589,7 @@ func TestSubscriptionOAuthExplicitChannelDoesNotSwitchOnModelUnavailable(t *test
 
 	boundary := service.NewRetryBoundary(initial, "default")
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(
+	retryParam.ReserveSubscriptionOAuthAttempt(
 		initial.Id,
 		0,
 		service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key),
@@ -628,7 +630,7 @@ func TestSubscriptionOAuthQuotaExhaustionSwitchesEvenWhen429RetryIsDisabled(t *t
 	boundary := service.NewRetryBoundary(initial, "default")
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	apiError := service.ApplyChannelErrorPolicy(
 		initial.Type,
 		types.NewOpenAIError(errors.New("You exceeded your current quota"), "insufficient_quota", http.StatusTooManyRequests),
@@ -665,7 +667,7 @@ func TestSubscriptionOAuthModelCapacitySwitchesEvenWhen429RetryIsDisabled(t *tes
 	boundary := service.NewRetryBoundary(initial, "default")
 	fingerprint := service.SubscriptionOAuthCredentialFingerprint(initial.Type, initial.Id, 0, initial.Key)
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0), Boundary: boundary}
-	retryParam.SetSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
+	retryParam.ReserveSubscriptionOAuthAttempt(initial.Id, 0, fingerprint)
 	apiError := service.ApplyChannelErrorPolicy(
 		initial.Type,
 		types.NewOpenAIError(
@@ -708,9 +710,272 @@ func TestTrackRetryAttemptStopsSelectingCredentialAfterFiveAttempts(t *testing.T
 
 	retryParam := &service.RetryParam{Retry: common.GetPointer(0)}
 	for range 5 {
-		require.True(t, trackRetryAttempt(c, retryParam, initial))
+		require.Equal(t, service.SubscriptionOAuthAttemptReserved, trackRetryAttempt(c, retryParam, initial))
 	}
-	require.False(t, trackRetryAttempt(c, retryParam, initial))
+	require.Equal(t, service.SubscriptionOAuthAttemptCredentialExhausted, trackRetryAttempt(c, retryParam, initial))
 	require.False(t, retryParam.Boundary.Allows(initial))
 	require.True(t, retryParam.Boundary.Allows(backup))
+}
+
+func TestTrackRetryAttemptStopsAtGlobalSubscriptionOAuthAttemptBudget(t *testing.T) {
+	originalRetries := common.SubscriptionOAuthUpstreamRetryTimes
+	common.SubscriptionOAuthUpstreamRetryTimes = 5
+	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = originalRetries })
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	first := &model.Channel{
+		Id:      81,
+		Type:    constant.ChannelTypeCodex,
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-a","account_id":"global-attempt-a"}`,
+		Group:   "default",
+	}
+	second := &model.Channel{
+		Id:      82,
+		Type:    constant.ChannelTypeCodex,
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: common.GetPointer("https://chatgpt.com"),
+		Key:     `{"access_token":"token-b","account_id":"global-attempt-b"}`,
+		Group:   "default",
+	}
+	first.SetOtherSettings(dto.ChannelOtherSettings{})
+	second.SetOtherSettings(dto.ChannelOtherSettings{})
+
+	retryParam := &service.RetryParam{Retry: common.GetPointer(0)}
+	for attempt := 0; attempt < 10; attempt++ {
+		channel := first
+		if attempt%2 == 1 {
+			channel = second
+		}
+		common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
+		require.Equal(t, service.SubscriptionOAuthAttemptReserved, trackRetryAttempt(c, retryParam, channel))
+		retryParam.RecordAttempt()
+	}
+	common.SetContextKey(c, constant.ContextKeyChannelKey, first.Key)
+	require.Equal(t, service.SubscriptionOAuthAttemptRequestExhausted, trackRetryAttempt(c, retryParam, first))
+}
+
+func TestRelaySwitchesToBackupSubscriptionOAuthCredentialAfterFirstIsExhausted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupResponsesCompactBillingDB(t)
+	service.InitHttpClient()
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.UserSubscription{}))
+
+	previousRetry429 := common.SubscriptionOAuthRetry429
+	common.SubscriptionOAuthRetry429 = true
+	t.Cleanup(func() { common.SubscriptionOAuthRetry429 = previousRetry429 })
+
+	const (
+		group     = "subscription-oauth-relay-test"
+		modelName = "claude-relay-retry-test"
+	)
+	savedGroupRatios := ratio_setting.GroupRatio2JSONString()
+	groupRatios := ratio_setting.GetGroupRatioCopy()
+	groupRatios[group] = 0
+	groupRatiosJSON, err := common.Marshal(groupRatios)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(groupRatiosJSON)))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroupRatios)) })
+
+	seenCredentials := make([]string, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seenCredentials = append(seenCredentials, credential)
+		w.Header().Set("Content-Type", "application/json")
+		if credential == "sk-ant-oat01-first" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"temporary upstream limit"}}`))
+			return
+		}
+		require.Equal(t, "sk-ant-oat01-backup", credential)
+		_, _ = w.Write([]byte(`{"id":"msg_backup","type":"message","role":"assistant","model":"claude-relay-retry-test","content":[{"type":"text","text":"backup response"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	user := &model.User{
+		Id:       7001,
+		Username: "subscription-oauth-relay-test",
+		Status:   common.UserStatusEnabled,
+		Group:    group,
+		Quota:    1_000_000,
+	}
+	token := &model.Token{
+		Id:          7001,
+		UserId:      user.Id,
+		Key:         "subscription-oauth-relay-token",
+		Name:        "subscription-oauth-relay-token",
+		Status:      common.TokenStatusEnabled,
+		RemainQuota: user.Quota,
+		Group:       group,
+	}
+	first := &model.Channel{
+		Id:      7001,
+		Type:    constant.ChannelTypeClaudeCode,
+		Key:     "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-first",
+		Status:  common.ChannelStatusEnabled,
+		Name:    "subscription-oauth-first",
+		BaseURL: common.GetPointer(upstream.URL),
+		Models:  modelName,
+		Group:   group,
+		Weight:  common.GetPointer(uint(1)),
+	}
+	backup := &model.Channel{
+		Id:      7002,
+		Type:    constant.ChannelTypeClaudeCode,
+		Key:     "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-backup",
+		Status:  common.ChannelStatusEnabled,
+		Name:    "subscription-oauth-backup",
+		BaseURL: common.GetPointer(upstream.URL),
+		Models:  modelName,
+		Group:   group,
+		Weight:  common.GetPointer(uint(1)),
+	}
+	require.NoError(t, model.DB.Create(user).Error)
+	require.NoError(t, model.DB.Create(token).Error)
+	require.NoError(t, model.DB.Create(first).Error)
+	require.NoError(t, model.DB.Create(backup).Error)
+	require.NoError(t, first.AddAbilities(model.DB))
+	require.NoError(t, backup.AddAbilities(model.DB))
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/messages",
+		strings.NewReader(`{"model":"claude-relay-retry-test","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyUserId, user.Id)
+	common.SetContextKey(c, constant.ContextKeyUserGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUserQuota, user.Quota)
+	common.SetContextKey(c, constant.ContextKeyTokenId, token.Id)
+	common.SetContextKey(c, constant.ContextKeyTokenKey, token.Key)
+	common.SetContextKey(c, constant.ContextKeyTokenGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{AcceptUnsetRatioModel: true})
+	c.Set("token_name", token.Name)
+	require.Nil(t, middleware.SetupContextForSelectedChannel(c, first, modelName))
+
+	Relay(c, types.RelayFormatClaude)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "backup response")
+	require.Equal(t, []string{"sk-ant-oat01-first", "sk-ant-oat01-backup"}, seenCredentials)
+}
+
+func TestRelayReturnsTerminalErrorAtGlobalSubscriptionOAuthAttemptBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupResponsesCompactBillingDB(t)
+	service.InitHttpClient()
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}, &model.UserSubscription{}))
+
+	previousRetries := common.SubscriptionOAuthUpstreamRetryTimes
+	common.SubscriptionOAuthUpstreamRetryTimes = 5
+	t.Cleanup(func() { common.SubscriptionOAuthUpstreamRetryTimes = previousRetries })
+
+	const (
+		group     = "subscription-oauth-budget-test"
+		modelName = "claude-relay-budget-test"
+	)
+	savedGroupRatios := ratio_setting.GroupRatio2JSONString()
+	groupRatios := ratio_setting.GetGroupRatioCopy()
+	groupRatios[group] = 0
+	groupRatiosJSON, err := common.Marshal(groupRatios)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(groupRatiosJSON)))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroupRatios)) })
+
+	// A malformed upstream URL fails before net/http can write request headers.
+	// That makes replay safe and drives the request through both per-credential
+	// five-attempt budgets before the global ten-attempt guard is reached.
+	const invalidUpstreamURL = "http://[::1"
+
+	user := &model.User{
+		Id:       7101,
+		Username: "subscription-oauth-budget-test",
+		Status:   common.UserStatusEnabled,
+		Group:    group,
+		Quota:    1_000_000,
+	}
+	token := &model.Token{
+		Id:          7101,
+		UserId:      user.Id,
+		Key:         "subscription-oauth-budget-token",
+		Name:        "subscription-oauth-budget-token",
+		Status:      common.TokenStatusEnabled,
+		RemainQuota: user.Quota,
+		Group:       group,
+	}
+	first := &model.Channel{
+		Id:       7101,
+		Type:     constant.ChannelTypeClaudeCode,
+		Key:      "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-budget-first",
+		Status:   common.ChannelStatusEnabled,
+		Name:     "subscription-oauth-budget-first",
+		BaseURL:  common.GetPointer(invalidUpstreamURL),
+		Models:   modelName,
+		Group:    group,
+		Weight:   common.GetPointer(uint(1)),
+		Priority: common.GetPointer(int64(3)),
+	}
+	second := &model.Channel{
+		Id:       7102,
+		Type:     constant.ChannelTypeClaudeCode,
+		Key:      "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-budget-second",
+		Status:   common.ChannelStatusEnabled,
+		Name:     "subscription-oauth-budget-second",
+		BaseURL:  common.GetPointer(invalidUpstreamURL),
+		Models:   modelName,
+		Group:    group,
+		Weight:   common.GetPointer(uint(1)),
+		Priority: common.GetPointer(int64(2)),
+	}
+	third := &model.Channel{
+		Id:       7103,
+		Type:     constant.ChannelTypeClaudeCode,
+		Key:      "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-budget-third",
+		Status:   common.ChannelStatusEnabled,
+		Name:     "subscription-oauth-budget-third",
+		BaseURL:  common.GetPointer(invalidUpstreamURL),
+		Models:   modelName,
+		Group:    group,
+		Weight:   common.GetPointer(uint(1)),
+		Priority: common.GetPointer(int64(1)),
+	}
+	require.NoError(t, model.DB.Create(user).Error)
+	require.NoError(t, model.DB.Create(token).Error)
+	for _, channel := range []*model.Channel{first, second, third} {
+		require.NoError(t, model.DB.Create(channel).Error)
+		require.NoError(t, channel.AddAbilities(model.DB))
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/messages",
+		strings.NewReader(`{"model":"claude-relay-budget-test","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyUserId, user.Id)
+	common.SetContextKey(c, constant.ContextKeyUserGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUserQuota, user.Quota)
+	common.SetContextKey(c, constant.ContextKeyTokenId, token.Id)
+	common.SetContextKey(c, constant.ContextKeyTokenKey, token.Key)
+	common.SetContextKey(c, constant.ContextKeyTokenGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{AcceptUnsetRatioModel: true})
+	c.Set("token_name", token.Name)
+	require.Nil(t, middleware.SetupContextForSelectedChannel(c, first, modelName))
+
+	Relay(c, types.RelayFormatClaude)
+
+	require.GreaterOrEqual(t, recorder.Code, http.StatusInternalServerError)
+	require.NotEmpty(t, recorder.Body.String())
+	require.Equal(t, []string{
+		"7101", "7101", "7101", "7101", "7101",
+		"7102", "7102", "7102", "7102", "7102",
+	}, c.GetStringSlice("use_channel"))
 }

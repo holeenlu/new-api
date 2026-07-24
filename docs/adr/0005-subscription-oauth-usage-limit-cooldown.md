@@ -59,7 +59,11 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
   until the later reset, because either still-exhausted window blocks recovery.
   Older responses with only `anthropic-ratelimit-unified-reset` retain the
   existing generic message unless exactly one per-window status identifies the
-  representative reset. No active call to `/api/oauth/usage` is involved.
+  representative reset. A confirmed per-window status or top-level
+  `anthropic-ratelimit-unified-status: rejected` is sufficient to classify
+  `upstream_usage_limit` even without a reset; routing then uses the one-hour
+  fallback and the client explicitly says that the upstream omitted a recovery
+  time. No active call to `/api/oauth/usage` is involved.
 - The gateway still does not actively call
   `GET https://api.anthropic.com/api/oauth/usage`: it is not reliable evidence
   about the model request that just failed. It does, however, read the
@@ -137,23 +141,34 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
 - A usage-exhausted subscription account can answer the Claude Code HTTP SSE
   request with `200` and then emit no event at all, which the generic
   streaming-idle timeout would only end after the full `STREAMING_TIMEOUT`
-  (minutes). Subscription-OAuth Claude streams therefore bound time-to-first
-  event (`CLAUDE_CODE_OAUTH_STREAM_FIRST_EVENT_TIMEOUT_MS`, default 30s, clamped
+  (minutes). If the response headers already prove a rejected unified, 5-hour,
+  or weekly window, the adapter closes that body and immediately fails over;
+  it never waits for the first-event timeout. Otherwise Subscription-OAuth
+  Claude streams bound time-to-first event
+  (`CLAUDE_CODE_OAUTH_STREAM_FIRST_EVENT_TIMEOUT_MS`, default 30s, clamped
   5s–120s): if no upstream event arrives within it and nothing has been written
-  downstream, the attempt fails over. When the silent stream's
-  `anthropic-ratelimit-unified-*` headers prove the window is exhausted, the
-  failover error is classified `upstream_usage_limit` with the parsed reset (so
-  the credential is cooled and the client learns the reset); otherwise it is a
-  retryable `502`. Once the first event arrives the normal idle timeout takes
-  over, so a legitimately slow first token is unaffected. This mirrors the
-  Responses SSE/WebSocket first-event preflight.
+  downstream, the attempt fails over with a retryable `502`. Once the first
+  event arrives the normal idle timeout takes over, so a legitimately slow first
+  token is unaffected. This mirrors the Responses SSE/WebSocket first-event
+  preflight.
+- Claude HTTP/SSE has one terminal contract for a confirmed subscription OAuth
+  failure. Before any downstream event is committed, the relay returns the
+  classified HTTP status, `Retry-After`, and the ordinary Claude JSON error so
+  retry selection can safely choose a compatible backup credential. After a
+  Claude SSE event is committed, the relay emits `event: error` with the
+  Claude-shaped classified error and ends the stream; it never appends an HTTP
+  JSON response to a live SSE stream. The scanner closes the upstream body on
+  every terminal or client-cancel path, which releases the OAuth response lease;
+  a committed or cancelled stream is never retried.
 - Capacity cycling is reserved for active process-local concurrency saturation.
   A credential already in rate-limit or usage-window cooldown is excluded
   immediately and cannot enter a capacity replay cycle. Model-capacity exclusion
   is request-local, so it cannot suppress unrelated models on the same account.
 - Each credential retains its configured five-attempt budget, and one request
   is additionally capped at ten relay attempts across all eligible
-  credentials. The last real upstream error is returned when that bound is hit.
+  credentials. The last real upstream error is returned when that bound is hit;
+  a rejected budget gate exits the relay loop rather than selecting candidates
+  without consuming another attempt.
 - Anthropic responses retain a protocol-compatible `error.type` and expose the
   stable gateway classification in `error.code`, allowing clients and the UI to
   localize behavior without parsing provider prose.

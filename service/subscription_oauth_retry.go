@@ -31,6 +31,18 @@ const (
 	SubscriptionOAuthSwitchCredential
 )
 
+// SubscriptionOAuthAttemptReservation explains why a credential was or was not
+// reserved for the next upstream attempt. The relay must distinguish a
+// per-credential exhaustion (which should select a backup) from the request
+// ceiling (which must finish the client request).
+type SubscriptionOAuthAttemptReservation int
+
+const (
+	SubscriptionOAuthAttemptReserved SubscriptionOAuthAttemptReservation = iota
+	SubscriptionOAuthAttemptCredentialExhausted
+	SubscriptionOAuthAttemptRequestExhausted
+)
+
 type SubscriptionOAuthAttemptTarget struct {
 	ChannelID      int
 	KeyIndex       int
@@ -231,15 +243,15 @@ func (p *RetryParam) RestartSubscriptionOAuthCapacityCycle() bool {
 	return p.startCapacityReplay()
 }
 
-// SetSubscriptionOAuthAttempt reserves one request-local attempt for a
+// ReserveSubscriptionOAuthAttempt reserves one request-local attempt for a
 // credential. It is the final guard around every relay path: even if an error
 // path fails before normal retry accounting, the same credential cannot be
 // selected more than the configured per-credential limit.
-func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) bool {
+func (p *RetryParam) ReserveSubscriptionOAuthAttempt(channelID, keyIndex int, fingerprint string) SubscriptionOAuthAttemptReservation {
 	state := p.ensureSubscriptionOAuthTracker()
 	if p.totalAttempts >= maximumSubscriptionOAuthRequestAttempts {
 		p.clearSubscriptionOAuthAttemptTarget()
-		return false
+		return SubscriptionOAuthAttemptRequestExhausted
 	}
 	credential := state.credentials[fingerprint]
 	if credential == nil {
@@ -255,7 +267,7 @@ func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, finger
 			p.Boundary.FailCredential(fingerprint)
 		}
 		p.clearSubscriptionOAuthAttemptTarget()
-		return false
+		return SubscriptionOAuthAttemptCredentialExhausted
 	}
 	credential.attempts++
 	p.setSubscriptionOAuthAttemptTarget(&SubscriptionOAuthAttemptTarget{
@@ -263,7 +275,7 @@ func (p *RetryParam) SetSubscriptionOAuthAttempt(channelID, keyIndex int, finger
 		KeyIndex:    keyIndex,
 		Fingerprint: fingerprint,
 	})
-	return true
+	return SubscriptionOAuthAttemptReserved
 }
 
 func (p *RetryParam) setSubscriptionOAuthAttemptTarget(target *SubscriptionOAuthAttemptTarget) {

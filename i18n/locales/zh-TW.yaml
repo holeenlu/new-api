@@ -284,7 +284,7 @@ custom_oauth.provider_id_field_invalid: "無法從供應者響應中提取使用
 
 # 轉發錯誤資訊（面向 API 用戶端的簡潔在地化提示）
 relay_error.upstream_usage_limit: "此帳號的訂閱用量已達上限，預計於 {{.ResetAt}} 恢復；在此之前該帳號已暫停使用，可稍後重試或改用其他模型/帳號。"
-relay_error.upstream_usage_limit_no_reset: "此帳號的訂閱用量已達上限，將在額度重置後自動恢復；在此之前可稍後重試或改用其他模型/帳號。"
+relay_error.upstream_usage_limit_no_reset: "此帳號的訂閱用量已達上限，但上游未提供恢復時間；額度重置後會自動恢復，在此之前可稍後重試或改用其他模型/帳號。"
 relay_error.upstream_usage_limit_windows: "此帳號的{{.Windows}}；在全部已達上限的視窗恢復前，該帳號已暫停使用，可稍後重試或改用其他模型/帳號。"
 relay_error.upstream_usage_limit_five_hour: "5 小時訂閱用量視窗已達上限，預計於 {{.ResetAt}} 恢復"
 relay_error.upstream_usage_limit_five_hour_no_reset: "5 小時訂閱用量視窗已達上限，恢復時間暫未由上游提供"

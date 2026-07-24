@@ -606,10 +606,11 @@ func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 	}
 
 	conn := s.conn
+	connStop := s.connStop
 
 	// TEMP diagnostic: capture write timing for every turn and reuse context for
 	// an existing connection.
-	diag := &reuseTurnDiag{writeAt: time.Now()}
+	diag := &reuseTurnDiag{writeAt: time.Now(), generation: s.generation}
 	if !justConnected {
 		diag.reused = true
 		diag.connAge = time.Since(s.connectedAt)
@@ -621,7 +622,7 @@ func (s *Session) doRequest(c *gin.Context, driver Driver, info *relaycommon.Rel
 
 	reader, writer := io.Pipe()
 	streamDone := make(chan struct{})
-	go s.streamAsSSE(c.Request.Context(), conn, writer, turnEvents, turnDone, streamDone, diag)
+	go s.streamAsSSE(c.Request.Context(), conn, connStop, writer, turnEvents, turnDone, streamDone, diag)
 	streamBody := &responseBody{
 		ReadCloser: reader,
 		session:    s,
@@ -1170,13 +1171,14 @@ func (s *Session) resetResponseIDsLocked() {
 // streamAsSSE relays events from the permanent connection reader to the SSE
 // pipe. reuseTurnDiag carries temporary first-event timing diagnostics.
 type reuseTurnDiag struct {
-	writeAt time.Time
-	reused  bool
-	connAge time.Duration
-	idleGap time.Duration
+	writeAt    time.Time
+	generation uint64
+	reused     bool
+	connAge    time.Duration
+	idleGap    time.Duration
 }
 
-func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer *io.PipeWriter, events chan upstreamMessage, turnDone chan struct{}, done chan struct{}, diag *reuseTurnDiag) {
+func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, connStop <-chan struct{}, writer *io.PipeWriter, events chan upstreamMessage, turnDone chan struct{}, done chan struct{}, diag *reuseTurnDiag) {
 	defer writer.Close()
 	defer close(done)
 	defer func() {
@@ -1194,19 +1196,6 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 		s.mu.Unlock()
 		close(turnDone)
 	}()
-
-	// Unblock a stalled turn when the request is cancelled: closing the connection
-	// makes the permanent reader fail and deliver the error here, releasing the
-	// capacity lease promptly.
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				s.invalidate(conn)
-			case <-done:
-			}
-		}()
-	}
 
 	// TEMP diagnostic: per-stream protocol summary (metadata only, no payloads).
 	// first/last event type + whether a terminal was received distinguishes "clean
@@ -1241,6 +1230,10 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 
 	waitingForTurnEvent := true
 	firstTurnEventDeadline := time.Now().Add(FirstEventTimeout)
+	var requestDone <-chan struct{}
+	if ctx != nil {
+		requestDone = ctx.Done()
+	}
 	for {
 		// Consumer-side timeouts (the permanent reader never sets read deadlines):
 		// the first turn-scoped event is bounded by one absolute FirstEventTimeout.
@@ -1255,16 +1248,58 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 		timer := time.NewTimer(timeout)
 		var msg upstreamMessage
 		var timedOut bool
+		if ctx != nil && ctx.Err() != nil {
+			timer.Stop()
+			err := ctx.Err()
+			streamEndErr = err
+			_ = writer.CloseWithError(err)
+			s.invalidate(conn)
+			return
+		}
+		hasMessage := false
+		// A connection can close immediately after its reader queued a terminal
+		// event. Prefer queued turn events over connStop so a completed response is
+		// never discarded just because its reusable connection then expired.
 		select {
 		case msg = <-events:
-		case <-timer.C:
-			timedOut = true
+			hasMessage = true
+		default:
+		}
+		if !hasMessage {
+			select {
+			case msg = <-events:
+			case <-timer.C:
+				timedOut = true
+			case <-requestDone:
+				timer.Stop()
+				err := ctx.Err()
+				streamEndErr = err
+				// Close the pipe before invalidating the socket. The downstream relay
+				// can then finish its cancelled request immediately even if the
+				// permanent reader is concurrently unwinding the same connection.
+				_ = writer.CloseWithError(err)
+				s.invalidate(conn)
+				return
+			case <-connStop:
+				timer.Stop()
+				err := errors.New("responses websocket upstream connection closed")
+				streamEndErr = err
+				// invalidateLocked may clear s.conn before the permanent reader can
+				// publish its read error. The turn owns this snapshot of connStop, so
+				// it must terminate directly instead of waiting for idleTimeout.
+				_ = writer.CloseWithError(err)
+				return
+			}
 		}
 		timer.Stop()
 		if timedOut {
 			if diag != nil && diag.reused {
-				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: timeout",
-					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
+				phase := "write_to_first_event"
+				if !waitingForTurnEvent {
+					phase = "stream_idle"
+				}
+				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: generation=%d reused=true conn_age=%dms idle_gap=%dms %s FAILED after %dms: timeout",
+					diag.generation, diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), phase, time.Since(diag.writeAt).Milliseconds()))
 			}
 			bound := idleTimeout
 			if waitingForTurnEvent {
@@ -1278,8 +1313,8 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 		}
 		if msg.err != nil {
 			if diag != nil && diag.reused && waitingForTurnEvent {
-				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: %s",
-					diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds(), msg.err.Error()))
+				logger.LogWarn(ctx, fmt.Sprintf("responses websocket timing: generation=%d reused=true conn_age=%dms idle_gap=%dms write_to_first_event FAILED after %dms: %s",
+					diag.generation, diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds(), msg.err.Error()))
 			}
 			streamEndErr = msg.err
 			s.invalidate(conn)
@@ -1290,10 +1325,10 @@ func (s *Session) streamAsSSE(ctx context.Context, conn *websocket.Conn, writer 
 			waitingForTurnEvent = false
 			if diag != nil {
 				if diag.reused {
-					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: reused=true conn_age=%dms idle_gap=%dms write_to_first_event=%dms",
-						diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
+					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: generation=%d reused=true conn_age=%dms idle_gap=%dms write_to_first_event=%dms",
+						diag.generation, diag.connAge.Milliseconds(), diag.idleGap.Milliseconds(), time.Since(diag.writeAt).Milliseconds()))
 				} else {
-					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: first event %dms", time.Since(diag.writeAt).Milliseconds()))
+					logger.LogInfo(ctx, fmt.Sprintf("responses websocket timing: generation=%d first_event=%dms", diag.generation, time.Since(diag.writeAt).Milliseconds()))
 				}
 			}
 		}

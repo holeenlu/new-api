@@ -118,6 +118,7 @@ type NewAPIError struct {
 // routing cooldown (the latest known reset); this field preserves the per-window
 // detail needed by client messages and by a later local cooldown rejection.
 type SubscriptionOAuthUsageWindows struct {
+	UnifiedExhausted   bool
 	FiveHourExhausted  bool
 	FiveHourRetryAfter time.Duration
 	SevenDayExhausted  bool
@@ -126,6 +127,13 @@ type SubscriptionOAuthUsageWindows struct {
 
 func (windows SubscriptionOAuthUsageWindows) HasExhaustedWindow() bool {
 	return windows.FiveHourExhausted || windows.SevenDayExhausted
+}
+
+// IsExhausted also includes a provider's top-level rejection when it does not
+// identify the particular subscription window. That evidence is sufficient for
+// routing and cooldown classification, but not for naming a window to clients.
+func (windows SubscriptionOAuthUsageWindows) IsExhausted() bool {
+	return windows.UnifiedExhausted || windows.HasExhaustedWindow()
 }
 
 // RetryDelay returns the latest known reset because every exhausted window must

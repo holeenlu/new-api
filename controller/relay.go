@@ -238,7 +238,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
-		if !trackRetryAttempt(c, retryParam, channel) {
+		attemptReservation := trackRetryAttempt(c, retryParam, channel)
+		if attemptReservation != service.SubscriptionOAuthAttemptReserved {
+			if attemptReservation == service.SubscriptionOAuthAttemptRequestExhausted {
+				// The request has reached its global guard. Returning the last real
+				// upstream error terminates streaming clients instead of selecting
+				// candidates without consuming a new attempt.
+				newAPIError = relayInfo.LastError
+				if newAPIError == nil {
+					newAPIError = types.NewErrorWithStatusCode(
+						errors.New("subscription OAuth relay attempt budget exhausted"),
+						types.ErrorCodeDoRequestFailed,
+						http.StatusServiceUnavailable,
+					)
+				}
+				break
+			}
 			continue
 		}
 		retryParam.RecordAttempt()
@@ -302,6 +317,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryParam.MarkSubscriptionOAuthFailure()
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+		// A successful OAuth refresh retries before recording the channel error.
+		// Keep the actual upstream rejection as the request's terminal fallback so
+		// the global attempt guard can still close the client request instead of
+		// leaving a stream open with no error.
+		relayInfo.LastError = newAPIError
 		if refreshErr, retry := refreshCodexCredentialForRetry(c, relayInfo, retryParam, channel, newAPIError); retry {
 			continue
 		} else if refreshErr != nil {
@@ -497,7 +517,7 @@ func setRelayRetryAfterHeader(c *gin.Context, retryAfter time.Duration) {
 	c.Header("Retry-After", strconv.Itoa(max(seconds, 1)))
 }
 
-func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) bool {
+func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *model.Channel) service.SubscriptionOAuthAttemptReservation {
 	if retryParam.Boundary == nil {
 		retryParam.Boundary = service.NewRetryBoundary(channel, retryParam.EffectiveGroup)
 		if retryParam.Boundary != nil {
@@ -505,7 +525,7 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 		}
 	}
 	if retryParam.Boundary == nil {
-		return true
+		return service.SubscriptionOAuthAttemptReserved
 	}
 	if relaycommon.IsSubscriptionOAuthChannel(channel.Type) {
 		service.ClearSubscriptionOAuthAttemptMetadata(c)
@@ -516,17 +536,18 @@ func trackRetryAttempt(c *gin.Context, retryParam *service.RetryParam, channel *
 			keyIndex,
 			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
 		)
-		if !retryParam.SetSubscriptionOAuthAttempt(channel.Id, keyIndex, fingerprint) {
-			return false
+		reservation := retryParam.ReserveSubscriptionOAuthAttempt(channel.Id, keyIndex, fingerprint)
+		if reservation != service.SubscriptionOAuthAttemptReserved {
+			return reservation
 		}
 		service.RecordSubscriptionOAuthCredential(c, fingerprint)
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		retryParam.Boundary.MarkAttempt(channel, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
-		return true
+		return service.SubscriptionOAuthAttemptReserved
 	}
 	retryParam.Boundary.MarkAttempt(channel)
-	return true
+	return service.SubscriptionOAuthAttemptReserved
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {

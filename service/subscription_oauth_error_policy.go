@@ -148,6 +148,9 @@ func IsSubscriptionOAuthUsageLimit(channelType int, err *types.NewAPIError) bool
 	if err.GetUpstreamStatusCode() != http.StatusTooManyRequests {
 		return false
 	}
+	if err.UsageWindows.IsExhausted() {
+		return true
+	}
 	if subscriptionOAuthUsageWindowReset(err) {
 		return true
 	}
@@ -276,7 +279,7 @@ func classifySubscriptionOAuthError(err *types.NewAPIError) *types.NewAPIError {
 		return err.Reclassify(err.Err, types.ErrorCodeUpstreamAccountDisabled)
 	}
 	if err.GetUpstreamStatusCode() == http.StatusTooManyRequests &&
-		(subscriptionOAuthUsageWindowReset(err) ||
+		(err.UsageWindows.IsExhausted() || subscriptionOAuthUsageWindowReset(err) ||
 			containsSubscriptionOAuthErrorMarker(lowerMessage, lowerCode, subscriptionOAuthUsageLimitMarkers)) {
 		return err.Reclassify(err.Err, types.ErrorCodeUpstreamUsageLimit)
 	}

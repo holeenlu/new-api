@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -208,6 +211,118 @@ func TestRelayErrorHandlerPreservesIndividualAnthropicUsageWindows(t *testing.T)
 	require.InDelta(t, (5 * time.Hour).Seconds(), err.UsageWindows.FiveHourRetryAfter.Seconds(), 2)
 	require.InDelta(t, (6 * 24 * time.Hour).Seconds(), err.UsageWindows.SevenDayRetryAfter.Seconds(), 2)
 	require.InDelta(t, (6 * 24 * time.Hour).Seconds(), err.RetryAfter.Seconds(), 2)
+}
+
+func TestAnthropicUsageWindowHeaderWithoutResetDrivesCooldownAndFailover(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	tests := []struct {
+		name              string
+		headers           http.Header
+		wantFiveHour      bool
+		wantSevenDay      bool
+		wantUnified       bool
+		wantMessageDetail string
+	}{
+		{
+			name: "five hour window",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"},
+			},
+			wantFiveHour:      true,
+			wantMessageDetail: "5 小时订阅用量窗口已达上限",
+		},
+		{
+			name: "weekly window",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-7d-Status": []string{"rejected"},
+			},
+			wantSevenDay:      true,
+			wantMessageDetail: "周订阅用量窗口已达上限",
+		},
+		{
+			name: "top level rejection without window detail",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status": []string{"rejected"},
+			},
+			wantUnified:       true,
+			wantMessageDetail: "上游未提供恢复时间",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.headers.Set("Content-Type", "application/json")
+			response := &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     test.headers,
+				Body: io.NopCloser(strings.NewReader(
+					`{"error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`,
+				)),
+			}
+
+			relayError := RelayErrorHandler(context.Background(), response)
+			require.True(t, relayError.UsageWindows.IsExhausted())
+			require.Equal(t, test.wantFiveHour, relayError.UsageWindows.FiveHourExhausted)
+			require.Equal(t, test.wantSevenDay, relayError.UsageWindows.SevenDayExhausted)
+			require.Equal(t, test.wantUnified, relayError.UsageWindows.UnifiedExhausted)
+			require.Zero(t, relayError.RetryAfter)
+
+			classified := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, relayError)
+			require.Equal(t, types.ErrorCodeUpstreamUsageLimit, classified.GetErrorCode())
+			message, ok := localizedRelayErrorMessage(
+				i18n.LangZhCN,
+				classified.GetErrorCode(),
+				classified.RetryAfter,
+				classified.UsageWindows,
+				time.Now(),
+			)
+			require.True(t, ok)
+			require.Contains(t, message, test.wantMessageDetail)
+
+			fingerprint := "anthropic-header-no-reset-" + test.name
+			state := replaceSubscriptionOAuthStateForTest(t, fingerprint)
+			retryParam := &RetryParam{}
+			require.Equal(t, SubscriptionOAuthAttemptReserved, retryParam.ReserveSubscriptionOAuthAttempt(1, 0, fingerprint))
+			decision, cooldown := retryParam.DecideSubscriptionOAuthContinuation(SubscriptionOAuthRetryObservation{
+				ChannelType: constant.ChannelTypeClaudeCode,
+				Error:       classified,
+				Retryable:   true,
+			})
+			require.Equal(t, SubscriptionOAuthSwitchCredential, decision)
+			require.Equal(t, subscriptionOAuthUsageLimitCooldown, cooldown)
+			state.mu.Lock()
+			require.Equal(t, subscriptionOAuthCooldownUsageLimit, state.cooldownReason)
+			require.Equal(t, subscriptionOAuthUsageLimitCooldown, state.cooldownDuration)
+			state.mu.Unlock()
+		})
+	}
+}
+
+func TestRelayErrorHandlerPreservesUsageHeadersWhenBodyReadFails(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(3 * time.Hour).Truncate(time.Second)
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Anthropic-Ratelimit-Unified-Status": []string{"rejected"},
+			"Anthropic-Ratelimit-Unified-Reset":  []string{fmt.Sprintf("%d", resetAt.Unix())},
+		},
+		Body: io.NopCloser(iotest.ErrReader(fmt.Errorf("connection reset while reading error body"))),
+	}
+
+	relayError := RelayErrorHandler(context.Background(), response)
+	require.Error(t, relayError)
+	require.True(t, relayError.UsageWindows.UnifiedExhausted)
+	require.InDelta(t, (3 * time.Hour).Seconds(), relayError.RetryAfter.Seconds(), 2)
+
+	classified := ApplyChannelErrorPolicy(constant.ChannelTypeClaudeCode, relayError)
+	require.Equal(t, types.ErrorCodeUpstreamUsageLimit, classified.GetErrorCode())
+	require.InDelta(
+		t,
+		(3 * time.Hour).Seconds(),
+		SubscriptionOAuthCredentialCooldownForError(constant.ChannelTypeClaudeCode, classified).Seconds(),
+		2,
+	)
 }
 
 func TestRelayErrorHandlerPreservesUsageResetFromBody(t *testing.T) {
