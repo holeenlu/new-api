@@ -407,6 +407,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'OAuth account cannot access this resource. Check the subscription and account permissions.',
     'OAuth start failed': 'OAuth start failed',
+    'Total Input Tokens': 'Total Input Tokens',
+    'Uncached Input Tokens': 'Uncached Input Tokens',
   },
   zh: {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -416,6 +418,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'OAuth 账户无权访问此资源。请检查订阅状态和账户权限。',
     'OAuth start failed': 'OAuth 授权启动失败',
+    'Total Input Tokens': '总输入 Token',
+    'Uncached Input Tokens': '非缓存输入 Token',
   },
   'zh-TW': {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -425,6 +429,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'OAuth 帳戶無權存取此資源。請檢查訂閱狀態和帳戶權限。',
     'OAuth start failed': 'OAuth 授權啟動失敗',
+    'Total Input Tokens': '總輸入 Token',
+    'Uncached Input Tokens': '未快取輸入 Token',
   },
   fr: {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -434,6 +440,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       "Le compte OAuth ne peut pas accéder à cette ressource. Vérifiez l'abonnement et les autorisations du compte.",
     'OAuth start failed': 'Échec du démarrage OAuth',
+    'Total Input Tokens': "Total des tokens d'entrée",
+    'Uncached Input Tokens': "Tokens d'entrée hors cache",
   },
   ja: {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -443,6 +451,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'OAuth アカウントはこのリソースにアクセスできません。サブスクリプションとアカウント権限を確認してください。',
     'OAuth start failed': 'OAuth の開始に失敗しました',
+    'Total Input Tokens': '合計入力トークン',
+    'Uncached Input Tokens': '非キャッシュ入力トークン',
   },
   ru: {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -452,6 +462,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'Учетная запись OAuth не имеет доступа к этому ресурсу. Проверьте подписку и разрешения учетной записи.',
     'OAuth start failed': 'Не удалось запустить OAuth',
+    'Total Input Tokens': 'Всего входных токенов',
+    'Uncached Input Tokens': 'Входные токены вне кэша',
   },
   vi: {
     'After signing in, copy the full callback URL from the browser address bar and paste it here.':
@@ -461,6 +473,8 @@ const extraKeys = {
     'OAuth account cannot access this resource. Check the subscription and account permissions.':
       'Tài khoản OAuth không thể truy cập tài nguyên này. Hãy kiểm tra gói đăng ký và quyền của tài khoản.',
     'OAuth start failed': 'Không thể khởi động OAuth',
+    'Total Input Tokens': 'Tổng token đầu vào',
+    'Uncached Input Tokens': 'Token đầu vào không lưu đệm',
   },
 }
 

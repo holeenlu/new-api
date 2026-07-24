@@ -60,6 +60,7 @@ import {
   getResponseTimeColor,
   renderAuditContent,
 } from '../../lib/format'
+import { getUsageTokenBreakdown } from '../../lib/token-usage'
 import {
   getLogTypeConfig,
   isPerCallBilling,
@@ -391,35 +392,46 @@ function TokenBreakdown(props: { log: UsageLog; other: LogOtherData }) {
   const { t } = useTranslation()
   const { log, other } = props
 
-  const promptTokens = log.prompt_tokens || 0
-  const completionTokens = log.completion_tokens || 0
-  const cacheRead = other.cache_tokens || 0
-  const cacheWrite = other.cache_creation_tokens || 0
+  const tokens = getUsageTokenBreakdown(log, other)
   const cacheWrite5m = other.cache_creation_tokens_5m || 0
   const cacheWrite1h = other.cache_creation_tokens_1h || 0
-  const hasTokens = promptTokens > 0 || completionTokens > 0
+  const hasTokens = tokens.totalInputTokens > 0 || tokens.completionTokens > 0
 
   if (!hasTokens) return null
 
   const rows: Array<{ label: string; value: string }> = []
 
-  rows.push({ label: t('Input Tokens'), value: promptTokens.toLocaleString() })
+  if (tokens.isAnthropic) {
+    rows.push({
+      label: t('Total Input Tokens'),
+      value: tokens.totalInputTokens.toLocaleString(),
+    })
+    rows.push({
+      label: t('Uncached Input Tokens'),
+      value: tokens.promptTokens.toLocaleString(),
+    })
+  } else {
+    rows.push({
+      label: t('Input Tokens'),
+      value: tokens.promptTokens.toLocaleString(),
+    })
+  }
   rows.push({
     label: t('Output Tokens'),
-    value: completionTokens.toLocaleString(),
+    value: tokens.completionTokens.toLocaleString(),
   })
 
-  if (cacheRead > 0) {
+  if (tokens.cacheReadTokens > 0) {
     rows.push({
       label: t('Cache Read'),
-      value: cacheRead.toLocaleString(),
+      value: tokens.cacheReadTokens.toLocaleString(),
     })
   }
 
-  if (cacheWrite > 0 && cacheWrite5m === 0 && cacheWrite1h === 0) {
+  if (tokens.cacheWriteTokens > 0 && cacheWrite5m === 0 && cacheWrite1h === 0) {
     rows.push({
       label: t('Cache Write'),
-      value: cacheWrite.toLocaleString(),
+      value: tokens.cacheWriteTokens.toLocaleString(),
     })
   }
 

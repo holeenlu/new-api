@@ -186,7 +186,10 @@ func TestCalculateTextQuotaSummaryUsesClaudeBillingUsageBeforeTopLevelUsage(t *t
 		}),
 	}
 
-	summary := calculateTextQuotaSummary(ctx, relayInfo, effectiveBillingUsage(usage))
+	billingUsage := effectiveBillingUsage(usage)
+	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
+	other := map[string]interface{}{}
+	appendInputTokensTotalForLog(other, billingUsage)
 
 	require.True(t, summary.IsClaudeUsageSemantic)
 	require.Equal(t, dto.BillingUsageSemanticAnthropic, summary.UsageSemantic)
@@ -197,6 +200,7 @@ func TestCalculateTextQuotaSummaryUsesClaudeBillingUsageBeforeTopLevelUsage(t *t
 	require.Equal(t, 12, summary.CacheCreationTokens5m)
 	require.Equal(t, 8, summary.CacheCreationTokens1h)
 	require.Equal(t, 118, summary.Quota)
+	require.Equal(t, 120, other["input_tokens_total"])
 }
 
 func TestCalculateTextQuotaSummaryUsesGeminiBillingUsageBeforeTopLevelUsage(t *testing.T) {

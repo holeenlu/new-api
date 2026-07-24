@@ -1,0 +1,12 @@
+{
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+http://ai-proxy.kdan.cc {
+	redir https://ai-proxy.kdan.cc{uri} permanent
+}
+
+https://ai-proxy.kdan.cc {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	reverse_proxy new-api:3000
+}

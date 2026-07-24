@@ -51,6 +51,7 @@ import {
   isViolationFeeLog,
   renderAuditContent,
 } from '../../lib/format'
+import { getUsageTokenBreakdown } from '../../lib/token-usage'
 import {
   isDisplayableLogType,
   isTimingLogType,
@@ -657,36 +658,35 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
 
         const other = parseLogOther(log.other)
 
-        const promptTokens = log.prompt_tokens || 0
-        const completionTokens = log.completion_tokens || 0
-        if (promptTokens === 0 && completionTokens === 0) {
+        const tokens = getUsageTokenBreakdown(log, other)
+        if (tokens.totalInputTokens === 0 && tokens.completionTokens === 0) {
           return <span className='text-muted-foreground text-xs'>-</span>
         }
-
-        const cacheReadTokens = other?.cache_tokens || 0
-        const cacheWrite5m = other?.cache_creation_tokens_5m || 0
-        const cacheWrite1h = other?.cache_creation_tokens_1h || 0
-        const hasSplitCache = cacheWrite5m > 0 || cacheWrite1h > 0
-        const cacheWriteTokens = hasSplitCache
-          ? cacheWrite5m + cacheWrite1h
-          : other?.cache_creation_tokens || 0
 
         return (
           <div className='flex flex-col gap-0.5'>
             <span className='font-mono text-xs font-medium tabular-nums'>
-              {promptTokens.toLocaleString()} /{' '}
-              {completionTokens.toLocaleString()}
+              {tokens.totalInputTokens.toLocaleString()} /{' '}
+              {tokens.completionTokens.toLocaleString()}
             </span>
-            {(cacheReadTokens > 0 || cacheWriteTokens > 0) && (
-              <div className='flex items-center gap-1 text-[11px]'>
-                {cacheReadTokens > 0 && (
+            {(tokens.isAnthropic ||
+              tokens.cacheReadTokens > 0 ||
+              tokens.cacheWriteTokens > 0) && (
+              <div className='flex flex-wrap items-center gap-x-1 gap-y-0.5 text-[11px]'>
+                {tokens.isAnthropic && (
                   <span className='text-muted-foreground/60'>
-                    {t('Cache')}↓ {cacheReadTokens.toLocaleString()}
+                    {t('Uncached Input Tokens')}{' '}
+                    {tokens.promptTokens.toLocaleString()}
                   </span>
                 )}
-                {cacheWriteTokens > 0 && (
+                {tokens.cacheReadTokens > 0 && (
                   <span className='text-muted-foreground/60'>
-                    ↑ {cacheWriteTokens.toLocaleString()}
+                    {t('Cache')}↓ {tokens.cacheReadTokens.toLocaleString()}
+                  </span>
+                )}
+                {tokens.cacheWriteTokens > 0 && (
+                  <span className='text-muted-foreground/60'>
+                    ↑ {tokens.cacheWriteTokens.toLocaleString()}
                   </span>
                 )}
               </div>
