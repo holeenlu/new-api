@@ -7,7 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/reasonmap"
-	"github.com/samber/lo"
+	sharedclaude "github.com/QuantumNous/new-api/service/relayconvert/internal/shared/claude"
 )
 
 func generateStopBlock(index int) *dto.ClaudeResponse {
@@ -68,8 +68,7 @@ func buildClaudeUsageFromOpenAIUsage(oaiUsage *dto.Usage) *dto.ClaudeUsage {
 }
 
 func NormalizeCacheCreationSplit(totalTokens int, tokens5m int, tokens1h int) (int, int) {
-	remainder := lo.Max([]int{totalTokens - tokens5m - tokens1h, 0})
-	return tokens5m + remainder, tokens1h
+	return sharedclaude.NormalizeCacheCreationSplit(totalTokens, tokens5m, tokens1h)
 }
 
 func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) []*dto.ClaudeResponse {

@@ -125,20 +125,46 @@ func usageFromOpenAIBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {
 
 func usageFromClaudeBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {
 	claudeUsage := billingUsage.ClaudeUsage
-	cacheCreation5m := claudeUsage.GetCacheCreation5mTokens()
-	if cacheCreation5m == 0 {
-		cacheCreation5m = claudeUsage.ClaudeCacheCreation5mTokens
+	cacheCreation5m := claudeUsage.ClaudeCacheCreation5mTokens
+	cacheCreation1h := claudeUsage.ClaudeCacheCreation1hTokens
+	if claudeUsage.CacheCreation != nil {
+		cacheCreation5m = claudeUsage.GetCacheCreation5mTokens()
+		cacheCreation1h = claudeUsage.GetCacheCreation1hTokens()
 	}
-	cacheCreation1h := claudeUsage.GetCacheCreation1hTokens()
-	if cacheCreation1h == 0 {
-		cacheCreation1h = claudeUsage.ClaudeCacheCreation1hTokens
+	cacheCreation5m, cacheCreation1h = NormalizeCacheCreationSplit(
+		claudeUsage.CacheCreationInputTokens,
+		cacheCreation5m,
+		cacheCreation1h,
+	)
+	// Keep the nested BillingUsage raw for audit, but expose normalized totals
+	// on dto.Usage so billing, logs, and UI report the same input count.
+	maxInt := int(^uint(0) >> 1)
+	normalizedCacheCreation := cacheCreation5m
+	if cacheCreation1h > maxInt-normalizedCacheCreation {
+		normalizedCacheCreation = maxInt
+	} else {
+		normalizedCacheCreation += cacheCreation1h
+	}
+	inputTokens := claudeUsage.InputTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	for _, tokens := range []int{claudeUsage.CacheReadInputTokens, normalizedCacheCreation} {
+		if tokens < 0 {
+			continue
+		}
+		if tokens > maxInt-inputTokens {
+			inputTokens = maxInt
+			break
+		}
+		inputTokens += tokens
 	}
 
 	usage := &dto.Usage{
 		PromptTokens:                claudeUsage.InputTokens,
 		CompletionTokens:            claudeUsage.OutputTokens,
 		TotalTokens:                 claudeUsage.InputTokens + claudeUsage.OutputTokens,
-		InputTokens:                 claudeUsage.InputTokens + claudeUsage.CacheReadInputTokens + claudeUsage.CacheCreationInputTokens,
+		InputTokens:                 inputTokens,
 		OutputTokens:                claudeUsage.OutputTokens,
 		UsageSemantic:               dto.BillingUsageSemanticAnthropic,
 		UsageSource:                 dto.BillingUsageSourceClaudeMessages,
@@ -147,7 +173,7 @@ func usageFromClaudeBillingUsage(billingUsage *dto.BillingUsage) *dto.Usage {
 		ClaudeCacheCreation1hTokens: cacheCreation1h,
 	}
 	usage.PromptTokensDetails.CachedTokens = claudeUsage.CacheReadInputTokens
-	usage.PromptTokensDetails.CachedCreationTokens = claudeUsage.CacheCreationInputTokens
+	usage.PromptTokensDetails.CachedCreationTokens = normalizedCacheCreation
 	return usage
 }
 

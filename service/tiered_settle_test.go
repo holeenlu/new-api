@@ -745,6 +745,88 @@ func TestBuildTieredTokenParams_Len_Claude(t *testing.T) {
 	if params.P != 5000 {
 		t.Fatalf("P = %f, want 5000 (no subtraction for Claude)", params.P)
 	}
+	semanticParams := BuildTieredTokenParams(usage, false, usedVars)
+	assert.Equal(t, params.CC, semanticParams.CC)
+	assert.Equal(t, params.CC1h, semanticParams.CC1h)
+	assert.Equal(t, params.Len, semanticParams.Len)
+}
+
+func TestBuildTieredTokenParams_NormalizesClaudeCacheCreationSplit(t *testing.T) {
+	tests := []struct {
+		name    string
+		total   int
+		known5m int
+		known1h int
+		want5m  float64
+		want1h  float64
+		wantLen float64
+	}{
+		{name: "aggregate only", total: 100, want5m: 100, wantLen: 100},
+		{name: "partial split", total: 100, known1h: 20, want5m: 80, want1h: 20, wantLen: 100},
+		{name: "full split", total: 100, known5m: 80, known1h: 20, want5m: 80, want1h: 20, wantLen: 100},
+		{name: "missing aggregate", known5m: 30, known1h: 20, want5m: 30, want1h: 20, wantLen: 50},
+		{name: "known split exceeds aggregate", total: 50, known5m: 40, known1h: 30, want5m: 40, want1h: 30, wantLen: 70},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := &dto.Usage{
+				PromptTokens:  1000,
+				UsageSemantic: dto.BillingUsageSemanticAnthropic,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedCreationTokens: tt.total,
+				},
+				ClaudeCacheCreation5mTokens: tt.known5m,
+				ClaudeCacheCreation1hTokens: tt.known1h,
+			}
+			params := BuildTieredTokenParams(usage, true, nil)
+			assert.Equal(t, tt.want5m, params.CC)
+			assert.Equal(t, tt.want1h, params.CC1h)
+			assert.Equal(t, 1000+tt.wantLen, params.Len)
+		})
+	}
+}
+
+func TestBuildTieredTokenParams_ClaudeCacheCreationAffectsTieredCharge(t *testing.T) {
+	expr := `tier("base", p * 1 + cc * 2 + cc1h * 4)`
+	for _, tt := range []struct {
+		name    string
+		known1h int
+		want    int
+	}{
+		{name: "aggregate only", want: 150},
+		{name: "partial split", known1h: 20, want: 170},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := &dto.Usage{
+				PromptTokens:  100,
+				UsageSemantic: dto.BillingUsageSemanticAnthropic,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedCreationTokens: 100,
+				},
+				ClaudeCacheCreation1hTokens: tt.known1h,
+			}
+			params := BuildTieredTokenParams(usage, true, billingexpr.UsedVars(expr))
+			info := makeRelayInfo(expr, 1, 100, 0)
+			ok, quota, result := TryTieredSettle(info, params)
+			require.True(t, ok)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.want, quota)
+		})
+	}
+}
+
+func TestBuildTieredTokenParams_ClaudeUsesCacheWriteAggregate(t *testing.T) {
+	usage := &dto.Usage{
+		UsageSemantic: dto.BillingUsageSemanticAnthropic,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CacheWriteTokens: 100,
+		},
+	}
+
+	params := BuildTieredTokenParams(usage, true, nil)
+	assert.Equal(t, 100.0, params.CC)
+	assert.Equal(t, 100.0, params.Len)
 }
 
 func TestBuildTieredTokenParams_Len_TierCondition(t *testing.T) {

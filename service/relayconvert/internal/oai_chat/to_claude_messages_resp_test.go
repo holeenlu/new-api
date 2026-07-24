@@ -212,6 +212,15 @@ func TestNormalizeCacheCreationSplit(t *testing.T) {
 	cache5m, cache1h = NormalizeCacheCreationSplit(3, 5, 1)
 	assert.Equal(t, 5, cache5m)
 	assert.Equal(t, 1, cache1h)
+
+	cache5m, cache1h = NormalizeCacheCreationSplit(-3, -5, -1)
+	assert.Equal(t, 0, cache5m)
+	assert.Equal(t, 0, cache1h)
+
+	maxInt := int(^uint(0) >> 1)
+	cache5m, cache1h = NormalizeCacheCreationSplit(0, maxInt, 2)
+	assert.Equal(t, maxInt, cache5m)
+	assert.Equal(t, 2, cache1h)
 }
 
 func ptr[T any](value T) *T {

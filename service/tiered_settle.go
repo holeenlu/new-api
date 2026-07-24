@@ -61,12 +61,18 @@ func clampTieredTokenParams(params billingexpr.TokenParams) billingexpr.TokenPar
 // report them as text-only. This function normalizes to text-only when
 // sub-categories are separately priced.
 func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVars map[string]bool) billingexpr.TokenParams {
+	claudeSemantic := isClaudeUsageSemantic || usage.UsageSemantic == dto.BillingUsageSemanticAnthropic
 	cc5m := float64(usage.PromptTokensDetails.CacheCreationTokensTotal())
 	cc1h := float64(0)
 
-	if usage.UsageSemantic == "anthropic" {
-		cc1h = float64(usage.ClaudeCacheCreation1hTokens)
-		cc5m = float64(usage.ClaudeCacheCreation5mTokens)
+	if claudeSemantic {
+		normalized5m, normalized1h := NormalizeCacheCreationSplit(
+			usage.PromptTokensDetails.CacheCreationTokensTotal(),
+			usage.ClaudeCacheCreation5mTokens,
+			usage.ClaudeCacheCreation1hTokens,
+		)
+		cc5m = float64(normalized5m)
+		cc1h = float64(normalized1h)
 	}
 
 	params := clampTieredTokenParams(billingexpr.TokenParams{
@@ -85,11 +91,11 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	// Non-Claude: prompt_tokens already includes everything.
 	// Claude: input_tokens is text-only, so add cache read + cache creation.
 	params.Len = params.P
-	if isClaudeUsageSemantic {
+	if claudeSemantic {
 		params.Len = params.P + params.CR + params.CC + params.CC1h
 	}
 
-	if !isClaudeUsageSemantic {
+	if !claudeSemantic {
 		if usedVars["cr"] {
 			params.P -= params.CR
 		}
