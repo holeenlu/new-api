@@ -471,6 +471,21 @@ func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
 	require.NotContains(t, newAPIError.Error(), body)
 }
 
+func TestRelayErrorHandlerPreservesStatusWhenParsedErrorMessageIsEmpty(t *testing.T) {
+	body := `{"error":{"message":""}}`
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	newAPIError := RelayErrorHandler(context.Background(), resp)
+
+	require.NotNil(t, newAPIError)
+	require.Contains(t, newAPIError.Error(), "bad response status code 502")
+	require.Contains(t, newAPIError.Error(), fmt.Sprintf("response_bytes: %d", len(body)))
+	require.NotContains(t, newAPIError.Error(), body)
+}
+
 func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
 	message := strings.Repeat("d", common.LocalLogContentLimit+256)
 	body := `{"error":{"message":"` + message + `","type":"server_error","code":"server_error"}}`

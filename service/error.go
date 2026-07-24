@@ -190,6 +190,15 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 		}
 	}
 	message := sanitizeUpstreamErrorMessage(errResponse.ToMessage())
+	if message == "" {
+		// The body parsed as JSON but carried no usable error message; log a
+		// bounded, redacted preview so the upstream failure remains diagnosable.
+		logger.LogError(ctx, fmt.Sprintf(
+			"bad response status code %d with empty error message, body: %s",
+			resp.StatusCode,
+			common.LocalLogPreview(string(responseBody)),
+		))
+	}
 	newApiErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	newApiErr.Err = buildUpstreamErrorSummary(resp, responseBody, truncated, message)
 	return
