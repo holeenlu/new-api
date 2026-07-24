@@ -346,7 +346,7 @@ func (p *RetryParam) handleSubscriptionOAuthAccountUnavailable() {
 	if target == nil {
 		return
 	}
-	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
+	p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient, types.SubscriptionOAuthUsageWindows{})
 }
 
 // handleSubscriptionOAuthModelUnavailable excludes the credential only from
@@ -418,7 +418,7 @@ func (p *RetryParam) DecideSubscriptionOAuthContinuation(
 			if target == nil {
 				return SubscriptionOAuthRetryStop, cooldown
 			}
-			p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownUsageLimit)
+			p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownUsageLimit, observation.Error.UsageWindows)
 		}
 		if stop {
 			return SubscriptionOAuthRetryStop, cooldown
@@ -481,7 +481,7 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 		return SubscriptionOAuthRetryStop
 	}
 	if statusCode == http.StatusTooManyRequests {
-		p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownRateLimit)
+		p.failCurrentSubscriptionOAuthCredential(target, cooldown, subscriptionOAuthCooldownRateLimit, types.SubscriptionOAuthUsageWindows{})
 		if downstreamStarted || !common.SubscriptionOAuthRetry429 {
 			return SubscriptionOAuthRetryStop
 		}
@@ -499,7 +499,7 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 	}
 	credential.failures++
 	if target.RecoveryProbe {
-		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
+		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient, types.SubscriptionOAuthUsageWindows{})
 		return SubscriptionOAuthSwitchCredential
 	}
 	maxFailures := common.SubscriptionOAuthUpstreamRetryTimes
@@ -507,7 +507,7 @@ func (p *RetryParam) decideSubscriptionOAuthRetry(
 		return SubscriptionOAuthRetryStop
 	}
 	if credential.failures >= maxFailures {
-		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient)
+		p.failCurrentSubscriptionOAuthCredential(target, subscriptionOAuthCredentialCooldown, subscriptionOAuthCooldownTransient, types.SubscriptionOAuthUsageWindows{})
 		return SubscriptionOAuthSwitchCredential
 	}
 
@@ -558,6 +558,7 @@ func (p *RetryParam) failCurrentSubscriptionOAuthCredential(
 	target *SubscriptionOAuthAttemptTarget,
 	cooldown time.Duration,
 	reason subscriptionOAuthCooldownReason,
+	usageWindows types.SubscriptionOAuthUsageWindows,
 ) {
 	if target == nil {
 		return
@@ -565,7 +566,7 @@ func (p *RetryParam) failCurrentSubscriptionOAuthCredential(
 	if p.Boundary != nil {
 		p.Boundary.FailCredential(target.Fingerprint)
 	}
-	cooldownSubscriptionOAuthCredential(target.Fingerprint, target.Generation, cooldown, reason)
+	cooldownSubscriptionOAuthCredentialWithUsageWindows(target.Fingerprint, target.Generation, cooldown, reason, usageWindows)
 	p.clearSubscriptionOAuthAttemptTarget()
 	p.advanceCapacityReplay()
 }

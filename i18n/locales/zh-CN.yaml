@@ -285,6 +285,11 @@ custom_oauth.provider_id_field_invalid: "无法从提供商响应中提取用户
 # 转发错误信息（面向 API 客户端的简洁本地化提示）
 relay_error.upstream_usage_limit: "该账号的订阅用量已达上限，预计于 {{.ResetAt}} 恢复；在此之前该账号已暂停使用，可稍后重试或改用其他模型/账号。"
 relay_error.upstream_usage_limit_no_reset: "该账号的订阅用量已达上限，将在额度重置后自动恢复；在此之前可稍后重试或改用其他模型/账号。"
+relay_error.upstream_usage_limit_windows: "该账号的{{.Windows}}；在全部已达上限的窗口恢复前，该账号已暂停使用，可稍后重试或改用其他模型/账号。"
+relay_error.upstream_usage_limit_five_hour: "5 小时订阅用量窗口已达上限，预计于 {{.ResetAt}} 恢复"
+relay_error.upstream_usage_limit_five_hour_no_reset: "5 小时订阅用量窗口已达上限，恢复时间暂未由上游提供"
+relay_error.upstream_usage_limit_weekly: "周订阅用量窗口已达上限，预计于 {{.ResetAt}} 恢复"
+relay_error.upstream_usage_limit_weekly_no_reset: "周订阅用量窗口已达上限，恢复时间暂未由上游提供"
 relay_error.upstream_rate_limited: "上游请求过于频繁，请在约 {{.RetrySeconds}} 秒后重试。"
 relay_error.upstream_rate_limited_no_retry: "上游请求过于频繁，请稍后重试。"
 relay_error.upstream_quota_exhausted: "该账号额度已耗尽，请充值或更换账号后重试。"

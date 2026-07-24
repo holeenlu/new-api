@@ -558,6 +558,13 @@ func (w *responsesWebSocketSSEWriter) Flush() {
 func (w *responsesWebSocketSSEWriter) Finish() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.ctx != nil && w.ctx.Err() != nil {
+		// The downstream connection is already gone. A locally successful socket
+		// write here would not prove that the client received the synthetic terminal,
+		// and logging it as sent obscures the cancellation that actually ended the
+		// turn.
+		return w.ctx.Err()
+	}
 	w.drainSSEFrames(true)
 	if w.err != nil {
 		return w.err

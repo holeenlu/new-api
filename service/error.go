@@ -109,7 +109,9 @@ func buildUpstreamErrorSummary(resp *http.Response, responseBody []byte, truncat
 			"anthropic-ratelimit-unified-status",
 			"anthropic-ratelimit-unified-reset",
 			"anthropic-ratelimit-unified-5h-status",
+			"anthropic-ratelimit-unified-5h-reset",
 			"anthropic-ratelimit-unified-7d-status",
+			"anthropic-ratelimit-unified-7d-reset",
 			"anthropic-ratelimit-input-tokens-reset",
 			"anthropic-ratelimit-tokens-reset",
 		} {
@@ -141,10 +143,12 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 		time.Now(),
 		maximumSubscriptionOAuthRetryAfter,
 	)
+	var usageWindows types.SubscriptionOAuthUsageWindows
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.RetryAfter = retryAfter
 			newApiErr.UpstreamStatusCode = resp.StatusCode
+			newApiErr.UsageWindows = usageWindows
 		}
 	}()
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
@@ -159,7 +163,9 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response) (newApiErr *typ
 	if truncated {
 		responseBody = responseBody[:maxUpstreamErrorResponseBytes]
 	}
-	retryAfter = ParseUpstreamRetryDelay(resp.Header, responseBody, time.Now())
+	now := time.Now()
+	retryAfter = ParseUpstreamRetryDelay(resp.Header, responseBody, now)
+	usageWindows = subscriptionOAuthUsageWindowsFromHeaders(resp.Header, now)
 
 	var errResponse dto.GeneralErrorResponse
 	err = common.Unmarshal(responseBody, &errResponse)
@@ -193,6 +199,13 @@ func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
 // structured upstream errors while keeping malformed values bounded. Ordinary
 // burst-rate cooldowns are still capped later by SubscriptionOAuthRetryCooldown.
 func ParseUpstreamRetryDelay(headers http.Header, responseBody []byte, now time.Time) time.Duration {
+	// Anthropic can report multiple exhausted subscription windows on one
+	// inference response. Their latest reset is the routing constraint, so it
+	// takes precedence over a generic body reset for a single representative
+	// window.
+	if delay := parseUnifiedUsageReset(headers, now); delay > 0 {
+		return delay
+	}
 	var payload map[string]any
 	if len(responseBody) > 0 && common.UnmarshalWithNumber(responseBody, &payload) == nil {
 		if delay := findUpstreamResetDelay(payload, now, true, 0); delay > 0 {
@@ -201,9 +214,6 @@ func ParseUpstreamRetryDelay(headers http.Header, responseBody []byte, now time.
 		if delay := findUpstreamResetDelay(payload, now, false, 0); delay > 0 {
 			return delay
 		}
-	}
-	if delay := parseUnifiedUsageReset(headers, now); delay > 0 {
-		return delay
 	}
 	return parseRetryAfterValue(headers.Get("Retry-After"), now, maximumSubscriptionOAuthUsageLimitCooldown)
 }
@@ -214,9 +224,13 @@ func ParseUpstreamRetryDelay(headers http.Header, responseBody []byte, now time.
 // does not. It only reports a reset when the unified status marks the account as
 // actually exhausted, so an acceleration/burst 429 that still advertises a
 // far-future window reset is not mistaken for a usage-window cooldown. The
-// top-level anthropic-ratelimit-unified-reset mirrors the current representative
-// window's reset, so per-window (5h/7d) headers do not need to be read here.
+// top-level anthropic-ratelimit-unified-reset is only a representative reset.
+// Per-window reset headers preserve whether the five-hour, seven-day, or both
+// windows are exhausted for client messaging and a later local rejection.
 func parseUnifiedUsageReset(headers http.Header, now time.Time) time.Duration {
+	if delay := subscriptionOAuthUsageWindowsFromHeaders(headers, now).RetryDelay(); delay > 0 {
+		return delay
+	}
 	if !unifiedRateLimitExhausted(headers) {
 		return 0
 	}
@@ -228,12 +242,44 @@ func unifiedRateLimitExhausted(headers http.Header) bool {
 		return true
 	}
 	for _, window := range []string{"anthropic-ratelimit-unified-5h-status", "anthropic-ratelimit-unified-7d-status"} {
-		switch strings.ToLower(strings.TrimSpace(headers.Get(window))) {
-		case "exceeded", "rate_limited":
+		if unifiedRateLimitWindowExhausted(headers.Get(window)) {
 			return true
 		}
 	}
 	return false
+}
+
+func subscriptionOAuthUsageWindowsFromHeaders(headers http.Header, now time.Time) types.SubscriptionOAuthUsageWindows {
+	if headers == nil {
+		return types.SubscriptionOAuthUsageWindows{}
+	}
+	windows := types.SubscriptionOAuthUsageWindows{
+		FiveHourExhausted: unifiedRateLimitWindowExhausted(headers.Get("anthropic-ratelimit-unified-5h-status")),
+		SevenDayExhausted: unifiedRateLimitWindowExhausted(headers.Get("anthropic-ratelimit-unified-7d-status")),
+	}
+	if windows.FiveHourExhausted {
+		windows.FiveHourRetryAfter = parseUpstreamResetValue(headers.Get("anthropic-ratelimit-unified-5h-reset"), now, true)
+	}
+	if windows.SevenDayExhausted {
+		windows.SevenDayRetryAfter = parseUpstreamResetValue(headers.Get("anthropic-ratelimit-unified-7d-reset"), now, true)
+	}
+	representativeReset := parseUpstreamResetValue(headers.Get("anthropic-ratelimit-unified-reset"), now, true)
+	if windows.FiveHourExhausted && !windows.SevenDayExhausted && windows.FiveHourRetryAfter == 0 {
+		windows.FiveHourRetryAfter = representativeReset
+	}
+	if windows.SevenDayExhausted && !windows.FiveHourExhausted && windows.SevenDayRetryAfter == 0 {
+		windows.SevenDayRetryAfter = representativeReset
+	}
+	return windows
+}
+
+func unifiedRateLimitWindowExhausted(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "exceeded", "rate_limited", "rejected":
+		return true
+	default:
+		return false
+	}
 }
 
 // SubscriptionOAuthUsageLimitFromResponseHeaders classifies a usage-window
@@ -256,7 +302,11 @@ func SubscriptionOAuthUsageLimitFromResponseHeaders(headers http.Header, now tim
 		http.StatusTooManyRequests,
 	)
 	apiErr.UpstreamStatusCode = http.StatusTooManyRequests
-	apiErr.RetryAfter = parseUnifiedUsageReset(headers, now)
+	apiErr.UsageWindows = subscriptionOAuthUsageWindowsFromHeaders(headers, now)
+	apiErr.RetryAfter = apiErr.UsageWindows.RetryDelay()
+	if apiErr.RetryAfter == 0 {
+		apiErr.RetryAfter = parseUnifiedUsageReset(headers, now)
+	}
 	return apiErr
 }
 

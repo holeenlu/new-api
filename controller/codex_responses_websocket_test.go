@@ -503,6 +503,45 @@ func TestResponsesWebSocketSSEWriterMissingTerminalReusesObservedResponseID(t *t
 	require.NoError(t, <-serverErr)
 }
 
+func TestResponsesWebSocketSSEWriterSkipsSyntheticFailureAfterCancellation(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		ctx, cancel := context.WithCancel(r.Context())
+		writer := newResponsesWebSocketSSEWriter(ctx, conn)
+		_, err = writer.Write([]byte(
+			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancelled\",\"status\":\"in_progress\"}}\n\n",
+		))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		cancel()
+		serverErr <- writer.Finish()
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, firstFrame, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"response.created","response":{"id":"resp_cancelled","status":"in_progress"}}`,
+		string(firstFrame),
+	)
+	_, _, err = conn.ReadMessage()
+	require.Error(t, err, "a cancelled downstream must not receive a synthetic response.failed")
+	require.ErrorIs(t, <-serverErr, context.Canceled)
+}
+
 func TestResponsesWebSocketReadPumpCancelsOnDisconnect(t *testing.T) {
 	serverErr := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

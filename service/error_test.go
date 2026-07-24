@@ -186,6 +186,30 @@ func TestSubscriptionOAuthUsageLimitFromResponseHeaders(t *testing.T) {
 	require.Nil(t, SubscriptionOAuthUsageLimitFromResponseHeaders(nil, now))
 }
 
+func TestRelayErrorHandlerPreservesIndividualAnthropicUsageWindows(t *testing.T) {
+	now := time.Now()
+	fiveHourReset := now.Add(5 * time.Hour).Truncate(time.Second)
+	weeklyReset := now.Add(6 * 24 * time.Hour).Truncate(time.Second)
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Content-Type":                          []string{"application/json"},
+			"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"},
+			"Anthropic-Ratelimit-Unified-5h-Reset":  []string{fmt.Sprintf("%d", fiveHourReset.Unix())},
+			"Anthropic-Ratelimit-Unified-7d-Status": []string{"exceeded"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":  []string{fmt.Sprintf("%d", weeklyReset.Unix())},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":{"message":"usage limit reached","type":"usage_limit_reached"}}`)),
+	}
+
+	err := RelayErrorHandler(context.Background(), response)
+	require.True(t, err.UsageWindows.FiveHourExhausted)
+	require.True(t, err.UsageWindows.SevenDayExhausted)
+	require.InDelta(t, (5 * time.Hour).Seconds(), err.UsageWindows.FiveHourRetryAfter.Seconds(), 2)
+	require.InDelta(t, (6 * 24 * time.Hour).Seconds(), err.UsageWindows.SevenDayRetryAfter.Seconds(), 2)
+	require.InDelta(t, (6 * 24 * time.Hour).Seconds(), err.RetryAfter.Seconds(), 2)
+}
+
 func TestRelayErrorHandlerPreservesUsageResetFromBody(t *testing.T) {
 	response := &http.Response{
 		StatusCode: http.StatusTooManyRequests,

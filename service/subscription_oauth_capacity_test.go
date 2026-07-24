@@ -169,6 +169,72 @@ func TestSubscriptionOAuthUsageLimitCooldownPreservesReasonAndResetTime(t *testi
 	require.False(t, strings.Contains(message, "credential is busy"))
 }
 
+func TestSubscriptionOAuthUsageLimitCooldownPreservesIndividualWindows(t *testing.T) {
+	fingerprint := SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeClaudeCode,
+		1,
+		0,
+		"sk-ant-oat01-usage-window-detail-account",
+	)
+	replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	windows := types.SubscriptionOAuthUsageWindows{
+		FiveHourExhausted:  true,
+		FiveHourRetryAfter: 5 * time.Hour,
+		SevenDayExhausted:  true,
+		SevenDayRetryAfter: 6 * 24 * time.Hour,
+	}
+	require.True(t, cooldownSubscriptionOAuthCredentialWithUsageWindows(
+		fingerprint,
+		1,
+		windows.RetryDelay(),
+		subscriptionOAuthCooldownUsageLimit,
+		windows,
+	))
+
+	_, err := AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 5, 0)
+	require.ErrorIs(t, err, errSubscriptionOAuthCredentialCool)
+	var capacityError *subscriptionOAuthCapacityError
+	require.ErrorAs(t, err, &capacityError)
+	require.True(t, capacityError.usageWindows.FiveHourExhausted)
+	require.True(t, capacityError.usageWindows.SevenDayExhausted)
+	require.InDelta(t, windows.FiveHourRetryAfter.Seconds(), capacityError.usageWindows.FiveHourRetryAfter.Seconds(), 1)
+	require.InDelta(t, windows.SevenDayRetryAfter.Seconds(), capacityError.usageWindows.SevenDayRetryAfter.Seconds(), 1)
+}
+
+func TestSubscriptionOAuthUsageLimitCooldownReportsRemainingWindowTimes(t *testing.T) {
+	fingerprint := SubscriptionOAuthCredentialFingerprint(
+		constant.ChannelTypeClaudeCode,
+		1,
+		0,
+		"sk-ant-oat01-usage-window-remaining-account",
+	)
+	state := replaceSubscriptionOAuthStateForTest(t, fingerprint)
+	windows := types.SubscriptionOAuthUsageWindows{
+		FiveHourExhausted:  true,
+		FiveHourRetryAfter: 5 * time.Hour,
+		SevenDayExhausted:  true,
+		SevenDayRetryAfter: 6 * 24 * time.Hour,
+	}
+	require.True(t, cooldownSubscriptionOAuthCredentialWithUsageWindows(
+		fingerprint,
+		1,
+		windows.RetryDelay(),
+		subscriptionOAuthCooldownUsageLimit,
+		windows,
+	))
+	state.mu.Lock()
+	state.cooldownUntil = time.Now().Add(3 * 24 * time.Hour)
+	state.mu.Unlock()
+
+	_, err := AcquireSubscriptionOAuthCapacity(context.Background(), fingerprint, 5, 0)
+	var capacityError *subscriptionOAuthCapacityError
+	require.ErrorAs(t, err, &capacityError)
+	require.False(t, capacityError.usageWindows.FiveHourExhausted)
+	require.True(t, capacityError.usageWindows.SevenDayExhausted)
+	require.Greater(t, capacityError.usageWindows.SevenDayRetryAfter, 2*24*time.Hour+23*time.Hour)
+	require.LessOrEqual(t, capacityError.usageWindows.SevenDayRetryAfter, 3*24*time.Hour)
+}
+
 func TestSubscriptionOAuthChannelCapacityReturnsUsageLimitClassification(t *testing.T) {
 	key := `{"account_id":"usage-limit-channel-account"}`
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{

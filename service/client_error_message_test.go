@@ -77,7 +77,7 @@ func TestLocalizedRelayErrorMessage(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			msg, ok := localizedRelayErrorMessage(test.lang, test.code, test.retryAfter, now)
+			msg, ok := localizedRelayErrorMessage(test.lang, test.code, test.retryAfter, types.SubscriptionOAuthUsageWindows{}, now)
 			require.Equal(t, test.wantOK, ok)
 			for _, want := range test.wantContain {
 				require.Contains(t, msg, want)
@@ -93,7 +93,30 @@ func TestLocalizedRelayErrorMessage(t *testing.T) {
 // Unclassified codes must keep their original (verbose) message so no error
 // regresses to a generic one.
 func TestLocalizedRelayErrorMessageSkipsUnknownCodes(t *testing.T) {
-	msg, ok := localizedRelayErrorMessage(i18n.LangZhCN, types.ErrorCodeBadResponseStatusCode, time.Minute, time.Now())
+	msg, ok := localizedRelayErrorMessage(i18n.LangZhCN, types.ErrorCodeBadResponseStatusCode, time.Minute, types.SubscriptionOAuthUsageWindows{}, time.Now())
 	require.False(t, ok)
 	require.Empty(t, msg)
+}
+
+func TestLocalizedRelayErrorMessageDistinguishesSubscriptionUsageWindows(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	now := time.Date(2026, time.July, 24, 1, 0, 0, 0, time.UTC)
+
+	message, ok := localizedRelayErrorMessage(
+		i18n.LangZhCN,
+		types.ErrorCodeUpstreamUsageLimit,
+		7*24*time.Hour,
+		types.SubscriptionOAuthUsageWindows{
+			FiveHourExhausted:  true,
+			FiveHourRetryAfter: 5 * time.Hour,
+			SevenDayExhausted:  true,
+			SevenDayRetryAfter: 7 * 24 * time.Hour,
+		},
+		now,
+	)
+	require.True(t, ok)
+	require.Contains(t, message, "5 小时订阅用量窗口已达上限")
+	require.Contains(t, message, now.Add(5*time.Hour).Format("2006-01-02 15:04"))
+	require.Contains(t, message, "周订阅用量窗口已达上限")
+	require.Contains(t, message, now.Add(7*24*time.Hour).Format("2006-01-02 15:04"))
 }

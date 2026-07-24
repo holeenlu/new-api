@@ -2,6 +2,7 @@ package responsesws
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -82,6 +83,78 @@ func newSessionTestRelayInfo(channelID, keyIndex int, key string) *relaycommon.R
 		ApiKey:               key,
 		UpstreamModelName:    "gpt-test",
 	}}
+}
+
+func TestCancelledTurnExitsAfterConnectionGenerationIsCleared(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstreamClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","item":{"type":"message"}}`)); err != nil {
+			return
+		}
+		_, _, _ = conn.ReadMessage()
+		close(upstreamClosed)
+	}))
+	defer server.Close()
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	c := newSessionTestContext()
+	c.Request = c.Request.WithContext(requestCtx)
+	driver := &sessionTestDriver{upstreamURL: server.URL}
+	session := &Session{}
+	defer session.Close()
+	resp, err := session.DoRequest(c, driver, newSessionTestRelayInfo(150, 0, "credential-a"), strings.NewReader(`{"model":"gpt-test","input":"one"}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	var firstEvent strings.Builder
+	for {
+		line, readErr := reader.ReadString('\n')
+		require.NoError(t, readErr)
+		firstEvent.WriteString(line)
+		if line == "\n" {
+			break
+		}
+	}
+	require.Contains(t, firstEvent.String(), "response.output_item.added")
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(reader)
+		readDone <- readErr
+	}()
+
+	// Reproduce the production ordering: the downstream context is cancelled,
+	// then Session.Close clears the connection generation before the permanent
+	// reader can relay its close error to the turn consumer.
+	session.mu.Lock()
+	cancelRequest()
+	session.invalidateLocked(session.conn)
+	session.mu.Unlock()
+
+	select {
+	case readErr := <-readDone:
+		require.Error(t, readErr)
+		require.ErrorIs(t, readErr, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled turn remained blocked after its connection generation was cleared")
+	}
+	select {
+	case <-upstreamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled turn did not close the upstream connection")
+	}
 }
 
 func TestResetChannelForRetryClearsSessionBinding(t *testing.T) {

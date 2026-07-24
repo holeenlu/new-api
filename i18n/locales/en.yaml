@@ -284,6 +284,11 @@ custom_oauth.provider_id_field_invalid: "Could not extract user ID from provider
 # Relay error messages surfaced to API clients (localized concise summaries)
 relay_error.upstream_usage_limit: "This account's subscription usage limit is reached; expected to recover at {{.ResetAt}}. The account is paused until then — retry later or use another model/account."
 relay_error.upstream_usage_limit_no_reset: "This account's subscription usage limit is reached; it recovers when the quota resets. Retry later or use another model/account."
+relay_error.upstream_usage_limit_windows: "This account's {{.Windows}}. The account is paused until every exhausted window recovers; retry later or use another model/account."
+relay_error.upstream_usage_limit_five_hour: "5-hour subscription usage window is exhausted and is expected to recover at {{.ResetAt}}"
+relay_error.upstream_usage_limit_five_hour_no_reset: "5-hour subscription usage window is exhausted; the upstream did not provide a reset time"
+relay_error.upstream_usage_limit_weekly: "weekly subscription usage window is exhausted and is expected to recover at {{.ResetAt}}"
+relay_error.upstream_usage_limit_weekly_no_reset: "weekly subscription usage window is exhausted; the upstream did not provide a reset time"
 relay_error.upstream_rate_limited: "The upstream is rate limiting requests; retry in about {{.RetrySeconds}} seconds."
 relay_error.upstream_rate_limited_no_retry: "The upstream is rate limiting requests; please retry shortly."
 relay_error.upstream_quota_exhausted: "This account's quota is exhausted; top up or switch accounts, then retry."

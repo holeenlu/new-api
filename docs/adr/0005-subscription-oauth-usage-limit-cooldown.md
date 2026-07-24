@@ -49,6 +49,17 @@ quarantine, but it receives its own retry transition and reset-aware cooldown.
   header). Structured reset fields, unified headers, and `Retry-After` determine
   the cooldown when present; a usage limit without reset metadata uses the
   one-hour fallback.
+- Claude's passive inference headers preserve each exhausted subscription
+  window independently: `anthropic-ratelimit-unified-5h-status` /
+  `-5h-reset` and `anthropic-ratelimit-unified-7d-status` / `-7d-reset`.
+  The gateway keeps this structured detail on the relay error instead of
+  inferring it from provider prose. A 5-hour-only or weekly-only rejection
+  names that window and its own reset in the client message. When both are
+  exhausted, the message lists both reset times and routing cools the credential
+  until the later reset, because either still-exhausted window blocks recovery.
+  Older responses with only `anthropic-ratelimit-unified-reset` retain the
+  existing generic message unless exactly one per-window status identifies the
+  representative reset. No active call to `/api/oauth/usage` is involved.
 - The gateway still does not actively call
   `GET https://api.anthropic.com/api/oauth/usage`: it is not reliable evidence
   about the model request that just failed. It does, however, read the
@@ -227,6 +238,10 @@ selected by the shared capacity retry path when available.
   429s keep the ≤15m transient cooldown.
 - `TestParseUpstreamRetryDelay*`: exact and relative reset metadata, wrapped
   WebSocket payloads, stale values, header fallback, and bounds.
+- Usage-window tests verify that five-hour and weekly Anthropic headers survive
+  HTTP errors and process-local cooldown rejections, the later reset controls
+  routing, and localized client messages distinguish one or both exhausted
+  windows without relying on error-message text.
 - Claude policy tests verify that the observed Anthropic account-rate-limit
   response remains `upstream_rate_limited`, while explicit subscription usage
   messages become `upstream_usage_limit`, without calling a management API.

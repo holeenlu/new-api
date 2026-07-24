@@ -188,8 +188,13 @@ project-wide written-request replay invariant.
 **Lease and reader lifecycle.** Subscription-OAuth capacity is leased per turn,
 not for the lifetime of an idle connection. Closing a response body before a
 terminal event cancels its sole upstream reader and invalidates the connection
-before releasing the lease. A later turn cannot start a second reader on the
-same socket.
+before releasing the lease. The turn consumer listens directly to both the
+downstream request context and its connection-generation stop signal; it does
+not depend on the permanent reader relaying a close error. This avoids a race in
+which session teardown clears the connection generation first, the reader exits
+without delivering an error, and the orphaned consumer waits for the full
+five-minute idle timeout. A later turn cannot start a second reader on the same
+socket.
 
 **Idle-connection recycling and reused-turn first-event bound.** A pooled
 upstream connection can be silently idle-closed by the upstream or an
@@ -235,6 +240,9 @@ error frame and wait indefinitely for a response-associated terminal (observed
 hangs after a gateway 409 and 502 that were resolved only by the user sending
 another message). Two cases, both carrying the classified error object (type,
 code, retry_after):
+- **Downstream cancellation** emits no synthetic terminal. The client connection
+  is already gone, so a locally successful socket write would not prove delivery
+  and must not be logged as a sent failure frame.
 - **Stream ended without a terminal** (partial output already forwarded): the
   writer tracks the response id observed in forwarded events and emits a single
   `response.failed` with that **real id**, so the terminal matches the in-flight

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 )
@@ -34,6 +35,7 @@ type subscriptionOAuthCapacityError struct {
 	cause          error
 	retryAfter     time.Duration
 	cooldownReason subscriptionOAuthCooldownReason
+	usageWindows   types.SubscriptionOAuthUsageWindows
 }
 
 func (e *subscriptionOAuthCapacityError) Error() string {
@@ -104,6 +106,7 @@ type subscriptionOAuthLocalState struct {
 	cooldownUntil    time.Time
 	cooldownDuration time.Duration
 	cooldownReason   subscriptionOAuthCooldownReason
+	usageWindows     types.SubscriptionOAuthUsageWindows
 	recoveryPending  bool
 	recoveryInFlight bool
 }
@@ -359,20 +362,25 @@ func acquireSubscriptionOAuthCapacity(
 		if state.cooldownUntil.After(now) {
 			retryAfter := time.Until(state.cooldownUntil)
 			cooldownReason := state.cooldownReason
+			elapsed := max(state.cooldownDuration-retryAfter, time.Duration(0))
+			usageWindows := state.usageWindows.RemainingAfter(elapsed)
 			state.mu.Unlock()
 			return nil, &subscriptionOAuthCapacityError{
 				cause:          errSubscriptionOAuthCredentialCool,
 				retryAfter:     retryAfter,
 				cooldownReason: cooldownReason,
+				usageWindows:   usageWindows,
 			}
 		}
 		if state.recoveryInFlight {
 			cooldownReason := state.cooldownReason
+			usageWindows := state.usageWindows.RemainingAfter(state.cooldownDuration)
 			state.mu.Unlock()
 			return nil, &subscriptionOAuthCapacityError{
 				cause:          errSubscriptionOAuthCredentialCool,
 				retryAfter:     time.Second,
 				cooldownReason: cooldownReason,
+				usageWindows:   usageWindows,
 			}
 		}
 	}
@@ -426,6 +434,7 @@ func acquireSubscriptionOAuthCapacity(
 				state.generation++
 				state.cooldownUntil = time.Time{}
 				state.cooldownReason = subscriptionOAuthCooldownTransient
+				state.usageWindows = types.SubscriptionOAuthUsageWindows{}
 				state.recoveryPending = false
 			case subscriptionOAuthLeaseAbandoned:
 				// Keep the circuit half-open and immediately eligible for another
@@ -522,6 +531,22 @@ func cooldownSubscriptionOAuthCredential(
 	duration time.Duration,
 	reason subscriptionOAuthCooldownReason,
 ) bool {
+	return cooldownSubscriptionOAuthCredentialWithUsageWindows(
+		fingerprint,
+		expectedGeneration,
+		duration,
+		reason,
+		types.SubscriptionOAuthUsageWindows{},
+	)
+}
+
+func cooldownSubscriptionOAuthCredentialWithUsageWindows(
+	fingerprint string,
+	expectedGeneration uint64,
+	duration time.Duration,
+	reason subscriptionOAuthCooldownReason,
+	usageWindows types.SubscriptionOAuthUsageWindows,
+) bool {
 	if strings.TrimSpace(fingerprint) == "" || duration <= 0 {
 		return false
 	}
@@ -549,6 +574,7 @@ func cooldownSubscriptionOAuthCredential(
 	state.cooldownDuration = duration
 	state.cooldownUntil = now.Add(duration)
 	state.cooldownReason = reason
+	state.usageWindows = usageWindows
 	state.recoveryPending = true
 	state.recoveryInFlight = false
 	return true
@@ -581,6 +607,7 @@ func MarkSubscriptionOAuthCredentialHealthy(fingerprint string, expectedGenerati
 	state.generation++
 	state.cooldownUntil = time.Time{}
 	state.cooldownReason = subscriptionOAuthCooldownTransient
+	state.usageWindows = types.SubscriptionOAuthUsageWindows{}
 	state.recoveryPending = false
 	state.recoveryInFlight = false
 	return true

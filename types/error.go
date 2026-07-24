@@ -109,7 +109,55 @@ type NewAPIError struct {
 	StatusCode         int
 	UpstreamStatusCode int `json:"-"`
 	Metadata           json.RawMessage
-	RetryAfter         time.Duration `json:"-"`
+	RetryAfter         time.Duration                 `json:"-"`
+	UsageWindows       SubscriptionOAuthUsageWindows `json:"-"`
+}
+
+// SubscriptionOAuthUsageWindows retains the exhausted subscription windows
+// reported by an upstream inference response. RetryAfter remains the single
+// routing cooldown (the latest known reset); this field preserves the per-window
+// detail needed by client messages and by a later local cooldown rejection.
+type SubscriptionOAuthUsageWindows struct {
+	FiveHourExhausted  bool
+	FiveHourRetryAfter time.Duration
+	SevenDayExhausted  bool
+	SevenDayRetryAfter time.Duration
+}
+
+func (windows SubscriptionOAuthUsageWindows) HasExhaustedWindow() bool {
+	return windows.FiveHourExhausted || windows.SevenDayExhausted
+}
+
+// RetryDelay returns the latest known reset because every exhausted window must
+// recover before the credential can safely re-enter routing.
+func (windows SubscriptionOAuthUsageWindows) RetryDelay() time.Duration {
+	return max(windows.FiveHourRetryAfter, windows.SevenDayRetryAfter)
+}
+
+// RemainingAfter converts the window delays captured at cooldown creation into
+// delays remaining at a later local-capacity rejection. Unknown reset times stay
+// unknown and exhausted until the next upstream probe establishes their state.
+func (windows SubscriptionOAuthUsageWindows) RemainingAfter(elapsed time.Duration) SubscriptionOAuthUsageWindows {
+	if elapsed <= 0 {
+		return windows
+	}
+	if windows.FiveHourExhausted && windows.FiveHourRetryAfter > 0 {
+		if windows.FiveHourRetryAfter <= elapsed {
+			windows.FiveHourExhausted = false
+			windows.FiveHourRetryAfter = 0
+		} else {
+			windows.FiveHourRetryAfter -= elapsed
+		}
+	}
+	if windows.SevenDayExhausted && windows.SevenDayRetryAfter > 0 {
+		if windows.SevenDayRetryAfter <= elapsed {
+			windows.SevenDayExhausted = false
+			windows.SevenDayRetryAfter = 0
+		} else {
+			windows.SevenDayRetryAfter -= elapsed
+		}
+	}
+	return windows
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.

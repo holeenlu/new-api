@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -107,6 +108,10 @@ func AcquireSubscriptionOAuthChannelCapacity(
 			types.ErrOptionWithNoRecordErrorLog(),
 		)
 		apiError.RetryAfter = SubscriptionOAuthCapacityRetryAfter(err)
+		var capacityError *subscriptionOAuthCapacityError
+		if errors.As(err, &capacityError) {
+			apiError.UsageWindows = capacityError.usageWindows
+		}
 		return nil, apiError
 	}
 	status := http.StatusServiceUnavailable

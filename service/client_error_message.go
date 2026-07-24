@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/i18n"
@@ -14,7 +15,8 @@ import (
 // Accept-Language → deployment default), replacing the verbose upstream
 // diagnostic summary that stays in the backend logs. It returns ok=false for
 // codes without a friendly template so the caller preserves the original
-// message. The reset time for a usage-limit is derived from err.RetryAfter.
+// message. Subscription usage limits retain their individual 5h and 7d window
+// details when the upstream supplied them.
 func LocalizedRelayErrorMessage(c *gin.Context, err *types.NewAPIError) (string, bool) {
 	if err == nil {
 		return "", false
@@ -23,7 +25,7 @@ func LocalizedRelayErrorMessage(c *gin.Context, err *types.NewAPIError) (string,
 	if c != nil {
 		lang = i18n.GetLangFromContext(c)
 	}
-	return localizedRelayErrorMessage(lang, err.GetErrorCode(), err.RetryAfter, time.Now())
+	return localizedRelayErrorMessage(lang, err.GetErrorCode(), err.RetryAfter, err.UsageWindows, time.Now())
 }
 
 // localizedRelayErrorMessage picks the message key and template data for a code,
@@ -34,6 +36,7 @@ func localizedRelayErrorMessage(
 	lang string,
 	code types.ErrorCode,
 	retryAfter time.Duration,
+	usageWindows types.SubscriptionOAuthUsageWindows,
 	now time.Time,
 ) (string, bool) {
 	resetAt := ""
@@ -49,6 +52,28 @@ func localizedRelayErrorMessage(
 	)
 	switch code {
 	case types.ErrorCodeUpstreamUsageLimit:
+		if usageWindows.HasExhaustedWindow() {
+			windows := make([]string, 0, 2)
+			if usageWindows.FiveHourExhausted {
+				windows = append(windows, localizedSubscriptionUsageWindow(
+					lang,
+					i18n.MsgRelayErrUsageLimitFiveHour,
+					i18n.MsgRelayErrUsageLimitFiveHourNoReset,
+					usageWindows.FiveHourRetryAfter,
+					now,
+				))
+			}
+			if usageWindows.SevenDayExhausted {
+				windows = append(windows, localizedSubscriptionUsageWindow(
+					lang,
+					i18n.MsgRelayErrUsageLimitWeekly,
+					i18n.MsgRelayErrUsageLimitWeeklyNoReset,
+					usageWindows.SevenDayRetryAfter,
+					now,
+				))
+			}
+			return i18n.Translate(lang, i18n.MsgRelayErrUsageLimitWindows, map[string]any{"Windows": strings.Join(windows, "; ")}), true
+		}
 		if resetAt != "" {
 			key, data = i18n.MsgRelayErrUsageLimit, map[string]any{"ResetAt": resetAt}
 		} else {
@@ -82,4 +107,19 @@ func localizedRelayErrorMessage(
 		return "", false
 	}
 	return i18n.Translate(lang, key, data), true
+}
+
+func localizedSubscriptionUsageWindow(
+	lang string,
+	withResetKey string,
+	withoutResetKey string,
+	retryAfter time.Duration,
+	now time.Time,
+) string {
+	if retryAfter <= 0 {
+		return i18n.Translate(lang, withoutResetKey)
+	}
+	return i18n.Translate(lang, withResetKey, map[string]any{
+		"ResetAt": now.Add(retryAfter).Format("2006-01-02 15:04"),
+	})
 }
