@@ -845,6 +845,9 @@ func validateOptionMaps(values map[string]string) error {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == operation_setting.ToolPriceOptionKey {
+		return operation_setting.ValidateToolPricesJSON(value)
+	}
 	if strings.HasSuffix(key, "Permission") {
 		if _, err := strconv.Atoi(value); err != nil {
 			return fmt.Errorf("%s must be an integer: %w", key, err)
@@ -933,6 +936,10 @@ func validateOptionValue(key string, value string) error {
 
 // handleConfigUpdate 处理分层配置更新，返回是否已处理
 func handleConfigUpdate(key, value string) (bool, error) {
+	if key == operation_setting.ToolPriceOptionKey {
+		operation_setting.LoadToolPricesFromJSONString(value)
+		return true, nil
+	}
 	parts := strings.SplitN(key, ".", 2)
 	if len(parts) != 2 {
 		return false, nil // 不是分层配置

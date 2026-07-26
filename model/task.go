@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -48,7 +49,7 @@ const (
 
 // TaskRefundLegacyCutoff separates legacy timeout tasks that intentionally
 // do not receive automatic refunds from tasks covered by reconciliation.
-const TaskRefundLegacyCutoff int64 = 1740182400 // 2025-02-22 00:00:00 UTC
+const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
 	ID         int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
@@ -833,7 +834,13 @@ func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 		// Status pollers own provider metadata, while the locked row owns the
 		// funding/token ledger. A poller can hold a snapshot loaded before task
 		// settlement; never let that snapshot restore an older reservation.
-		t.Quota = persisted.Quota
+		// Legacy timeout tasks intentionally clear the reservation marker without
+		// refunding it. Other transitions must retain the locked persisted quota.
+		legacyTimeout := t.Status == TaskStatusFailure && t.Quota == 0 &&
+			strings.Contains(t.FailReason, "旧系统遗留任务")
+		if !legacyTimeout {
+			t.Quota = persisted.Quota
+		}
 		t.PrivateData.BillingReservation = persisted.PrivateData.BillingReservation
 
 		result := tx.Model(&Task{}).

@@ -86,6 +86,14 @@ func sweepTimedOutTasks(ctx context.Context) {
 			logger.LogInfo(ctx, fmt.Sprintf("sweepTimedOutTasks: task %s already transitioned, skip", task.TaskID))
 			continue
 		}
+		if isLegacy {
+			// Clear the pending marker without refunding legacy reservations.
+			task.Quota = 0
+			if err := task.UpdateQuota(); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("clear legacy task quota failed for %s: %v", task.TaskID, err))
+				continue
+			}
+		}
 		timedOutCount++
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
