@@ -150,6 +150,9 @@ function ModelJsonTextareaField(props: {
             <JsonCodeEditor
               value={field.value}
               onChange={(value) => field.onChange(value)}
+              name={field.name}
+              onBlur={field.onBlur}
+              textareaRef={field.ref}
             />
           </FormControl>
           <FormDescription className='text-xs leading-5'>
