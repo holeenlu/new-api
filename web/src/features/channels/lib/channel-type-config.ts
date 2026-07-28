@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { CHANNEL_TYPES } from '../constants'
+import { CHANNEL_TYPE_NEW_API, CHANNEL_TYPES } from '../constants'
 
 // ============================================================================
 // Channel Type Configuration
@@ -152,6 +152,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       baseUrl: 'Sub2API gateway base URL',
       key: 'Sub2API API Key',
       models: 'Models fetched from upstream /v1/models',
+    },
+  },
+  [CHANNEL_TYPE_NEW_API]: {
+    id: CHANNEL_TYPE_NEW_API,
+    name: CHANNEL_TYPES[CHANNEL_TYPE_NEW_API],
+    icon: 'NewAPI',
+    hints: {
+      baseUrl: 'Base URL is required for this channel type',
+      key: 'Enter API key for this channel',
+      models: 'Models',
     },
   },
 }

@@ -18,9 +18,9 @@ import (
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
@@ -648,8 +648,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	var err error
 	if common2.SubscriptionOAuthResponseHeaderTimeout > 0 &&
 		rootconstant.IsSubscriptionOAuthChannel(info.ChannelType) {
-		client, err = service.GetHttpClientWithResponseHeaderTimeout(
+		client, err = service.GetHttpClientWithResponseHeaderTimeoutSettings(
 			info.ChannelSetting.Proxy,
+			info.ChannelSetting,
 			time.Duration(common2.SubscriptionOAuthResponseHeaderTimeout)*time.Second,
 		)
 		if err != nil {
@@ -664,20 +665,29 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		// first. A streaming Responses upstream returns headers immediately; only
 		// a dead or stalled one does not, and with RELAY_TIMEOUT defaulting to 0
 		// such a request would otherwise wait forever. Never bounds the body.
-		client, err = service.GetHttpClientWithResponseHeaderTimeout(
+		client, err = service.GetHttpClientWithResponseHeaderTimeoutSettings(
 			info.ChannelSetting.Proxy,
+			info.ChannelSetting,
 			time.Duration(common2.StreamResponseHeaderTimeout)*time.Second,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("new stream response header timeout client failed: %w", err)
 		}
-	} else if info.ChannelSetting.Proxy != "" {
-		client, err = service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
+	} else {
+		client, err = service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 		if err != nil {
 			return nil, fmt.Errorf("new proxy http client failed: %w", err)
 		}
-	} else {
-		client = service.GetHttpClient()
+	}
+	if common2.DebugEnabled && req != nil && req.URL != nil {
+		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
+		logger.LogDebug(c, fmt.Sprintf(
+			"http transport select: host=%s protocol=%s shards=%d policy=%s",
+			req.URL.Host,
+			policy.Protocol,
+			policy.Shards,
+			policy.String(),
+		))
 	}
 
 	var stopPinger context.CancelFunc
@@ -730,6 +740,17 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")
+	}
+	if common2.DebugEnabled {
+		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
+		logger.LogDebug(c, fmt.Sprintf(
+			"http transport negotiated: host=%s protocol=%s shards=%d policy=%s negotiated=%s",
+			req.URL.Host,
+			policy.Protocol,
+			policy.Shards,
+			policy.String(),
+			resp.Proto,
+		))
 	}
 
 	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {

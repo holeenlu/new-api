@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 )

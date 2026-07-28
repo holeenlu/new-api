@@ -119,7 +119,11 @@ func DoAlphaSearch(c *gin.Context, info *relaycommon.RelayInfo, body []byte) (*h
 	req.Header.Set("X-Session-ID", sessionID)
 
 	timeout := time.Duration(rootcommon.SubscriptionOAuthResponseHeaderTimeout) * time.Second
-	client, err := service.GetHttpClientWithResponseHeaderTimeout(info.ChannelSetting.Proxy, timeout)
+	client, err := service.GetHttpClientWithResponseHeaderTimeoutSettings(
+		info.ChannelSetting.Proxy,
+		info.ChannelSetting,
+		timeout,
+	)
 	if err != nil {
 		lease.Abandon()
 		return nil, err

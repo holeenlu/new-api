@@ -6,7 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,7 +45,7 @@ func TestIsResponsesEventStreamContentType(t *testing.T) {
 
 func TestRecalcQuotaFromRatiosIgnoresInvalidMultipliers(t *testing.T) {
 	info := &relaycommon.RelayInfo{
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			Quota: 100,
 		},
 	}
@@ -66,7 +66,7 @@ func TestRecalcQuotaFromRatiosIgnoresInvalidMultipliers(t *testing.T) {
 
 func TestRecalcQuotaFromRatiosRejectsAllInvalidAdjustedRatios(t *testing.T) {
 	info := &relaycommon.RelayInfo{
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			Quota: 100,
 		},
 	}

@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/model_setting"
-	"github.com/QuantumNous/new-api/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -136,7 +137,7 @@ func newWalletViolationRelayInfo(userID, channelID int) *relaycommon.RelayInfo {
 		UserSetting: dto.UserSetting{
 			BillingPreference: "wallet_only",
 		},
-		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{
+		PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{
 			GroupRatio: 1,
 		}},
 		StartTime: time.Now(),
@@ -233,9 +234,9 @@ func TestViolationFeeCreatesSubscriptionSessionForOtherwiseFreeRequest(t *testin
 		UserSetting: dto.UserSetting{
 			BillingPreference: "subscription_only",
 		},
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			FreeModel: true,
-			GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatioInfo: hosttypes.GroupRatioInfo{
 				GroupRatio: 1,
 			},
 		},
@@ -824,7 +825,7 @@ func TestViolationFeeRequiresCompleteSubscriptionReservation(t *testing.T) {
 		UserSetting: dto.UserSetting{
 			BillingPreference: "subscription_only",
 		},
-		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
+		PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
 		StartTime: time.Now(),
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelId: channelID,
@@ -934,7 +935,7 @@ func TestViolationFeeRecordsFundingCommittedSettlementError(t *testing.T) {
 		TokenId:         tokenID,
 		OriginModelName: "paid-model",
 		UsingGroup:      "default",
-		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{
+		PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{
 			GroupRatio: 1,
 		}},
 		StartTime: time.Now(),
@@ -1017,7 +1018,7 @@ func TestViolationFeeSkipsLedgerWhenFundingNotCommitted(t *testing.T) {
 		TokenId:         tokenID,
 		OriginModelName: "paid-model",
 		UsingGroup:      "default",
-		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{
+		PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{
 			GroupRatio: 1,
 		}},
 		StartTime: time.Now(),

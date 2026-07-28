@@ -10,9 +10,10 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -272,9 +273,9 @@ func TestOpenaiRealtimeHandlerProgressivelyReservesCumulativeAuthoritativeUsage(
 		OutputAudioFormat: "pcm16",
 		IsFirstRequest:    true,
 		Billing:           billing,
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			ModelRatio: 1,
-			GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatioInfo: hosttypes.GroupRatioInfo{
 				GroupRatio: 1,
 			},
 		},
@@ -355,9 +356,9 @@ func TestOpenaiRealtimeHandlerRejectsNegativeAuthoritativeUsage(t *testing.T) {
 			UpstreamModelName: "gpt-4o-realtime-preview",
 		},
 		Billing: billing,
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			ModelRatio: 1,
-			GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatioInfo: hosttypes.GroupRatioInfo{
 				GroupRatio: 1,
 			},
 		},
@@ -419,9 +420,9 @@ func TestOpenaiRealtimeHandlerReservationFailureTerminatesWithoutDroppingUsage(t
 		},
 		IsFirstRequest: true,
 		Billing:        billing,
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			ModelRatio: 1,
-			GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatioInfo: hosttypes.GroupRatioInfo{
 				GroupRatio: 1,
 			},
 		},

@@ -5,9 +5,10 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -115,7 +116,7 @@ func TestPreConsumeBillingRejectsNegativeQuotaBeforeDeduction(t *testing.T) {
 
 func TestCalcOpenRouterCacheCreateTokensSaturatesOversizedCost(t *testing.T) {
 	usage := dto.Usage{Cost: float64(common.MaxQuota) * common.QuotaPerUnit}
-	priceData := types.PriceData{
+	priceData := hosttypes.PriceData{
 		ModelRatio:         1,
 		CompletionRatio:    1,
 		CacheRatio:         1,

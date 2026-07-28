@@ -12,7 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	"github.com/QuantumNous/new-api/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -279,11 +279,11 @@ func taskBillingOther(task *model.Task) map[string]interface{} {
 	return other
 }
 
-func taskBillingContextPriceData(bc *model.TaskBillingContext) *types.PriceData {
+func taskBillingContextPriceData(bc *model.TaskBillingContext) *hosttypes.PriceData {
 	if bc == nil || len(bc.OtherRatios) == 0 {
 		return nil
 	}
-	priceData := &types.PriceData{}
+	priceData := &hosttypes.PriceData{}
 	if !priceData.ReplaceOtherRatios(bc.OtherRatios) {
 		return nil
 	}

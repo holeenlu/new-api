@@ -23,7 +23,7 @@ FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f
 ARG APP_VERSION
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOPROXY_FALLBACK=https://proxy.golang.org,direct
-ENV GO111MODULE=on CGO_ENABLED=0
+ENV GO111MODULE=on CGO_ENABLED=0 GOWORK=off
 ENV GOPROXY=${GOPROXY}
 
 ARG TARGETOS
@@ -34,6 +34,7 @@ ENV GOEXPERIMENT=greenteagc
 WORKDIR /build
 
 ADD go.mod go.sum ./
+ADD relaykit/go.mod ./relaykit/go.mod
 RUN set -eux; \
     if ! timeout 180 env GOPROXY="$GOPROXY" go mod download; then \
       echo "Primary Go module proxy failed; retrying with $GOPROXY_FALLBACK" >&2; \

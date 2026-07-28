@@ -13,16 +13,17 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/responsesws"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	"github.com/QuantumNous/new-api/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -35,7 +36,7 @@ type compactBillingRecorder struct {
 	preConsumedQuota        int
 	reserveTarget           int
 	modelAtReserve          string
-	priceDataAtReserve      types.PriceData
+	priceDataAtReserve      hosttypes.PriceData
 	tieredSnapshotAtReserve *billingexpr.BillingSnapshot
 	requestInputAtReserve   *billingexpr.RequestInput
 	upstreamModelAtReserve  string
@@ -118,7 +119,7 @@ func TestResponsesCompactFreezesMappedPriceAndRejectsReserveBeforeUpstream(t *te
 	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "://must-not-reach-upstream")
 
-	originalPriceData := types.PriceData{
+	originalPriceData := hosttypes.PriceData{
 		ModelRatio:        2,
 		CompletionRatio:   3,
 		QuotaToPreConsume: 11,

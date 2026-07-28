@@ -1,7 +1,7 @@
 package common
 
 import (
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {

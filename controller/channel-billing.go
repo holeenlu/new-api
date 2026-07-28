@@ -13,9 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/shopspring/decimal"
 
@@ -160,7 +160,8 @@ func GetResponseBodyWithContext(ctx context.Context, method, url string, channel
 	for k := range headers {
 		req.Header.Add(k, headers.Get(k))
 	}
-	client, err := service.GetHttpClientWithResponseHeaderTimeout(channel.GetSetting().Proxy, timeout)
+	settings := channel.GetSetting()
+	client, err := service.GetHttpClientWithResponseHeaderTimeoutSettings(settings.Proxy, settings, timeout)
 	if err != nil {
 		return nil, err
 	}

@@ -58,6 +58,7 @@ const (
 	ChannelTypeAdvancedCustom = 58
 	ChannelTypeClaudeCode     = 59
 	ChannelTypeSub2API        = 60
+	ChannelTypeNewAPI         = 61
 	ChannelTypeDummy          // this one is only for count, do not add any channel after this
 
 )
@@ -128,6 +129,7 @@ var ChannelBaseURLs = []string{
 	"",                                          //58
 	"https://api.anthropic.com",                 //59
 	"",                                          //60
+	"",                                          //61
 }
 
 var ChannelTypeNames = map[int]string{
@@ -188,6 +190,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeAdvancedCustom: "Advanced Custom",
 	ChannelTypeClaudeCode:     "Claude Code (OAuth)",
 	ChannelTypeSub2API:        "Sub2API",
+	ChannelTypeNewAPI:         "New API",
 }
 
 func GetChannelTypeName(channelType int) string {

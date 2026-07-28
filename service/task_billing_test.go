@@ -13,7 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -214,7 +214,7 @@ func makeWalletTaskBillingInfo(userId, tokenId, estimate int, tokenKey string) *
 }
 
 func TestPriceDataOtherRatiosFilterAndSnapshot(t *testing.T) {
-	priceData := types.PriceData{}
+	priceData := hosttypes.PriceData{}
 
 	priceData.AddOtherRatio("zero", 0)
 	priceData.AddOtherRatio("negative", -0.5)
@@ -238,7 +238,7 @@ func TestPriceDataOtherRatiosFilterAndSnapshot(t *testing.T) {
 }
 
 func TestPriceDataReplaceAndApplyOtherRatios(t *testing.T) {
-	priceData := types.PriceData{}
+	priceData := hosttypes.PriceData{}
 
 	replaced := priceData.ReplaceOtherRatios(map[string]float64{
 		"zero":     0,

@@ -12,7 +12,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
@@ -20,8 +19,9 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/samber/lo"
 )
@@ -293,7 +293,7 @@ func fetchCodexUpstreamModelCatalog(
 	ctx context.Context,
 	baseURL string,
 	key string,
-	proxyURL string,
+	settings dto.ChannelSettings,
 ) ([]codex.UpstreamModel, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -304,7 +304,7 @@ func fetchCodexUpstreamModelCatalog(
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	client, err := service.GetHttpClientWithResponseHeaderTimeout(proxyURL, timeout)
+	client, err := service.GetHttpClientWithResponseHeaderTimeoutSettings(settings.Proxy, settings, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +351,7 @@ func fetchCodexChannelUpstreamModelCatalog(ctx context.Context, channel *model.C
 			ctx,
 			channel.GetBaseURL(),
 			key,
-			channel.GetSetting().Proxy,
+			channel.GetSetting(),
 		)
 		if err != nil {
 			err = applySubscriptionOAuthModelFetchError(channel, err)

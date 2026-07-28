@@ -20,8 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/samber/lo"
@@ -30,20 +30,20 @@ import (
 )
 
 const (
-	defaultTimeoutSeconds          = 10
-	defaultEndpoint                = "/api/pricing"
-	maxConcurrentFetches           = 8
-	maxRatioConfigBytes            = 10 << 20 // 10MB
-	floatEpsilon                   = 1e-9
-	officialRatioPresetID          = -100
-	officialRatioPresetName        = "官方倍率预设"
-	officialRatioPresetBaseURL     = "https://basellm.github.io"
-	modelsDevPresetID              = -101
-	modelsDevPresetName            = "models.dev 价格预设"
-	modelsDevPresetBaseURL         = "https://models.dev"
-	modelsDevHost                  = "models.dev"
-	modelsDevPath                  = "/api.json"
-	modelsDevInputCostRatioBase    = 1000.0
+	defaultTimeoutSeconds       = 10
+	defaultEndpoint             = "/api/pricing"
+	maxConcurrentFetches        = 8
+	maxRatioConfigBytes         = 10 << 20 // 10MB
+	floatEpsilon                = 1e-9
+	officialRatioPresetID       = -100
+	officialRatioPresetName     = "官方倍率预设"
+	officialRatioPresetBaseURL  = "https://basellm.github.io"
+	modelsDevPresetID           = -101
+	modelsDevPresetName         = "models.dev 价格预设"
+	modelsDevPresetBaseURL      = "https://models.dev"
+	modelsDevHost               = "models.dev"
+	modelsDevPath               = "/api.json"
+	modelsDevInputCostRatioBase = 1000.0
 )
 
 func nearlyEqual(a, b float64) bool {

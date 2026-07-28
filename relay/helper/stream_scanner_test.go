@@ -615,7 +615,6 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
 }
 
-
 // fakeStreamIdleTimer lets the test drive an idle bound to expiry and observe
 // refreshes without wall-clock sleeps.
 type fakeStreamIdleTimer struct {

@@ -18,8 +18,8 @@ func LogAlphaSearchConsumption(c *gin.Context, info *relaycommon.RelayInfo, quot
 	other := map[string]interface{}{
 		"request_path": c.Request.URL.Path,
 		"alpha_search": true,
-		"model_price": info.PriceData.ModelPrice,
-		"group_ratio": info.PriceData.GroupRatioInfo.GroupRatio,
+		"model_price":  info.PriceData.ModelPrice,
+		"group_ratio":  info.PriceData.GroupRatioInfo.GroupRatio,
 	}
 	if info.PriceData.ModelRatio > 0 {
 		other["model_ratio"] = info.PriceData.ModelRatio

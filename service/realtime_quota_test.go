@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -19,10 +19,10 @@ import (
 )
 
 func TestCalculateWssQuotaUsesModelPriceForPerCallBilling(t *testing.T) {
-	info := &relaycommon.RelayInfo{PriceData: types.PriceData{
+	info := &relaycommon.RelayInfo{PriceData: hosttypes.PriceData{
 		UsePrice:   true,
 		ModelPrice: 2.5,
-		GroupRatioInfo: types.GroupRatioInfo{
+		GroupRatioInfo: hosttypes.GroupRatioInfo{
 			GroupRatio: 0.4,
 		},
 	}}
@@ -44,7 +44,7 @@ func TestCalculateWssQuotaUsesModelPriceForPerCallBilling(t *testing.T) {
 func TestCalculateWssQuotaUsesFrozenTieredExpressionAndRealtimeAudioDimensions(t *testing.T) {
 	expr := `tier("audio", p * 1 + ai * 3 + c * 2 + ao * 4)`
 	info := &relaycommon.RelayInfo{
-		PriceData: types.PriceData{ModelRatio: 999},
+		PriceData: hosttypes.PriceData{ModelRatio: 999},
 		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
 			BillingMode:  "tiered_expr",
 			ModelName:    "frozen-realtime-model",
@@ -77,10 +77,10 @@ func TestPostAudioConsumeQuotaUsesConfiguredPerCallModelPrice(t *testing.T) {
 		OriginModelName: "per-call-audio",
 		UserQuota:       common.GetTrustQuota(),
 		Billing:         billing,
-		PriceData: types.PriceData{
+		PriceData: hosttypes.PriceData{
 			UsePrice:   true,
 			ModelPrice: 2.5,
-			GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatioInfo: hosttypes.GroupRatioInfo{
 				GroupRatio: 0.4,
 			},
 		},

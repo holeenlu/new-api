@@ -14,8 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/codex"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -107,7 +107,8 @@ func fetchCodexChannelWhamData(
 	if responseHeaderTimeout <= 0 {
 		responseHeaderTimeout = 30 * time.Second
 	}
-	client, err := service.GetHttpClientWithResponseHeaderTimeout(ch.GetSetting().Proxy, responseHeaderTimeout)
+	settings := ch.GetSetting()
+	client, err := service.GetHttpClientWithResponseHeaderTimeoutSettings(settings.Proxy, settings, responseHeaderTimeout)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -140,7 +141,8 @@ func fetchCodexChannelWhamData(
 			oauthKey = refreshedKey
 			ch = refreshedChannel
 			accountID = strings.TrimSpace(oauthKey.AccountID)
-			client, err = service.GetHttpClientWithResponseHeaderTimeout(ch.GetSetting().Proxy, responseHeaderTimeout)
+			settings = ch.GetSetting()
+			client, err = service.GetHttpClientWithResponseHeaderTimeoutSettings(settings.Proxy, settings, responseHeaderTimeout)
 			if err != nil {
 				common.ApiError(c, err)
 				return
@@ -199,8 +201,10 @@ func correlateCodexOAuthUsageLimit(
 	if err != nil || strings.TrimSpace(oauthKey.AccessToken) == "" || strings.TrimSpace(oauthKey.AccountID) == "" {
 		return apiError
 	}
-	client, err := service.GetHttpClientWithResponseHeaderTimeout(
-		channel.GetSetting().Proxy,
+	settings := channel.GetSetting()
+	client, err := service.GetHttpClientWithResponseHeaderTimeoutSettings(
+		settings.Proxy,
+		settings,
 		codexOAuthUsageCorrelationTimeout,
 	)
 	if err != nil {
