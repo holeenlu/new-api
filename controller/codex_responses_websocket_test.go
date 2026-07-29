@@ -513,6 +513,7 @@ func TestResponsesWebSocketSSEWriterSkipsSyntheticFailureAfterCancellation(t *te
 		}
 		defer conn.Close()
 		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 		writer := newResponsesWebSocketSSEWriter(ctx, conn)
 		_, err = writer.Write([]byte(
 			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancelled\",\"status\":\"in_progress\"}}\n\n",
